@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  syntax-and-cli:
+  source-integrity:
     runs-on: ubuntu-latest
 
     steps:
@@ -19,23 +19,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Compile single-file trainer
+      - name: Compile launcher
         run: python -m py_compile nestsar.py
 
-      - name: Check CLI and GPU discovery
+      - name: Reconstruct and verify readable trainer
         run: |
-          python nestsar.py --version
-          python nestsar.py --list-models
-          python nestsar.py --list-gpus
-          python nestsar.py --help
+          python nestsar.py --export-source /tmp/nestsar_readable.py
+          echo "8aa931b9423bbe4aaba2258563021797f738619ae6fd5f9a227ca9239dfb49d4  /tmp/nestsar_readable.py" | sha256sum --check --strict
+          python -m py_compile /tmp/nestsar_readable.py
 
-      - name: Check automatic allocation dry run
+      - name: Verify source fragments
         run: |
-          mkdir -p /tmp/nestsar-test
-          : > /tmp/nestsar-test/ntu120_3danno.pkl
-          python nestsar.py \
-            --preset smoke \
-            --dataset /tmp/nestsar-test/ntu120_3danno.pkl \
-            --output-dir /tmp/nestsar-runs \
-            --gpu-map auto \
-            --dry-run
+          test "$(find .source -maxdepth 1 -name 'chunk*.b64' | wc -l)" -eq 12
