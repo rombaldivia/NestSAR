@@ -1,0 +1,33 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  source-integrity:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile launcher
+        run: python -m py_compile nestsar.py
+
+      - name: Reconstruct and verify readable trainer
+        run: |
+          python nestsar.py --export-source /tmp/nestsar_readable.py
+          echo "8aa931b9423bbe4aaba2258563021797f738619ae6fd5f9a227ca9239dfb49d4  /tmp/nestsar_readable.py" | sha256sum --check --strict
+          python -m py_compile /tmp/nestsar_readable.py
+
+      - name: Verify source fragments
+        run: |
+          test "$(find .source -maxdepth 1 -name 'chunk*.b64' | wc -l)" -eq 12

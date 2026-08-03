@@ -1,0 +1,7 @@
+# Core scientific stack used by the validated Kaggle environment.
+# Install a GPU-compatible JAX/JAXLIB build for your CUDA version before
+# installing this file in a local venv. Kaggle already provides JAX with CUDA.
+numpy==2.0.2
+flax==0.11.2
+optax==0.2.8
+tqdm>=4.66,<5
