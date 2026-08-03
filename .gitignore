@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+env/
+.env
+
+# Notebooks and editors
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# Datasets and generated artifacts
+*.pkl
+*.pickle
+*.npz
+*.npy
+*.msgpack
+*.ckpt
+*.orbax/
+data/
+datasets/
+runs/
+checkpoints/
+outputs/
+wandb/
+
+# Logs and local metadata
+*.log
+.DS_Store
