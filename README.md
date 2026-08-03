@@ -4,9 +4,24 @@ Nested multi-timescale memory networks for skeleton-based action recognition in 
 
 ## Project status
 
-This repository is under active research development. The first objective is to consolidate the current experimental code into a single reproducible entry point, `nestsar.py`, that can run both on Kaggle and inside a local Python virtual environment.
+This repository is under active research development. The current branch introduces the stable command-line interface and reproducibility metadata for a single-file trainer, `nestsar.py`, designed to run both on Kaggle and inside a local Python virtual environment.
 
-## Target usage
+The training engine has **not yet been ported** into the standardized file. At this stage, use `--dry-run` to validate paths, hyperparameters, presets, GPU mapping, configuration hashing, and experiment metadata without starting training.
+
+## Current bootstrap usage
+
+```bash
+python nestsar.py \
+  --preset legacy_4l_seed128 \
+  --protocol both \
+  --dataset auto \
+  --gpu-map xsub:0,xset:1 \
+  --dry-run
+```
+
+## Target training usage
+
+After the validated legacy engine is ported into `nestsar.py`, the same interface will launch training:
 
 ```bash
 python nestsar.py \
