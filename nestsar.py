@@ -602,6 +602,15 @@ def batch_iterator(
 # MODELO
 # ============================================================
 
+def stable_l2_normalize(
+    x: jnp.ndarray,
+    epsilon: float = 1e-12,
+) -> jnp.ndarray:
+    """L2 normalization with finite gradients for zero vectors."""
+    squared_norm = jnp.sum(jnp.square(x), axis=-1, keepdims=True)
+    return x * jax.lax.rsqrt(squared_norm + epsilon)
+
+
 class HOPEModel(nn.Module):
     mode: str
     num_classes: int
@@ -692,12 +701,8 @@ class HOPEModel(nn.Module):
                 name="memory_value",
             )(direct_features)
 
-            keys = keys / (
-                jnp.linalg.norm(keys, axis=-1, keepdims=True) + 1e-6
-            )
-            queries = queries / (
-                jnp.linalg.norm(queries, axis=-1, keepdims=True) + 1e-6
-            )
+            keys = stable_l2_normalize(keys)
+            queries = stable_l2_normalize(queries)
 
             eta_logit = self.param(
                 "eta_logit",
@@ -1002,12 +1007,8 @@ class NestSARH3Model(nn.Module):
             name="memory_value",
         )(direct_features)
 
-        keys_1 = keys_1 / (
-            jnp.linalg.norm(keys_1, axis=-1, keepdims=True) + 1e-6
-        )
-        queries_1 = queries_1 / (
-            jnp.linalg.norm(queries_1, axis=-1, keepdims=True) + 1e-6
-        )
+        keys_1 = stable_l2_normalize(keys_1)
+        queries_1 = stable_l2_normalize(queries_1)
 
         eta_1_logit = self.param(
             "eta_logit",
@@ -1109,12 +1110,8 @@ class NestSARH3Model(nn.Module):
         keys_2 = keys_1 + nested_scale * k_delta
         values_2 = values_1 + nested_scale * v_delta
 
-        queries_2 = queries_2 / (
-            jnp.linalg.norm(queries_2, axis=-1, keepdims=True) + 1e-6
-        )
-        keys_2 = keys_2 / (
-            jnp.linalg.norm(keys_2, axis=-1, keepdims=True) + 1e-6
-        )
+        queries_2 = stable_l2_normalize(queries_2)
+        keys_2 = stable_l2_normalize(keys_2)
 
         eta_2_logit = self.param(
             "nested_eta_logit",
@@ -1206,7 +1203,7 @@ def four_logit(value: float) -> float:
 
 
 def four_normalize_vectors(x: jnp.ndarray) -> jnp.ndarray:
-    return x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + 1e-6)
+    return stable_l2_normalize(x)
 
 
 def four_associative_scan(
@@ -2432,7 +2429,7 @@ def parse_args() -> argparse.Namespace:
             "Detecta las GPU y lanza XSUB/XSET como procesos independientes."
         )
     )
-    parser.add_argument("--version", action="version", version="NestSAR 0.3.0")
+    parser.add_argument("--version", action="version", version="NestSAR 0.3.1")
     parser.add_argument("--model", choices=tuple(MODEL_ALIASES), default="nestsar_4l")
     parser.add_argument("--protocol", choices=("xsub", "xset", "both"), default="both")
     parser.add_argument("--dataset", default="auto")
