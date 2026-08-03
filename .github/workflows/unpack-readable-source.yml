@@ -1,0 +1,45 @@
+name: publish readable single-file trainer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/unpack-readable-source.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  publish-readable-source:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Export complete readable trainer
+        run: |
+          set -euo pipefail
+          python nestsar.py --export-source /tmp/nestsar_readable.py
+          echo '8aa931b9423bbe4aaba2258563021797f738619ae6fd5f9a227ca9239dfb49d4  /tmp/nestsar_readable.py' | sha256sum --check --strict
+          python -m py_compile /tmp/nestsar_readable.py
+          mv /tmp/nestsar_readable.py nestsar.py
+          rm -rf .source
+          rm -f .github/workflows/unpack-readable-source.yml
+
+      - name: Commit readable source
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'refactor: publish complete readable single-file trainer'
+          git push origin HEAD:main
