@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  source-integrity:
+  readable-single-file:
     runs-on: ubuntu-latest
 
     steps:
@@ -19,15 +19,21 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Compile launcher
+      - name: Compile complete trainer
         run: python -m py_compile nestsar.py
 
-      - name: Reconstruct and verify readable trainer
+      - name: Verify complete implementation is visible
         run: |
-          python nestsar.py --export-source /tmp/nestsar_readable.py
-          echo "8aa931b9423bbe4aaba2258563021797f738619ae6fd5f9a227ca9239dfb49d4  /tmp/nestsar_readable.py" | sha256sum --check --strict
-          python -m py_compile /tmp/nestsar_readable.py
+          test ! -d .source
+          grep -q "class HOPEModel" nestsar.py
+          grep -q "class NestSARH3Model" nestsar.py
+          grep -q "class NestSAR4LModel" nestsar.py
+          grep -q "def run_experiment" nestsar.py
+          grep -q "def save_full_checkpoint" nestsar.py
+          grep -q "def restore_full_checkpoint" nestsar.py
+          grep -q "def launch_protocols" nestsar.py
+          grep -q "def parse_args" nestsar.py
 
-      - name: Verify source fragments
+      - name: Verify readable source checksum
         run: |
-          test "$(find .source -maxdepth 1 -name 'chunk*.b64' | wc -l)" -eq 12
+          echo "8aa931b9423bbe4aaba2258563021797f738619ae6fd5f9a227ca9239dfb49d4  nestsar.py" | sha256sum --check --strict
