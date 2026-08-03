@@ -1,0 +1,40 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  syntax-and-cli:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile single-file trainer
+        run: python -m py_compile nestsar.py
+
+      - name: Check CLI
+        run: |
+          python nestsar.py --version
+          python nestsar.py --list-models
+          python nestsar.py --help
+
+      - name: Check configuration dry run
+        run: |
+          mkdir -p /tmp/nestsar-test
+          : > /tmp/nestsar-test/ntu120_3danno.pkl
+          python nestsar.py \
+            --preset smoke \
+            --dataset /tmp/nestsar-test/ntu120_3danno.pkl \
+            --output-dir /tmp/nestsar-runs \
+            --gpu-map xsub:0,xset:1 \
+            --dry-run
