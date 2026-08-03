@@ -24,6 +24,7 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path('nestsar.py')
           source = path.read_text(encoding='utf-8')
@@ -34,7 +35,7 @@ jobs:
 
           class HOPEModel(nn.Module):
           '''
-          replacement = '''# ============================================================
+          helper = '''# ============================================================
           # MODELO
           # ============================================================
 
@@ -52,74 +53,66 @@ jobs:
           if 'def stable_l2_normalize(' not in source:
               if marker not in source:
                   raise RuntimeError('model marker not found')
-              source = source.replace(marker, replacement, 1)
+              source = source.replace(marker, helper, 1)
 
-          replacements = [
-              (
-                  '''            keys = keys / (
-                  jnp.linalg.norm(keys, axis=-1, keepdims=True) + 1e-6
-              )
-              queries = queries / (
-                  jnp.linalg.norm(queries, axis=-1, keepdims=True) + 1e-6
-              )''',
-                  '''            keys = stable_l2_normalize(keys)
-              queries = stable_l2_normalize(queries)''',
-              ),
-              (
-                  '''        keys_1 = keys_1 / (
-              jnp.linalg.norm(keys_1, axis=-1, keepdims=True) + 1e-6
-          )
-          queries_1 = queries_1 / (
-              jnp.linalg.norm(queries_1, axis=-1, keepdims=True) + 1e-6
-          )''',
-                  '''        keys_1 = stable_l2_normalize(keys_1)
-          queries_1 = stable_l2_normalize(queries_1)''',
-              ),
-              (
-                  '''        queries_2 = queries_2 / (
-              jnp.linalg.norm(queries_2, axis=-1, keepdims=True) + 1e-6
-          )
-          keys_2 = keys_2 / (
-              jnp.linalg.norm(keys_2, axis=-1, keepdims=True) + 1e-6
-          )''',
-                  '''        queries_2 = stable_l2_normalize(queries_2)
-          keys_2 = stable_l2_normalize(keys_2)''',
-              ),
-              (
-                  '''def four_normalize_vectors(x: jnp.ndarray) -> jnp.ndarray:
-              return x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + 1e-6)''',
-                  '''def four_normalize_vectors(x: jnp.ndarray) -> jnp.ndarray:
-              return stable_l2_normalize(x)''',
-              ),
-          ]
-          for old, new in replacements:
-              if new in source:
+          names = ('keys', 'queries', 'keys_1', 'queries_1', 'queries_2', 'keys_2')
+          for name in names:
+              if f'{name} = stable_l2_normalize({name})' in source:
                   continue
-              if old not in source:
-                  raise RuntimeError('expected normalization block not found')
-              source = source.replace(old, new, 1)
+              pattern = re.compile(
+                  rf'(?m)^(?P<indent>[ \t]*){name} = {name} / \(\n'
+                  rf'[ \t]*jnp\.linalg\.norm\({name}, axis=-1, keepdims=True\) \+ 1e-6\n'
+                  rf'[ \t]*\)'
+              )
+              source, count = pattern.subn(
+                  lambda match: (
+                      f"{match.group('indent')}{name} = "
+                      f"stable_l2_normalize({name})"
+                  ),
+                  source,
+                  count=1,
+              )
+              if count != 1:
+                  raise RuntimeError(f'normalization block not found: {name}')
 
-          old_smoke = '''    _, metrics = train_step(
+          if 'return stable_l2_normalize(x)' not in source:
+              pattern = re.compile(
+                  r'def four_normalize_vectors\(x: jnp\.ndarray\) -> jnp\.ndarray:\n'
+                  r'[ \t]*return x / \(jnp\.linalg\.norm\(x, axis=-1, keepdims=True\) \+ 1e-6\)'
+              )
+              source, count = pattern.subn(
+                  'def four_normalize_vectors(x: jnp.ndarray) -> jnp.ndarray:\n'
+                  '    return stable_l2_normalize(x)',
+                  source,
+                  count=1,
+              )
+              if count != 1:
+                  raise RuntimeError('four_normalize_vectors block not found')
+
+          old_call = '''    _, metrics = train_step(
               state,
               batch_x,
               batch_y,
               jax.random.PRNGKey(CFG.seed + 999),
-          )
-              jax.block_until_ready(metrics["loss"])
-              if not tree_all_finite(metrics):
-                  raise FloatingPointError("El paso físico produjo métricas no finitas.")'''
-          new_smoke = '''    smoke_state, metrics = train_step(
+          )'''
+          new_call = '''    smoke_state, metrics = train_step(
               state,
               batch_x,
               batch_y,
               jax.random.PRNGKey(CFG.seed + 999),
-          )
-              jax.block_until_ready(metrics["loss"])
-              bad_metrics = [
-                  key
-                  for key, value in metrics.items()
-                  if not bool(np.asarray(jnp.all(jnp.isfinite(value))))
-              ]
+          )'''
+          if 'smoke_state, metrics = train_step(' not in source:
+              if old_call not in source:
+                  raise RuntimeError('smoke train_step call not found')
+              source = source.replace(old_call, new_call, 1)
+
+          old_check = '''    if not tree_all_finite(metrics):
+              raise FloatingPointError("El paso físico produjo métricas no finitas.")'''
+          new_check = '''    bad_metrics = [
+              key
+              for key, value in metrics.items()
+              if not bool(np.asarray(jnp.all(jnp.isfinite(value))))
+          ]
               if bad_metrics:
                   raise FloatingPointError(
                       "El paso físico produjo métricas no finitas: "
@@ -130,15 +123,16 @@ jobs:
                       "El paso físico produjo parámetros no finitos."
                   )'''
           if 'bad_metrics = [' not in source:
-              if old_smoke not in source:
-                  raise RuntimeError('smoke block not found')
-              source = source.replace(old_smoke, new_smoke, 1)
+              if old_check not in source:
+                  raise RuntimeError('smoke finite check not found')
+              source = source.replace(old_check, new_check, 1)
 
           source = source.replace(
               'parser.add_argument("--version", action="version", version="NestSAR 0.3.0")',
               'parser.add_argument("--version", action="version", version="NestSAR 0.3.1")',
               1,
           )
+
           path.write_text(source, encoding='utf-8')
           PY
 
@@ -146,7 +140,9 @@ jobs:
         run: |
           python -m py_compile nestsar.py
           grep -q 'def stable_l2_normalize' nestsar.py
+          grep -q 'return stable_l2_normalize(x)' nestsar.py
           grep -q 'bad_metrics = \[' nestsar.py
+          grep -q 'NestSAR 0.3.1' nestsar.py
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           rm -f .github/workflows/pr-patch-stability.yml
