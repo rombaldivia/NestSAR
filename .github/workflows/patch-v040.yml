@@ -1,0 +1,400 @@
+name: patch NestSAR v0.4.0
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/patch-v040.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Patch trainer
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('nestsar.py')
+          source = path.read_text(encoding='utf-8')
+
+          def replace_once(old: str, new: str, label: str) -> None:
+              global source
+              if new in source:
+                  return
+              if old not in source:
+                  raise RuntimeError(f'No se encontró el bloque requerido: {label}')
+              source = source.replace(old, new, 1)
+
+          # ------------------------------------------------------
+          # 1. Normalización L2 estable para vectores exactamente cero.
+          # ------------------------------------------------------
+          model_marker = '''# ============================================================
+          # MODELO
+          # ============================================================
+          '''
+          stable_marker = '''# ============================================================
+          # MODELO
+          # ============================================================
+
+          def stable_l2_normalize(
+              x: jnp.ndarray,
+              epsilon: float = 1e-12,
+          ) -> jnp.ndarray:
+              """Normalización L2 con gradientes finitos incluso para x == 0."""
+              squared_norm = jnp.sum(jnp.square(x), axis=-1, keepdims=True)
+              return x * jax.lax.rsqrt(squared_norm + epsilon)
+
+          '''
+          if 'def stable_l2_normalize(' not in source:
+              if model_marker not in source:
+                  raise RuntimeError('No se encontró el marcador MODELO')
+              source = source.replace(model_marker, stable_marker, 1)
+
+          replacements = [
+              (
+                  '''            keys = keys / (
+                  jnp.linalg.norm(keys, axis=-1, keepdims=True) + 1e-6
+              )
+              queries = queries / (
+                  jnp.linalg.norm(queries, axis=-1, keepdims=True) + 1e-6
+              )''',
+                  '''            keys = stable_l2_normalize(keys)
+              queries = stable_l2_normalize(queries)''',
+                  'H2 normalization',
+              ),
+              (
+                  '''        keys_1 = keys_1 / (
+              jnp.linalg.norm(keys_1, axis=-1, keepdims=True) + 1e-6
+          )
+          queries_1 = queries_1 / (
+              jnp.linalg.norm(queries_1, axis=-1, keepdims=True) + 1e-6
+          )''',
+                  '''        keys_1 = stable_l2_normalize(keys_1)
+          queries_1 = stable_l2_normalize(queries_1)''',
+                  'H3 level-1 normalization',
+              ),
+              (
+                  '''        queries_2 = queries_2 / (
+              jnp.linalg.norm(queries_2, axis=-1, keepdims=True) + 1e-6
+          )
+          keys_2 = keys_2 / (
+              jnp.linalg.norm(keys_2, axis=-1, keepdims=True) + 1e-6
+          )''',
+                  '''        queries_2 = stable_l2_normalize(queries_2)
+          keys_2 = stable_l2_normalize(keys_2)''',
+                  'H3 level-2 normalization',
+              ),
+              (
+                  '''def four_normalize_vectors(x: jnp.ndarray) -> jnp.ndarray:
+              return x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + 1e-6)''',
+                  '''def four_normalize_vectors(x: jnp.ndarray) -> jnp.ndarray:
+              return stable_l2_normalize(x)''',
+                  'NestSAR-4L normalization',
+              ),
+          ]
+          for old, new, label in replacements:
+              if new not in source:
+                  if old not in source:
+                      raise RuntimeError(f'No se encontró {label}')
+                  source = source.replace(old, new, 1)
+
+          # ------------------------------------------------------
+          # 2. Hiperparámetros del optimizador y scheduler.
+          # Los defaults preservan el experimento legacy.
+          # ------------------------------------------------------
+          old_config = '''    learning_rate: float = 2.0e-4
+              weight_decay: float = 3.0e-2
+              warmup_fraction: float = 0.10
+              label_smoothing: float = 0.05
+              grad_clip: float = 1.0
+          '''
+          new_config = '''    optimizer: str = "adamw"
+              scheduler: str = "cosine"
+              learning_rate: float = 2.0e-4
+              min_lr_ratio: float = 0.05
+              warmup_fraction: float = 0.10
+              warmup_start_ratio: float = 0.05
+              weight_decay: float = 3.0e-2
+              adam_beta1: float = 0.90
+              adam_beta2: float = 0.999
+              adam_epsilon: float = 1.0e-8
+              lion_beta1: float = 0.90
+              lion_beta2: float = 0.99
+              label_smoothing: float = 0.05
+              grad_clip: float = 1.0
+          '''
+          replace_once(old_config, new_config, 'Config optimizer fields')
+
+          old_schedule = '''def make_schedule(total_steps: int) -> optax.Schedule:
+              warmup_steps = max(1, int(total_steps * CFG.warmup_fraction))
+              decay_steps = max(1, total_steps - warmup_steps)
+              warmup = optax.linear_schedule(
+                  init_value=CFG.learning_rate * 0.05,
+                  end_value=CFG.learning_rate,
+                  transition_steps=warmup_steps,
+              )
+              cosine = optax.cosine_decay_schedule(
+                  init_value=CFG.learning_rate,
+                  decay_steps=decay_steps,
+                  alpha=0.05,
+              )
+              return optax.join_schedules([warmup, cosine], [warmup_steps])
+          '''
+          new_schedule = '''def make_schedule(total_steps: int) -> optax.Schedule:
+              warmup_steps = int(total_steps * CFG.warmup_fraction)
+              decay_steps = max(1, total_steps - warmup_steps)
+              minimum_lr = CFG.learning_rate * CFG.min_lr_ratio
+
+              if CFG.scheduler == "cosine":
+                  decay = optax.cosine_decay_schedule(
+                      init_value=CFG.learning_rate,
+                      decay_steps=decay_steps,
+                      alpha=CFG.min_lr_ratio,
+                  )
+              elif CFG.scheduler == "linear":
+                  decay = optax.linear_schedule(
+                      init_value=CFG.learning_rate,
+                      end_value=minimum_lr,
+                      transition_steps=decay_steps,
+                  )
+              elif CFG.scheduler == "constant":
+                  decay = optax.constant_schedule(CFG.learning_rate)
+              else:
+                  raise ValueError(f"Scheduler no soportado: {CFG.scheduler}")
+
+              if warmup_steps <= 0:
+                  return decay
+
+              warmup = optax.linear_schedule(
+                  init_value=CFG.learning_rate * CFG.warmup_start_ratio,
+                  end_value=CFG.learning_rate,
+                  transition_steps=max(1, warmup_steps),
+              )
+              return optax.join_schedules([warmup, decay], [warmup_steps])
+          '''
+          replace_once(old_schedule, new_schedule, 'make_schedule')
+
+          old_optimizer = '''    optimizer = optax.chain(
+              optax.clip_by_global_norm(CFG.grad_clip),
+              optax.adamw(
+                  learning_rate=make_schedule(total_steps),
+                  weight_decay=CFG.weight_decay,
+              ),
+          )
+          '''
+          new_optimizer = '''    schedule = make_schedule(total_steps)
+              if CFG.optimizer == "adamw":
+                  optimizer_core = optax.adamw(
+                      learning_rate=schedule,
+                      b1=CFG.adam_beta1,
+                      b2=CFG.adam_beta2,
+                      eps=CFG.adam_epsilon,
+                      weight_decay=CFG.weight_decay,
+                  )
+              elif CFG.optimizer == "lion":
+                  optimizer_core = optax.lion(
+                      learning_rate=schedule,
+                      b1=CFG.lion_beta1,
+                      b2=CFG.lion_beta2,
+                      weight_decay=CFG.weight_decay,
+                  )
+              else:
+                  raise ValueError(f"Optimizador no soportado: {CFG.optimizer}")
+
+              optimizer = optax.chain(
+                  optax.clip_by_global_norm(CFG.grad_clip),
+                  optimizer_core,
+              )
+          '''
+          replace_once(old_optimizer, new_optimizer, 'optimizer construction')
+
+          # ------------------------------------------------------
+          # 3. Conexión de argumentos a Config.
+          # ------------------------------------------------------
+          old_configure = '''        learning_rate=args.learning_rate,
+              weight_decay=args.weight_decay,
+              warmup_fraction=args.warmup_fraction,
+              label_smoothing=args.label_smoothing,
+          '''
+          new_configure = '''        optimizer=args.optimizer,
+              scheduler=args.scheduler,
+              learning_rate=args.learning_rate,
+              min_lr_ratio=args.min_lr_ratio,
+              warmup_fraction=args.warmup_fraction,
+              warmup_start_ratio=args.warmup_start_ratio,
+              weight_decay=args.weight_decay,
+              adam_beta1=args.adam_beta1,
+              adam_beta2=args.adam_beta2,
+              adam_epsilon=args.adam_epsilon,
+              lion_beta1=args.lion_beta1,
+              lion_beta2=args.lion_beta2,
+              label_smoothing=args.label_smoothing,
+          '''
+          replace_once(old_configure, new_configure, 'configure_from_args optimizer fields')
+
+          old_cli = '''    parser.add_argument("--learning-rate", type=float, default=2e-4)
+              parser.add_argument("--weight-decay", type=float, default=0.03)
+              parser.add_argument("--warmup-fraction", type=float, default=0.10)
+              parser.add_argument("--label-smoothing", type=float, default=0.05)
+              parser.add_argument("--grad-clip", type=float, default=1.0)
+              parser.add_argument("--memory-residual-scale", type=float, default=0.25)
+              parser.add_argument("--initial-eta", type=float, default=0.10)
+              parser.add_argument("--initial-alpha", type=float, default=0.95)
+          '''
+          new_cli = '''    parser.add_argument("--optimizer", choices=("adamw", "lion"), default="adamw")
+              parser.add_argument("--scheduler", choices=("cosine", "linear", "constant"), default="cosine")
+              parser.add_argument("--learning-rate", type=float, default=2e-4)
+              parser.add_argument("--min-lr-ratio", type=float, default=0.05)
+              parser.add_argument("--warmup-fraction", type=float, default=0.10)
+              parser.add_argument("--warmup-start-ratio", type=float, default=0.05)
+              parser.add_argument("--weight-decay", type=float, default=0.03)
+              parser.add_argument("--adam-beta1", type=float, default=0.90)
+              parser.add_argument("--adam-beta2", type=float, default=0.999)
+              parser.add_argument("--adam-epsilon", type=float, default=1e-8)
+              parser.add_argument("--lion-beta1", type=float, default=0.90)
+              parser.add_argument("--lion-beta2", type=float, default=0.99)
+              parser.add_argument("--label-smoothing", type=float, default=0.05)
+              parser.add_argument("--grad-clip", type=float, default=1.0)
+              parser.add_argument("--memory-residual-scale", type=float, default=0.25)
+              parser.add_argument(
+                  "--memory-update-rate-init", "--initial-eta",
+                  dest="initial_eta", type=float, default=0.10,
+                  help="Tasa inicial de escritura de memoria; --initial-eta es alias legacy.",
+              )
+              parser.add_argument(
+                  "--memory-retention-init", "--initial-alpha",
+                  dest="initial_alpha", type=float, default=0.95,
+                  help="Retención inicial de memoria; --initial-alpha es alias legacy.",
+              )
+          '''
+          replace_once(old_cli, new_cli, 'CLI optimizer and memory aliases')
+
+          # ------------------------------------------------------
+          # 4. Validación estricta de rangos.
+          # ------------------------------------------------------
+          validation_anchor = '''    if not 0 <= args.warmup_fraction <= 1:
+              raise ValueError("--warmup-fraction debe estar en [0,1].")
+          '''
+          validation_extended = '''    if not 0 <= args.warmup_fraction <= 1:
+              raise ValueError("--warmup-fraction debe estar en [0,1].")
+              if not 0 <= args.warmup_start_ratio <= 1:
+                  raise ValueError("--warmup-start-ratio debe estar en [0,1].")
+              if not 0 <= args.min_lr_ratio <= 1:
+                  raise ValueError("--min-lr-ratio debe estar en [0,1].")
+              if args.learning_rate <= 0:
+                  raise ValueError("--learning-rate debe ser mayor que cero.")
+              if args.weight_decay < 0:
+                  raise ValueError("--weight-decay no puede ser negativo.")
+              if args.grad_clip <= 0:
+                  raise ValueError("--grad-clip debe ser mayor que cero.")
+              if args.adam_epsilon <= 0:
+                  raise ValueError("--adam-epsilon debe ser mayor que cero.")
+              for name in ("adam_beta1", "adam_beta2", "lion_beta1", "lion_beta2"):
+                  value = getattr(args, name)
+                  if not 0 <= value < 1:
+                      raise ValueError(f"--{name.replace('_', '-')} debe estar en [0,1).")
+              if not 0 < args.initial_eta < 1:
+                  raise ValueError("--memory-update-rate-init debe estar en (0,1).")
+              if not 0 < args.initial_alpha < 1:
+                  raise ValueError("--memory-retention-init debe estar en (0,1).")
+          '''
+          replace_once(validation_anchor, validation_extended, 'validation ranges')
+
+          # ------------------------------------------------------
+          # 5. Smoke test con diagnóstico exacto de NaN/Inf.
+          # ------------------------------------------------------
+          old_smoke = '''    _, metrics = train_step(
+              state,
+              batch_x,
+              batch_y,
+              jax.random.PRNGKey(CFG.seed + 999),
+          )
+              jax.block_until_ready(metrics["loss"])
+              if not tree_all_finite(metrics):
+                  raise FloatingPointError("El paso físico produjo métricas no finitas.")
+          '''
+          new_smoke = '''    smoke_state, metrics = train_step(
+              state,
+              batch_x,
+              batch_y,
+              jax.random.PRNGKey(CFG.seed + 999),
+          )
+              jax.block_until_ready(metrics["loss"])
+              bad_metrics = [
+                  key
+                  for key, value in metrics.items()
+                  if not bool(np.asarray(jnp.all(jnp.isfinite(value))))
+              ]
+              if bad_metrics:
+                  raise FloatingPointError(
+                      "El paso físico produjo métricas no finitas: "
+                      + ", ".join(sorted(bad_metrics))
+                  )
+              if not tree_all_finite(smoke_state.params):
+                  raise FloatingPointError(
+                      "El paso físico produjo parámetros no finitos."
+                  )
+          '''
+          if 'bad_metrics = [' not in source:
+              if old_smoke not in source:
+                  raise RuntimeError('No se encontró el bloque smoke test')
+              source = source.replace(old_smoke, new_smoke, 1)
+
+          # ------------------------------------------------------
+          # 6. Logging y versión.
+          # ------------------------------------------------------
+          log_anchor = '''    log(f"JAX={jax.__version__} | backend={jax.default_backend()}")
+          '''
+          log_extended = '''    log(f"JAX={jax.__version__} | backend={jax.default_backend()}")
+              log(
+                  f"Optimizer={CFG.optimizer} | scheduler={CFG.scheduler} | "
+                  f"lr={CFG.learning_rate:g} | min_lr_ratio={CFG.min_lr_ratio:g} | "
+                  f"wd={CFG.weight_decay:g} | dropout={CFG.dropout:g}"
+              )
+          '''
+          replace_once(log_anchor, log_extended, 'optimizer logging')
+
+          source = source.replace(
+              'parser.add_argument("--version", action="version", version="NestSAR 0.3.0")',
+              'parser.add_argument("--version", action="version", version="NestSAR 0.4.0")',
+              1,
+          )
+          source = source.replace(
+              'parser.add_argument("--version", action="version", version="NestSAR 0.3.1")',
+              'parser.add_argument("--version", action="version", version="NestSAR 0.4.0")',
+              1,
+          )
+
+          path.write_text(source, encoding='utf-8')
+          PY
+
+      - name: Compile and verify
+        run: |
+          python -m py_compile nestsar.py
+          grep -q 'def stable_l2_normalize' nestsar.py
+          grep -q -- '--optimizer' nestsar.py
+          grep -q -- '--scheduler' nestsar.py
+          grep -q -- '--memory-update-rate-init' nestsar.py
+          grep -q -- '--memory-retention-init' nestsar.py
+          grep -q 'NestSAR 0.4.0' nestsar.py
+
+      - name: Remove one-shot workflows and commit
+        run: |
+          rm -f .github/workflows/patch-v040.yml
+          rm -f .github/workflows/fix-zero-gradient.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'fix: stabilize training and expose optimizer hyperparameters'
+          git push origin HEAD:main
