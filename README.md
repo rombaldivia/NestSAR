@@ -4,9 +4,33 @@ Nested multi-timescale memory networks for skeleton-based action recognition in 
 
 ## Project status
 
-This repository is under active research development. The current branch introduces the stable command-line interface and reproducibility metadata for a single-file trainer, `nestsar.py`, designed to run both on Kaggle and inside a local Python virtual environment.
+This repository is under active research development. The current branch introduces the stable command-line interface, automatic GPU discovery/allocation, and reproducibility metadata for a single-file trainer, `nestsar.py`, designed to run both on Kaggle and inside a local Python virtual environment.
 
-The training engine has **not yet been ported** into the standardized file. At this stage, use `--dry-run` to validate paths, hyperparameters, presets, GPU mapping, configuration hashing, and experiment metadata without starting training.
+The training engine has **not yet been ported** into the standardized file. At this stage, use `--dry-run` to validate paths, hyperparameters, presets, GPU allocation, configuration hashing, and experiment metadata without starting training.
+
+## Detect GPUs
+
+```bash
+python nestsar.py --list-gpus
+```
+
+By default, `--gpu-map auto` uses every visible GPU:
+
+- 1 GPU: XSUB and XSET are scheduled sequentially on the same device.
+- 2 GPUs: XSUB uses GPU 0 and XSET uses GPU 1 in parallel.
+- More than 2 GPUs: the visible devices are split between XSUB and XSET for future data-parallel execution.
+
+The maximum number of devices can be limited with:
+
+```bash
+python nestsar.py --list-gpus --max-gpus 2
+```
+
+An explicit allocation is also supported:
+
+```bash
+python nestsar.py --gpu-map xsub:0+1,xset:2+3
+```
 
 ## Current bootstrap usage
 
@@ -15,7 +39,7 @@ python nestsar.py \
   --preset legacy_4l_seed128 \
   --protocol both \
   --dataset auto \
-  --gpu-map xsub:0,xset:1 \
+  --gpu-map auto \
   --dry-run
 ```
 
@@ -33,7 +57,7 @@ python nestsar.py \
   --eval-batch-size 256 \
   --epochs 150 \
   --patience 40 \
-  --gpu-map xsub:0,xset:1
+  --gpu-map auto
 ```
 
 ## Planned model registry
@@ -49,6 +73,7 @@ python nestsar.py \
 - Shared preprocessing, optimizer, scheduler, evaluator, and checkpoint format
 - Exact training resume with model, optimizer, scheduler, RNG, and early-stopping state
 - Configuration snapshots and dataset fingerprints for every run
+- Automatic hardware inventory and GPU allocation saved with each run
 - The same command-line interface on Kaggle and local environments
 
 ## Current validated experimental reference
