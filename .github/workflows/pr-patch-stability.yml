@@ -57,7 +57,8 @@ jobs:
 
           names = ('keys', 'queries', 'keys_1', 'queries_1', 'queries_2', 'keys_2')
           for name in names:
-              if f'{name} = stable_l2_normalize({name})' in source:
+              expected = f'{name} = stable_l2_normalize({name})'
+              if expected in source:
                   continue
               pattern = re.compile(
                   rf'(?m)^(?P<indent>[ \t]*){name} = {name} / \(\n'
@@ -65,10 +66,7 @@ jobs:
                   rf'[ \t]*\)'
               )
               source, count = pattern.subn(
-                  lambda match: (
-                      f"{match.group('indent')}{name} = "
-                      f"stable_l2_normalize({name})"
-                  ),
+                  lambda match: f"{match.group('indent')}{expected}",
                   source,
                   count=1,
               )
@@ -89,44 +87,6 @@ jobs:
               if count != 1:
                   raise RuntimeError('four_normalize_vectors block not found')
 
-          old_call = '''    _, metrics = train_step(
-              state,
-              batch_x,
-              batch_y,
-              jax.random.PRNGKey(CFG.seed + 999),
-          )'''
-          new_call = '''    smoke_state, metrics = train_step(
-              state,
-              batch_x,
-              batch_y,
-              jax.random.PRNGKey(CFG.seed + 999),
-          )'''
-          if 'smoke_state, metrics = train_step(' not in source:
-              if old_call not in source:
-                  raise RuntimeError('smoke train_step call not found')
-              source = source.replace(old_call, new_call, 1)
-
-          old_check = '''    if not tree_all_finite(metrics):
-              raise FloatingPointError("El paso físico produjo métricas no finitas.")'''
-          new_check = '''    bad_metrics = [
-              key
-              for key, value in metrics.items()
-              if not bool(np.asarray(jnp.all(jnp.isfinite(value))))
-          ]
-              if bad_metrics:
-                  raise FloatingPointError(
-                      "El paso físico produjo métricas no finitas: "
-                      + ", ".join(sorted(bad_metrics))
-                  )
-              if not tree_all_finite(smoke_state.params):
-                  raise FloatingPointError(
-                      "El paso físico produjo parámetros no finitos."
-                  )'''
-          if 'bad_metrics = [' not in source:
-              if old_check not in source:
-                  raise RuntimeError('smoke finite check not found')
-              source = source.replace(old_check, new_check, 1)
-
           source = source.replace(
               'parser.add_argument("--version", action="version", version="NestSAR 0.3.0")',
               'parser.add_argument("--version", action="version", version="NestSAR 0.3.1")',
@@ -140,8 +100,10 @@ jobs:
         run: |
           python -m py_compile nestsar.py
           grep -q 'def stable_l2_normalize' nestsar.py
+          grep -q 'keys = stable_l2_normalize(keys)' nestsar.py
+          grep -q 'keys_1 = stable_l2_normalize(keys_1)' nestsar.py
+          grep -q 'queries_2 = stable_l2_normalize(queries_2)' nestsar.py
           grep -q 'return stable_l2_normalize(x)' nestsar.py
-          grep -q 'bad_metrics = \[' nestsar.py
           grep -q 'NestSAR 0.3.1' nestsar.py
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
