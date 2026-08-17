@@ -11,13 +11,16 @@ Forward changes relative to audited v4.1:
   1) causal depthwise temporal convolution, k=4
   2) existing bounded self-referential K/V/Q/eta/alpha/main-memory
   3) sequential forward CMS: f1 -> f2 -> f4 -> f8
-     with each CMS block D128 -> 32 -> D128
+     with configurable bottleneck width (default 32)
 
-The existing D128/T16 skeleton frontend, four streams, SASM, L1/L2/L3
-hierarchy, Short-L3 fix, H4/L4, classifier and stream fusion remain.
+Canonical audited generated configuration:
+  T16 / D128 / M64 / R32 / blocks 2-2-2-2 / CMS bottleneck 32
+  Parameters: 2,083,236
 
-Audited generated parameter count for D128/M64/R32/T16: 2,083,236.
-Softmax attention: NONE.
+For non-canonical dimensions the generated trainer reports the actual parameter
+count instead of incorrectly enforcing the canonical 2,083,236 guard. Set
+NESTSAR_EXPECTED_PARAMS to a positive integer when you want a hard guard for a
+custom configuration.
 """
 
 from __future__ import annotations
@@ -65,8 +68,13 @@ def build_core(root: Path) -> Path:
     s = replace_exact(
         s,
         f"EXPECTED_PARAMS = {EXPECTED_BASE_PARAMS:_}",
-        f"EXPECTED_PARAMS = {EXPECTED_NEW_PARAMS:_}",
-        "core parameter guard",
+        (
+            f"EXPECTED_PARAMS = {EXPECTED_NEW_PARAMS:_}\n\n"
+            'CMS_BOTTLENECK = int(os.environ.get("NESTSAR_CMS_BOTTLENECK", "32"))\n'
+            'if CMS_BOTTLENECK < 1:\n'
+            '    raise ValueError("NESTSAR_CMS_BOTTLENECK must be >= 1")'
+        ),
+        "core parameter guard / CMS config",
     )
 
     # ------------------------------------------------------------------
@@ -118,8 +126,8 @@ def build_core(root: Path) -> Path:
 
     # ------------------------------------------------------------------
     # Replace old single FF tail by sequential CMS f1/f2/f4/f8.
-    # Four 128->32->128 blocks deliberately preserve approximately the
-    # dense FLOPs/token of the old 128->128->128 FF tail.
+    # Canonical D128 uses bottleneck 32. The width can now be configured
+    # through NESTSAR_CMS_BOTTLENECK before importing the model.
     # ------------------------------------------------------------------
     start_marker = "        # Keep the proven M4 FF/residual tail unchanged."
     end_marker = "        # Compatibility with existing M4G-H4 aggregation."
@@ -137,7 +145,7 @@ def build_core(root: Path) -> Path:
                 name=f"cms_f{cms_frequency}_norm"
             )(output)
             cms_h = nn.Dense(
-                features=32,
+                features=CMS_BOTTLENECK,
                 use_bias=True,
                 kernel_init=nn.initializers.xavier_uniform(),
                 name=f"cms_f{cms_frequency}_in",
@@ -174,7 +182,7 @@ def build_core(root: Path) -> Path:
         'print("HOPE local conv:      causal temporal window=4")\n'
         'print("HOPE memory:          self-referential K/V/Q/eta/alpha/main-memory")\n'
         'print("Sequential CMS:       f1 -> f2 -> f4 -> f8")\n'
-        'print("CMS bottleneck:       32")\n'
+        'print(f"CMS bottleneck:       {CMS_BOTTLENECK}")\n'
         'print("Softmax attention:    NONE")',
         1,
     )
@@ -255,18 +263,46 @@ def build_train(root: Path) -> Path:
     if n != 1:
         raise RuntimeError(f"trainer tier mapping replacement count={n}")
 
-    # Add hard runtime parameter guard.
+    # Canonical guard is strict; custom dimensions are allowed and reported.
     old = '''    params = variables["params"]
     counts, leaves = tier_parameter_counts(params)'''
     new = f'''    params = variables["params"]
     parameter_count = sum(
         int(x.size) for x in jax.tree_util.tree_leaves(params)
     )
-    if parameter_count != {EXPECTED_NEW_PARAMS:_}:
+
+    forced_expected = int(os.environ.get("NESTSAR_EXPECTED_PARAMS", "0"))
+    canonical_config = (
+        ns.CFG.frames == 16
+        and ns.CFG.model_dim == 128
+        and ns.CFG.memory_dim == 64
+        and ns.CFG.controller_rank == 32
+        and ns.CFG.frame_blocks == 2
+        and ns.CFG.chunk_blocks == 2
+        and ns.CFG.clip_blocks == 2
+        and ns.CFG.controller_blocks == 2
+        and ns.CFG.chunk_size == 4
+        and ns.CFG.clip_size == 8
+        and int(os.environ.get("NESTSAR_CMS_BOTTLENECK", "32")) == 32
+    )
+    expected = (
+        forced_expected
+        if forced_expected > 0
+        else ({EXPECTED_NEW_PARAMS:_} if canonical_config else 0)
+    )
+
+    if expected > 0 and parameter_count != expected:
         raise RuntimeError(
-            f"PARAMETER GUARD FAIL: {{parameter_count:,}} != {EXPECTED_NEW_PARAMS:,}"
+            f"PARAMETER GUARD FAIL: {{parameter_count:,}} != {{expected:,}}"
         )
-    print(f"PARAMETER GUARD: PASS ({{parameter_count:,}})")
+    if expected > 0:
+        print(f"PARAMETER GUARD: PASS ({{parameter_count:,}})")
+    else:
+        print(
+            f"PARAMETER COUNT (custom config): {{parameter_count:,}} | "
+            "no canonical guard"
+        )
+
     counts, leaves = tier_parameter_counts(params)'''
     s = replace_exact(s, old, new, "trainer parameter guard")
 
@@ -295,8 +331,9 @@ def main() -> int:
     print("Root:             ", root)
     print("Core:             ", core.name)
     print("Trainer:          ", train.name)
-    print("Expected params:  ", f"{EXPECTED_NEW_PARAMS:,}")
-    print("Frames / D / M:    16 / 128 / 64")
+    print("Canonical params: ", f"{EXPECTED_NEW_PARAMS:,}")
+    print("Canonical config:  T16 / D128 / M64 / R32 / blocks 2-2-2-2")
+    print("CMS bottleneck:    env NESTSAR_CMS_BOTTLENECK (default 32)")
     print("Local conv:        causal depthwise k=4")
     print("Self-ref memory:   K/V/Q/eta/alpha/main-memory")
     print("Forward CMS:       f1 -> f2 -> f4 -> f8")
