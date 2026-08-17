@@ -17,10 +17,29 @@ flag. The universal runtime therefore removes --allow-cpu before delegating to
 the inherited parser and sets args.allow_cpu=True itself on TPU. This keeps the
 exact v4.1 training CLI unchanged while allowing the already-verified TPU
 backend to pass the old GPU-only guard.
+
+Kaggle notebook note
+--------------------
+A notebook kernel can remain inside a directory after a previous cell deletes
+that directory. In that state os.getcwd() raises FileNotFoundError and libtpu
+can abort while resolving its runtime/runfiles path. Repair the process working
+directory before importing JAX so TPU initialization never inherits a deleted
+cwd.
 """
 
 import os
 import sys
+from pathlib import Path
+
+# -----------------------------------------------------------------------------
+# Repair a deleted/stale cwd BEFORE JAX/libtpu is imported.
+# -----------------------------------------------------------------------------
+try:
+    os.getcwd()
+except FileNotFoundError:
+    safe_cwd = Path("/kaggle/working") if Path("/kaggle/working").is_dir() else Path(__file__).resolve().parent
+    os.chdir(safe_cwd)
+    print(f"Recovered deleted working directory -> {safe_cwd}")
 
 os.environ.setdefault("JAX_THREEFRY_PARTITIONABLE", "true")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -70,11 +89,6 @@ reg.PART_MASK_PROB = float(os.environ.get("NESTSAR_PART_MASK_PROB", str(reg.PART
 # -----------------------------------------------------------------------------
 # Legacy v4.1 CLI compatibility for TPU.
 # -----------------------------------------------------------------------------
-# run_universal.py historically appended --allow-cpu for TPU so that the old
-# nestsar.py GPU-only guard would not abort. The exact audited source bundle can
-# come from a revision whose argparse surface does not expose that flag. Strip
-# only this compatibility flag before the inherited parser sees argv, then set
-# the resulting Namespace attribute ourselves.
 if BACKEND == "tpu":
     removed_allow_cpu = "--allow-cpu" in sys.argv
     if removed_allow_cpu:
