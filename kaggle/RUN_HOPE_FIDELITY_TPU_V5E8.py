@@ -8,7 +8,7 @@ from pathlib import Path
 
 BUNDLE = "NestSAR_HOPE_v4_1_SHORTL3FIX_Kaggle_16F_ONE_CELL.py"
 REPO = Path(__file__).resolve().parents[1]
-RUNNER = REPO / "experiments" / "hope_fidelity_d128_v1" / "run_universal_v2.py"
+RUNNER = REPO / "experiments" / "hope_fidelity_d128_v1" / "run_universal_v3.py"
 
 
 def first_hit(name: str):
