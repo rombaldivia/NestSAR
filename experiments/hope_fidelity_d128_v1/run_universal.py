@@ -19,7 +19,7 @@ effective batch = global physical batch * accumulation.
 
 The exact v4.1 self-contained one-cell may be supplied with --bundle-cell. On
 Kaggle it is auto-discovered under /kaggle/input. Locally you can instead pass
---source-root pointing at the exact v4.1 source directory.
+--source-root pointing at the exact audited v4.1 source directory.
 """
 
 import argparse
@@ -129,6 +129,107 @@ def find_bundle(explicit: str | None) -> Path | None:
     return None
 
 
+def normalize_extracted_v41(runtime: Path) -> None:
+    """Reproduce the audited one-cell's post-extraction trainer fixes.
+
+    The exact self-contained v4.1 artifact stores an immutable source ZIP and
+    then applies three trainer-only patches before launch: optimizer-step LR
+    accounting, effective-batch logging / redundant-smoke omission, and the LR
+    display step. The universal launcher extracts the same immutable ZIP, so it
+    must apply those same idempotent patches before building HOPE-Fidelity.
+    """
+    core_path = runtime / "nestsar.py"
+    core = core_path.read_text(encoding="utf-8")
+
+    old_total = '''    steps_per_epoch = max(1, math.ceil(len(train_dataset) / CFG.batch_size))
+    total_steps = CFG.epochs * steps_per_epoch
+
+    model = build_model(model_id)
+'''
+    new_total = '''    steps_per_epoch = max(1, math.ceil(len(train_dataset) / CFG.batch_size))
+    total_micro_steps = CFG.epochs * steps_per_epoch
+    total_steps = max(
+        1,
+        math.ceil(total_micro_steps / max(1, CFG.grad_accum_steps)),
+    )
+    optimizer_steps_per_epoch = (
+        steps_per_epoch / max(1, CFG.grad_accum_steps)
+    )
+
+    model = build_model(model_id)
+'''
+    if old_total in core:
+        core = core.replace(old_total, new_total, 1)
+        print("[v4.1 PATCH] LR schedule counts effective optimizer updates")
+    elif "total_micro_steps = CFG.epochs * steps_per_epoch" not in core:
+        raise RuntimeError("Could not normalize v4.1 total_steps accounting")
+
+    old_block = '''    parameter_count = count_parameters(state.params)
+    log(f"Parámetros: {parameter_count:,}")
+
+    train_step, eval_step = build_steps(model, model_id)
+    smoke_test(model, state, train_step)
+    if smoke_only:
+'''
+    new_block = '''    parameter_count = count_parameters(state.params)
+    log(f"Parámetros: {parameter_count:,}")
+    log(
+        f"Batch físico={CFG.batch_size} | "
+        f"acumulación={CFG.grad_accum_steps} | "
+        f"batch efectivo≈{CFG.batch_size * CFG.grad_accum_steps} | "
+        f"updates/época≈{optimizer_steps_per_epoch:.2f}"
+    )
+
+    train_step, eval_step = build_steps(model, model_id)
+    log("Smoke test OMITIDO para esta corrida.")
+    if smoke_only:
+'''
+    if old_block in core:
+        core = core.replace(old_block, new_block, 1)
+        print("[v4.1 PATCH] effective-batch logging / redundant smoke omission")
+    elif 'log("Smoke test OMITIDO para esta corrida.")' not in core:
+        raise RuntimeError("Could not normalize v4.1 training-start block")
+
+    old_lr = "lr = float(np.asarray(make_schedule(total_steps)(state.step)))"
+    new_lr = '''lr_step = state.step // max(1, CFG.grad_accum_steps)
+            lr = float(np.asarray(make_schedule(total_steps)(lr_step)))'''
+    if old_lr in core:
+        core = core.replace(old_lr, new_lr, 1)
+        print("[v4.1 PATCH] displayed LR uses effective optimizer step")
+    elif (
+        "lr_step = state.step // max(1, CFG.grad_accum_steps)" not in core
+        and "lr_step = state.step // CFG.grad_accum_steps" not in core
+        and "lr_step = int(np.asarray(state.step)) // max(1, CFG.grad_accum_steps)" not in core
+    ):
+        raise RuntimeError("Could not normalize v4.1 LR logger")
+
+    if "grad_accum_steps" not in core or "--grad-accum-steps" not in core:
+        raise RuntimeError("Extracted v4.1 source has no gradient-accumulation CLI support")
+    core_path.write_text(core, encoding="utf-8")
+
+    reg_path = runtime / "nestsar_m4_regmask_ema_v3_safe.py"
+    reg = reg_path.read_text(encoding="utf-8")
+    ema_pattern = re.compile(r"^EMA_DECAY\s*=\s*[0-9.]+\s*$", re.MULTILINE)
+    match = ema_pattern.search(reg)
+    if not match:
+        raise RuntimeError("Could not find EMA_DECAY in exact v4.1 RegMask source")
+    if match.group(0) != "EMA_DECAY = 0.995":
+        reg = reg[:match.start()] + "EMA_DECAY = 0.995" + reg[match.end():]
+        print("[v4.1 PATCH] EMA_DECAY -> 0.995")
+    for marker in (
+        "FRAME_MASK_PROB = 0.08",
+        "JOINT_MASK_PROB = 0.08",
+        "PART_MASK_PROB = 0.03",
+    ):
+        if marker not in reg:
+            raise RuntimeError(f"Unexpected v4.1 RegMask source; missing {marker!r}")
+    reg_path.write_text(reg, encoding="utf-8")
+
+    compile(core, str(core_path), "exec")
+    compile(reg, str(reg_path), "exec")
+    print("Exact v4.1 post-extraction normalization: PASS")
+
+
 def extract_exact_bundle(cell: Path, runtime: Path) -> Path:
     text = cell.read_text(encoding="utf-8")
     patterns = (
@@ -151,6 +252,8 @@ def extract_exact_bundle(cell: Path, runtime: Path) -> Path:
         raise RuntimeError(
             f"Exact v4.1 bundle SHA mismatch: {actual} != {EXPECTED_BUNDLE_SHA256}"
         )
+    if runtime.exists():
+        shutil.rmtree(runtime)
     runtime.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(__import__("io").BytesIO(raw), "r") as zf:
         zf.extractall(runtime)
@@ -158,6 +261,7 @@ def extract_exact_bundle(cell: Path, runtime: Path) -> Path:
         missing = [name for name in REQUIRED_V41 if not (runtime / name).is_file()]
         raise RuntimeError("Extracted v4.1 bundle missing: " + ", ".join(missing))
     print(f"Exact v4.1 bundle: PASS | SHA256={actual}")
+    normalize_extracted_v41(runtime)
     return runtime
 
 
@@ -213,7 +317,6 @@ def build_parser():
         description="Universal NestSAR-HOPE-Fidelity trainer for RTX5080, 2xT4 and TPU v5e-8",
     )
 
-    # Source / run.
     ap.add_argument("--preset", choices=tuple(PRESETS), default="canonical")
     ap.add_argument("--source-root")
     ap.add_argument("--bundle-cell")
@@ -228,14 +331,12 @@ def build_parser():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--smoke-only", action="store_true")
 
-    # Accelerator.
     ap.add_argument("--backend", choices=("auto", "gpu", "tpu"), default=None)
     ap.add_argument("--device-count", type=int, default=None, help="0=all visible")
     ap.add_argument("--device-ids", help="GPU physical ids before JAX import, e.g. 0 or 0,1")
     ap.add_argument("--spmd", choices=("auto", "on", "off"), default=None)
     ap.add_argument("--gpu-memory-fraction", type=float, default=0.90)
 
-    # Architecture — same style as CD-Former CLI.
     ap.add_argument("--frames", type=int, default=16)
     ap.add_argument("--num-classes", type=int, default=120)
     ap.add_argument("--model-dim", type=int, default=128)
@@ -250,7 +351,6 @@ def build_parser():
     ap.add_argument("--cms-bottleneck", type=int, default=32)
     ap.add_argument("--expected-params", type=int, default=0, help="0=canonical guard or dynamic custom count")
 
-    # Optimization.
     ap.add_argument("--batch-size", type=int, default=None, help="GLOBAL physical batch")
     ap.add_argument("--grad-accum-steps", type=int, default=None)
     ap.add_argument("--eval-batch-size", type=int, default=None, help="GLOBAL eval batch")
@@ -269,13 +369,11 @@ def build_parser():
     ap.add_argument("--seed", type=int, default=128)
     ap.add_argument("--log-every-batches", type=int, default=200)
 
-    # RegMask / EMA.
     ap.add_argument("--ema-decay", type=float, default=0.995)
     ap.add_argument("--frame-mask-prob", type=float, default=0.08)
     ap.add_argument("--joint-mask-prob", type=float, default=0.08)
     ap.add_argument("--part-mask-prob", type=float, default=0.03)
 
-    # Self-reference.
     ap.add_argument("--selfref-dgd-scale", type=float, default=1.0)
     ap.add_argument("--selfref-eta-max", type=float, default=0.05)
     ap.add_argument("--selfref-residual-beta", type=float, default=0.10)
@@ -286,7 +384,6 @@ def build_parser():
     ap.add_argument("--selfref-state-init-scale", type=float, default=0.12)
     ap.add_argument("--short-l3-blend", type=float, default=1.0)
 
-    # Outer CMS / DMGD-L2.
     ap.add_argument("--cms-period-l1", type=int, default=1)
     ap.add_argument("--cms-period-l2", type=int, default=2)
     ap.add_argument("--cms-period-l3", type=int, default=4)
@@ -319,8 +416,6 @@ def main() -> int:
     source_root = resolve_source_root(args, runtime)
     dataset = find_dataset(args.dataset)
 
-    # Build in the source/runtime tree. The baseline source is never overwritten;
-    # the builder writes two new fidelity files.
     if not args.skip_build:
         subprocess.run([sys.executable, "-u", str(BUILDER), "--root", str(source_root)], check=True)
 
@@ -366,14 +461,12 @@ def main() -> int:
         env.pop("CUDA_VISIBLE_DEVICES", None)
         env.pop("XLA_PYTHON_CLIENT_MEM_FRACTION", None)
 
-    # Persistent XLA cache.
     cache = source_root / ".jax_cache_universal"
     cache.mkdir(parents=True, exist_ok=True)
     env["JAX_COMPILATION_CACHE_DIR"] = str(cache)
     env["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] = "1"
     env["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"] = "-1"
 
-    # Model/trainer controls read at import time.
     env.update({
         "NESTSAR_CMS_BOTTLENECK": str(args.cms_bottleneck),
         "NESTSAR_EXPECTED_PARAMS": str(args.expected_params),
@@ -437,6 +530,11 @@ def main() -> int:
         "--log-every-batches", str(args.log_every_batches),
         "--resume", resume,
     ]
+    # The inherited v4.1 CLI names this guard --allow-cpu, but semantically it
+    # means "allow a non-GPU JAX backend". We add it only for TPU; the universal
+    # worker has already hard-checked backend=tpu before ns.main() runs.
+    if args.backend == "tpu":
+        cmd.append("--allow-cpu")
     if args.smoke_only:
         cmd.append("--smoke-only")
 
