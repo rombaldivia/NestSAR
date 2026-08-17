@@ -25,67 +25,122 @@ This experiment starts from the exact audited NestSAR-HOPE v4.1 D128/T16 source 
 
 There is **no softmax attention**. The local convolution is temporal-only and depthwise; it is not a CNN/TCN backbone.
 
-## Audited generated size
+## Canonical generated size
 
-For T16 / D128 / M64 / R32:
+For T16 / D128 / M64 / R32 / blocks 2-2-2-2 / CMS bottleneck 32:
 
 - Params: **2,083,236**
 - Increase over v4.1: **49,248 params (+2.42%)**
 - Exact GFLOPs: **not yet locked; profile before paper claims**
 
-The design intentionally replaces the original D128 FF tail with four narrow `128 -> 32 -> 128` CMS blocks, keeping dense per-token compute close to the original tail.
+For custom dimensions the trainer now reports the actual parameter count rather than incorrectly enforcing 2,083,236. Pass `--expected-params N` when you want a hard guard for a custom configuration.
 
-## Build
+## Universal CD-Former-style CLI
 
-Run against the exact v4.1 source directory:
+Use:
 
 ```bash
-python experiments/hope_fidelity_d128_v1/build_from_v41.py \
-  --root /path/to/exact/v4.1/source
+python -u experiments/hope_fidelity_d128_v1/run_universal.py --help
 ```
 
-It creates two new files in that source directory without modifying the baseline files:
+The same launcher supports one RTX 5080, Kaggle 2xT4, and Kaggle TPU v5e-8. `--batch-size` is the **global physical batch**; when SPMD is active it is sharded across devices.
 
-- `nestsar_hope_fidelity_d128_v1_core.py`
-- `nestsar_hope_fidelity_d128_v1_train.py`
-
-## Scratch XSUB probe
+### RTX 5080 — canonical recipe
 
 ```bash
-python -u nestsar_hope_fidelity_d128_v1_train.py \
-  --model nestsar_hope_fidelity_d128_v1 \
+python -u experiments/hope_fidelity_d128_v1/run_universal.py \
+  --preset rtx5080 \
+  --source-root /home/romelbaldivia/NestSAR_RTX5080_TQDM/NestSAR_HOPE_v4_1_RTX5080_16F_E40 \
+  --dataset /home/romelbaldivia/Downloads/ntu120_3danno.pkl \
   --protocol xsub \
-  --dataset /path/to/ntu120_3danno.pkl \
-  --output-dir runs_hope_fidelity_d128_v1_probe_xsub \
-  --seed 128 \
-  --frames 16 \
-  --num-classes 120 \
-  --model-dim 128 \
-  --memory-dim 64 \
+  --probe --fresh
+```
+
+This preset is one GPU, global B32, accumulation 4, effective batch 128.
+
+### Kaggle 2xT4 — data parallel
+
+```bash
+python -u experiments/hope_fidelity_d128_v1/run_universal.py \
+  --preset 2xt4 \
+  --dataset auto \
+  --protocol xsub \
+  --probe --fresh
+```
+
+This preset uses both visible T4 GPUs with SPMD: global B32 -> local B16/GPU, accumulation 4 -> effective batch 128.
+
+### Kaggle TPU v5e-8 — throughput preset
+
+```bash
+python -u experiments/hope_fidelity_d128_v1/run_universal.py \
+  --preset tpu-v5e8 \
+  --dataset auto \
+  --protocol xsub \
+  --probe --fresh
+```
+
+This preset uses all 8 TPU devices: global B128 -> local B16/device, accumulation 1 -> effective batch 128.
+
+### TPU v5e-8 — strict batching comparison to v4.1
+
+```bash
+python -u experiments/hope_fidelity_d128_v1/run_universal.py \
+  --preset tpu-v5e8-canonical \
+  --dataset auto \
+  --protocol xsub \
+  --probe --fresh
+```
+
+This preserves B32 x accumulation4, with B32 sharded to B4/device.
+
+## Configurable architecture and optimizer arguments
+
+Example custom run:
+
+```bash
+python -u experiments/hope_fidelity_d128_v1/run_universal.py \
+  --preset 2xt4 \
+  --frames 32 \
+  --model-dim 192 \
+  --memory-dim 96 \
+  --controller-rank 48 \
   --frame-blocks 2 \
   --chunk-blocks 2 \
   --clip-blocks 2 \
   --controller-blocks 2 \
   --chunk-size 4 \
   --clip-size 8 \
-  --controller-rank 32 \
-  --dropout 0.22 \
+  --cms-bottleneck 48 \
   --batch-size 32 \
   --grad-accum-steps 4 \
   --eval-batch-size 64 \
-  --epochs 3 \
-  --patience 3 \
-  --learning-rate 1e-3 \
-  --weight-decay 0.05 \
-  --warmup-fraction 0.10 \
-  --label-smoothing 0.05 \
-  --grad-clip 1.0 \
-  --memory-residual-scale 0.25 \
-  --predictive-loss-weight 0.10 \
-  --initial-eta 0.02 \
-  --initial-alpha 0.95 \
-  --log-every-batches 200 \
-  --resume none
+  --learning-rate 6e-4 \
+  --weight-decay 0.03 \
+  --dropout 0.15 \
+  --epochs 100 \
+  --patience 20 \
+  --dataset auto \
+  --protocol xsub \
+  --fresh
 ```
 
-For the paper result, train from random initialization (`--resume none`). The old 73.24771% v4.1 model is the locked comparison baseline, not a warm start.
+The CLI also exposes EMA/RegMask, self-reference stability constants, CMS periods and DMGD-L2 settings.
+
+## Exact v4.1 source bundle
+
+The universal launcher requires the exact v4.1 source tree. Locally pass `--source-root`. On Kaggle attach `NestSAR_HOPE_v4_1_SHORTL3FIX_Kaggle_16F_ONE_CELL.py`; the launcher auto-discovers it under `/kaggle/input`, verifies the embedded bundle SHA-256, extracts the exact source, and then builds the fidelity files.
+
+## Build only
+
+```bash
+python experiments/hope_fidelity_d128_v1/build_from_v41.py \
+  --root /path/to/exact/v4.1/source
+```
+
+It creates two new files without modifying the baseline files:
+
+- `nestsar_hope_fidelity_d128_v1_core.py`
+- `nestsar_hope_fidelity_d128_v1_train.py`
+
+For the paper result, train from random initialization (`--resume none` or `--fresh`). The old 73.24771% v4.1 model is the locked comparison baseline, not a warm start.
