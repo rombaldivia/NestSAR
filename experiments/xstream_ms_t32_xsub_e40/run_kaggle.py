@@ -194,10 +194,12 @@ source = source.replace("/kaggle/working", str(RUNTIME_ROOT))
 # accumulation 16. Effective batch stays EXACTLY 128, while compile activation size is
 # ~4x smaller. Kaggle keeps the original B32/accum4 experiment unchanged.
 if PLATFORM == "colab":
+    # NOTE: anchor batch_size with its indentation. The bare substring "batch_size=32,"
+    # also occurs inside "eval_batch_size=32," and previously caused a false count of 2.
     simple_patches = [
-        ("batch_size=32,", "batch_size=8,", 1),
-        ("grad_accum_steps=4,", "grad_accum_steps=16,", 1),
-        ("eval_batch_size=32,", "eval_batch_size=8,", 1),
+        ("\n    batch_size=32,", "\n    batch_size=8,", 1),
+        ("\n    grad_accum_steps=4,", "\n    grad_accum_steps=16,", 1),
+        ("\n    eval_batch_size=32,", "\n    eval_batch_size=8,", 1),
         ("GLOBAL_BATCH = 32", "GLOBAL_BATCH = 8", 1),
         ("GRAD_ACCUM = 4", "GRAD_ACCUM = 16", 2),
         ("assert ns.CFG.batch_size == 32", "assert ns.CFG.batch_size == 8", 1),
