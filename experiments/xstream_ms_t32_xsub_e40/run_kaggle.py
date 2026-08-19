@@ -2,7 +2,6 @@
 from pathlib import Path
 import hashlib
 import os
-import re
 import shutil
 import sys
 import urllib.request
@@ -82,12 +81,10 @@ if digest != EXPECTED_SHA256:
 
 # ------------------------------------------------------------------------------------------
 # Runtime platform
+# IMPORTANT: detect Colab first. A Colab session can contain a stale /kaggle directory
+# created by an earlier launcher attempt; /content is the authoritative Colab marker.
 # ------------------------------------------------------------------------------------------
-if Path("/kaggle/working").exists():
-    PLATFORM = "kaggle"
-    RUNTIME_ROOT = Path("/kaggle/working")
-    SEARCH_ROOTS = [Path("/kaggle/input"), RUNTIME_ROOT]
-elif Path("/content").exists():
+if Path("/content").exists():
     PLATFORM = "colab"
     RUNTIME_ROOT = Path("/content/nestsar_xstream_runtime")
     RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
@@ -96,6 +93,10 @@ elif Path("/content").exists():
         Path("/content/drive/MyDrive"),
         RUNTIME_ROOT,
     ]
+elif Path("/kaggle/working").exists():
+    PLATFORM = "kaggle"
+    RUNTIME_ROOT = Path("/kaggle/working")
+    SEARCH_ROOTS = [Path("/kaggle/input"), RUNTIME_ROOT]
 else:
     raise RuntimeError(
         "Unsupported runtime: expected Google Colab (/content) or Kaggle (/kaggle/working)."
@@ -125,6 +126,8 @@ if PLATFORM == "colab":
         Path("/content") / DATASET_NAME,
         Path("/content/drive/MyDrive") / DATASET_NAME,
         RUNTIME_ROOT / DATASET_NAME,
+        # Reuse a previously downloaded copy from a stale Kaggle-style directory if present.
+        Path("/kaggle/working") / DATASET_NAME,
     ]
 else:
     candidates.append(RUNTIME_ROOT / DATASET_NAME)
@@ -185,38 +188,47 @@ source = source.replace(
 # 2) Redirect every hard-coded Kaggle working path to the active runtime root.
 source = source.replace("/kaggle/working", str(RUNTIME_ROOT))
 
-# 3) TPU runtimes may expose different logical device counts. Keep TPU-only execution,
-# but require only that GLOBAL_BATCH shards evenly across the visible devices.
-device_guard = re.compile(
-    r'if\s*\(\s*len\(\s*DEVICES\s*\)\s*!=\s*8\s*\)\s*:\s*'
-    r'raise RuntimeError\(\s*f"Expected 8 TPU devices; found \{len\(DEVICES\)\}"\s*\)',
-    re.MULTILINE,
-)
-source, device_patch_count = device_guard.subn(
-    'if len(DEVICES) < 1 or (GLOBAL_BATCH % len(DEVICES)) != 0:\n\n'
-    '    raise RuntimeError(\n'
-    '        f"Global batch {GLOBAL_BATCH} must be divisible by visible TPU device count {len(DEVICES)}"\n'
-    '    )',
-    source,
-    count=1,
-)
-if device_patch_count != 1:
-    raise RuntimeError(
-        f"TPU device guard portability patch failed; matches={device_patch_count}"
-    )
+# 3) TPU runtimes may expose different logical device counts. The committed all-in-one
+# source formats the old 8-device guard across several lines, so patch that exact block
+# rather than relying on a fragile regex.
+old_device_guard = '''if len(
+    DEVICES
+) != 8:
 
-# Keep result metadata accurate for non-8 logical topologies.
-local_batch_pattern = re.compile(
-    r'("local_batch"\s*:\s*GLOBAL_BATCH\s*//\s*)8(\s*,)',
-    re.MULTILINE,
-)
-source, local_batch_patch_count = local_batch_pattern.subn(
-    r'\1len(DEVICES)\2',
-    source,
-    count=1,
-)
-if local_batch_patch_count not in (0, 1):
-    raise RuntimeError("Unexpected local_batch metadata patch count")
+    raise RuntimeError(
+        f"Expected 8 TPU devices; found {len(DEVICES)}"
+    )'''
+new_device_guard = '''if len(DEVICES) < 1 or (GLOBAL_BATCH % len(DEVICES)) != 0:
+
+    raise RuntimeError(
+        f"Global batch {GLOBAL_BATCH} must be divisible by visible TPU device count {len(DEVICES)}"
+    )'''
+
+device_guard_count = source.count(old_device_guard)
+if device_guard_count != 1:
+    raise RuntimeError(
+        f"TPU device guard portability patch failed; expected exactly 1 block, found {device_guard_count}"
+    )
+source = source.replace(old_device_guard, new_device_guard, 1)
+
+# Keep result metadata accurate for non-8 logical topologies. The source also formats
+# this value over several lines, so patch the exact block.
+old_local_batch = '''"local_batch":
+        GLOBAL_BATCH
+        //
+        8,'''
+new_local_batch = '''"local_batch":
+        GLOBAL_BATCH
+        //
+        len(DEVICES),'''
+
+local_batch_count = source.count(old_local_batch)
+if local_batch_count == 1:
+    source = source.replace(old_local_batch, new_local_batch, 1)
+elif local_batch_count != 0:
+    raise RuntimeError(
+        f"Unexpected local_batch metadata block count: {local_batch_count}"
+    )
 
 runtime_bytes = source.encode("utf-8")
 runtime_sha = hashlib.sha256(runtime_bytes).hexdigest()
@@ -248,6 +260,7 @@ if missing_markers:
     )
 
 print("Committed source audit: PASS")
+print("Device guard patch:     PASS")
 print("Runtime syntax audit:   PASS")
 print("Marker audit:           PASS")
 print("Runtime SHA256:         ", runtime_sha)
