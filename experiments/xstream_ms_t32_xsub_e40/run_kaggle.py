@@ -11,8 +11,6 @@ import urllib.request
 EXPECTED_SHA256 = "9185ad324e490de1f12f49feea5eb94d6a514fee05a06d7ab724bd32cb040f72"
 NUM_PARTS = 11
 
-# The original chunk upload introduced one extra trailing character in three
-# chunks. These are the intended UTF-8 byte lengths after boundary repair.
 EXPECTED_PART_BYTES = [
     18010,
     18000,
@@ -49,8 +47,7 @@ for i, path in enumerate(PARTS):
         candidate = text[:-1]
         if len(candidate.encode("utf-8")) != expected_bytes:
             raise RuntimeError(
-                f"Chunk {i:02d} has an unexpected +1 byte corruption: "
-                f"{actual_bytes} bytes"
+                f"Chunk {i:02d} has an unexpected +1 byte corruption: {actual_bytes} bytes"
             )
         normalized = candidate
         print(
@@ -70,7 +67,7 @@ source_bytes = source.encode("utf-8")
 digest = hashlib.sha256(source_bytes).hexdigest()
 
 print("=" * 100)
-print("NESTSAR XSTREAM-MS T32 XSUB E40 — KAGGLE LAUNCHER")
+print("NESTSAR XSTREAM-MS T32 XSUB E40 — COLAB/KAGGLE LAUNCHER")
 print("=" * 100)
 print("Chunks:       ", NUM_PARTS)
 print("Source bytes: ", len(source_bytes))
@@ -83,23 +80,37 @@ if digest != EXPECTED_SHA256:
         f"actual:   {digest}"
     )
 
-# This production launcher is intentionally Kaggle-only.
-if Path("/content").exists() and not Path("/kaggle").exists():
+# ------------------------------------------------------------------------------------------
+# Runtime platform
+# ------------------------------------------------------------------------------------------
+if Path("/kaggle/working").exists():
+    PLATFORM = "kaggle"
+    RUNTIME_ROOT = Path("/kaggle/working")
+    SEARCH_ROOTS = [Path("/kaggle/input"), RUNTIME_ROOT]
+elif Path("/content").exists():
+    PLATFORM = "colab"
+    RUNTIME_ROOT = Path("/content/nestsar_xstream_runtime")
+    RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
+    SEARCH_ROOTS = [
+        Path("/content"),
+        Path("/content/drive/MyDrive"),
+        RUNTIME_ROOT,
+    ]
+else:
     raise RuntimeError(
-        "This launcher is locked to Kaggle TPU, but this runtime is Google Colab "
-        "(/content exists and /kaggle does not). Open a Kaggle notebook and enable TPU."
+        "Unsupported runtime: expected Google Colab (/content) or Kaggle (/kaggle/working)."
     )
 
-if not Path("/kaggle/working").exists():
-    raise RuntimeError("/kaggle/working was not found; this does not look like a Kaggle runtime.")
+print("Platform:     ", PLATFORM)
+print("Runtime root: ", RUNTIME_ROOT)
 
 # ------------------------------------------------------------------------------------------
-# Resolve NTU120 robustly across Kaggle accounts.
+# Resolve NTU120 robustly.
 # Priority:
 #   1) NESTSAR_DATASET environment override
-#   2) any attached Kaggle input containing ntu120_3danno.pkl
-#   3) /kaggle/working cache
-#   4) OpenMMLab download when Kaggle internet is enabled
+#   2) common local/attached paths
+#   3) recursive search for the exact filename
+#   4) OpenMMLab download
 # ------------------------------------------------------------------------------------------
 DATASET_NAME = "ntu120_3danno.pkl"
 DATASET_URL = "https://download.openmmlab.com/mmaction/pyskl/data/nturgbd/ntu120_3danno.pkl"
@@ -109,24 +120,34 @@ manual = os.environ.get("NESTSAR_DATASET", "").strip()
 if manual:
     candidates.append(Path(manual))
 
-input_root = Path("/kaggle/input")
-if input_root.exists():
-    candidates.extend(input_root.rglob(DATASET_NAME))
+if PLATFORM == "colab":
+    candidates += [
+        Path("/content") / DATASET_NAME,
+        Path("/content/drive/MyDrive") / DATASET_NAME,
+        RUNTIME_ROOT / DATASET_NAME,
+    ]
+else:
+    candidates.append(RUNTIME_ROOT / DATASET_NAME)
 
-working_dataset = Path("/kaggle/working") / DATASET_NAME
-candidates.append(working_dataset)
+for root in SEARCH_ROOTS:
+    if root.exists():
+        try:
+            candidates.extend(root.rglob(DATASET_NAME))
+        except Exception:
+            pass
 
 dataset = next((p for p in candidates if p.is_file()), None)
+working_dataset = RUNTIME_ROOT / DATASET_NAME
 
 if dataset is None:
-    print("NTU120 dataset was not attached; attempting OpenMMLab download...")
+    print("NTU120 dataset was not found locally; attempting OpenMMLab download...")
     tmp = working_dataset.with_suffix(".pkl.part")
     try:
         req = urllib.request.Request(
             DATASET_URL,
-            headers={"User-Agent": "NestSAR-Kaggle/1.0"},
+            headers={"User-Agent": "NestSAR-Colab-Kaggle/1.0"},
         )
-        with urllib.request.urlopen(req, timeout=60) as response, tmp.open("wb") as f:
+        with urllib.request.urlopen(req, timeout=120) as response, tmp.open("wb") as f:
             shutil.copyfileobj(response, f, length=16 * 1024 * 1024)
         tmp.replace(working_dataset)
         dataset = working_dataset
@@ -135,14 +156,10 @@ if dataset is None:
             tmp.unlink(missing_ok=True)
         except Exception:
             pass
-        found_pkls = []
-        if input_root.exists():
-            found_pkls = [str(p) for p in input_root.rglob("*.pkl")][:20]
         raise FileNotFoundError(
             "ntu120_3danno.pkl was not found and automatic OpenMMLab download failed.\n"
-            "Attach the NTU120 dataset to this Kaggle notebook, or set NESTSAR_DATASET to its path.\n"
-            f"Download error: {type(exc).__name__}: {exc}\n"
-            "Visible .pkl files:\n  - " + ("\n  - ".join(found_pkls) if found_pkls else "NONE")
+            "Upload/mount the dataset, or set NESTSAR_DATASET to its full path.\n"
+            f"Download error: {type(exc).__name__}: {exc}"
         ) from exc
 
 print("Dataset:      ", dataset)
@@ -153,7 +170,7 @@ os.environ["NESTSAR_DATASET"] = str(dataset)
 # Deterministic runtime portability patches.
 # The committed source payload is verified ABOVE before any patch is applied.
 # ------------------------------------------------------------------------------------------
-# 1) Make the resolved dataset an explicit first candidate without changing model/training code.
+# 1) Make the resolved dataset an explicit first candidate.
 dataset_anchor = "DATASET_CANDIDATES = ["
 if source.count(dataset_anchor) != 1:
     raise RuntimeError(
@@ -165,8 +182,11 @@ source = source.replace(
     1,
 )
 
-# 2) Newer Kaggle TPU runtimes may expose the v5e slice as fewer logical JAX devices.
-# Keep TPU-only execution, but require only that the global batch shards evenly.
+# 2) Redirect every hard-coded Kaggle working path to the active runtime root.
+source = source.replace("/kaggle/working", str(RUNTIME_ROOT))
+
+# 3) TPU runtimes may expose different logical device counts. Keep TPU-only execution,
+# but require only that GLOBAL_BATCH shards evenly across the visible devices.
 device_guard = re.compile(
     r'if\s*\(\s*len\(\s*DEVICES\s*\)\s*!=\s*8\s*\)\s*:\s*'
     r'raise RuntimeError\(\s*f"Expected 8 TPU devices; found \{len\(DEVICES\)\}"\s*\)',
@@ -185,7 +205,7 @@ if device_patch_count != 1:
         f"TPU device guard portability patch failed; matches={device_patch_count}"
     )
 
-# Keep result metadata accurate when the runtime exposes a non-8 logical topology.
+# Keep result metadata accurate for non-8 logical topologies.
 local_batch_pattern = re.compile(
     r'("local_batch"\s*:\s*GLOBAL_BATCH\s*//\s*)8(\s*,)',
     re.MULTILINE,
@@ -201,13 +221,11 @@ if local_batch_patch_count not in (0, 1):
 runtime_bytes = source.encode("utf-8")
 runtime_sha = hashlib.sha256(runtime_bytes).hexdigest()
 
-# Static syntax check before starting JAX/TPU initialization.
 try:
     compile(source, "<NestSAR-XStream-MS-T32>", "exec")
 except SyntaxError as exc:
     raise RuntimeError(f"Runtime-patched XStream source does not compile: {exc}") from exc
 
-# Architecture/training markers that must be present in this exact experiment.
 REQUIRED_MARKERS = [
     "class CrossStreamMultiScaleHint",
     "class NestSARHOPEXStreamMST32",
@@ -234,8 +252,7 @@ print("Runtime syntax audit:   PASS")
 print("Marker audit:           PASS")
 print("Runtime SHA256:         ", runtime_sha)
 
-out_root = Path("/kaggle/working")
-target = out_root / "NestSAR_HOPE_XStream_MS_T32_D128_XSUB_E40_ALL_IN_ONE.py"
+target = RUNTIME_ROOT / "NestSAR_HOPE_XStream_MS_T32_D128_XSUB_E40_ALL_IN_ONE.py"
 target.write_text(source, encoding="utf-8")
 
 print("Assembled:             ", target)
