@@ -137,6 +137,19 @@ source = source.replace(
     f'NestSAR_HOPE_XSTREAM_J25_T32_D128_XSUB_E{EPOCHS:02d}',
 )
 
+# J25 backward fix: non-joint hint cotangents have shape
+# [3, B, T, J, D].  The original XStream code used the old 4-D
+# transpose for [3, B, T, D].  Preserve the joint axis and move the
+# non-joint stream axis beside it: [B, T, 3, J, D].
+transpose_old = "jnp.transpose(cn, (1, 2, 0, 3))"
+transpose_new = "jnp.transpose(cn, (1, 2, 0, 3, 4))"
+if source.count(transpose_old) != 1:
+    raise RuntimeError(
+        "J25 cotangent transpose patch guard failed; "
+        f"matches={source.count(transpose_old)}"
+    )
+source = source.replace(transpose_old, transpose_new, 1)
+
 # Marker audit: verify the science-defining invariants before execution.
 markers = [
     "NUM_JOINT_TOKENS = 25",
@@ -146,6 +159,7 @@ markers = [
     "FIRST spatial collapse: only now, after L1/L2/L3/L4.",
     '"spatial_collapse_before_l4":',
     "False,",
+    transpose_new,
 ]
 missing = [m for m in markers if m not in source]
 if missing:
@@ -164,6 +178,7 @@ print("Dataset:              ", dataset)
 print("Dataset bytes:        ", f"{dataset.stat().st_size:,}")
 print("Source audit:          PASS", EXPECTED_SHA)
 print("Runtime syntax audit:  PASS")
+print("J25 backward transpose:PASS  [3,B,T,J,D] -> [B,T,3,J,D]")
 print("Spatial tokens:        25 joints preserved through L1/L2/L3/L4")
 print("Cross-stream:          joint-aligned S=4 attention at L1/L2/L3 hints")
 print("Physical global batch:", global_batch)
