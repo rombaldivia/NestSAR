@@ -89,8 +89,24 @@ if backend != "tpu":
 if num_devices < 1 or EFFECTIVE_BATCH % num_devices:
     raise RuntimeError(f"Unsupported TPU topology: devices={num_devices}")
 
-# One physical sample per visible TPU device. J25 internally expands each sample to 25 joint tracks.
-global_batch = num_devices
+# J25 expands each physical sample into 25 temporal joint tracks.  B1 was
+# intentionally conservative for first compile.  Colab now defaults to B4;
+# the effective batch remains exactly 128 by reducing gradient accumulation.
+default_batch = 4 if PLATFORM == "colab" else num_devices
+global_batch = int(os.environ.get("NESTSAR_GLOBAL_BATCH", str(default_batch)))
+if global_batch < num_devices:
+    raise RuntimeError(
+        f"NESTSAR_GLOBAL_BATCH={global_batch} must be >= visible devices={num_devices}"
+    )
+if global_batch % num_devices:
+    raise RuntimeError(
+        f"NESTSAR_GLOBAL_BATCH={global_batch} must be divisible by devices={num_devices}"
+    )
+if global_batch > EFFECTIVE_BATCH or EFFECTIVE_BATCH % global_batch:
+    raise RuntimeError(
+        f"NESTSAR_GLOBAL_BATCH={global_batch} must divide effective batch {EFFECTIVE_BATCH}"
+    )
+
 grad_accum = EFFECTIVE_BATCH // global_batch
 eval_batch = global_batch
 microsteps = math.ceil(TRAIN_EXPECTED / global_batch)
@@ -182,6 +198,7 @@ print("J25 backward transpose:PASS  [3,B,T,J,D] -> [B,T,3,J,D]")
 print("Spatial tokens:        25 joints preserved through L1/L2/L3/L4")
 print("Cross-stream:          joint-aligned S=4 attention at L1/L2/L3 hints")
 print("Physical global batch:", global_batch)
+print("Local batch/TPU:       ", global_batch // num_devices)
 print("Grad accumulation:     ", grad_accum)
 print("Effective batch:       ", EFFECTIVE_BATCH)
 print("Microsteps/epoch:      ", f"{microsteps:,}")
