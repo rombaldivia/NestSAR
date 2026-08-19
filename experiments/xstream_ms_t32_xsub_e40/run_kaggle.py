@@ -188,7 +188,89 @@ source = source.replace(
 # 2) Redirect every hard-coded Kaggle working path to the active runtime root.
 source = source.replace("/kaggle/working", str(RUNTIME_ROOT))
 
-# 3) TPU runtimes may expose different logical device counts. The committed all-in-one
+# 3) Colab's current TPU runtime can expose the TPU slice as ONE logical JAX device.
+# Running the original B32/T32 gradient compile on that one logical device drives host
+# compiler RAM close to Colab's ~47 GB limit. For Colab only, use microbatch B8 and
+# accumulation 16. Effective batch stays EXACTLY 128, while compile activation size is
+# ~4x smaller. Kaggle keeps the original B32/accum4 experiment unchanged.
+if PLATFORM == "colab":
+    simple_patches = [
+        ("batch_size=32,", "batch_size=8,", 1),
+        ("grad_accum_steps=4,", "grad_accum_steps=16,", 1),
+        ("eval_batch_size=32,", "eval_batch_size=8,", 1),
+        ("GLOBAL_BATCH = 32", "GLOBAL_BATCH = 8", 1),
+        ("GRAD_ACCUM = 4", "GRAD_ACCUM = 16", 2),
+        ("assert ns.CFG.batch_size == 32", "assert ns.CFG.batch_size == 8", 1),
+        ("assert ns.CFG.grad_accum_steps == 4", "assert ns.CFG.grad_accum_steps == 16", 1),
+        ("assert MICROSTEPS_PER_EPOCH == 1970", "assert MICROSTEPS_PER_EPOCH == 7879", 1),
+        ("assert TOTAL_MICROSTEPS == 78_800", "assert TOTAL_MICROSTEPS == 315_160", 1),
+        ("assert TOTAL_STEPS == 19_700", "assert TOTAL_STEPS == 19_698", 1),
+        ("every_k_schedule=4,", "every_k_schedule=GRAD_ACCUM,", 1),
+    ]
+
+    for old, new, expected_count in simple_patches:
+        actual_count = source.count(old)
+        if actual_count != expected_count:
+            raise RuntimeError(
+                f"Colab memory patch failed for {old!r}: "
+                f"expected {expected_count} occurrence(s), found {actual_count}"
+            )
+        source = source.replace(old, new)
+
+    old_fast_boundary = '''    if (
+        next_accepted
+        %
+        4
+        ==
+        0
+    ):'''
+    new_fast_boundary = '''    if (
+        next_accepted
+        %
+        GRAD_ACCUM
+        ==
+        0
+    ):'''
+    if source.count(old_fast_boundary) != 1:
+        raise RuntimeError("Colab FAST boundary patch failed")
+    source = source.replace(old_fast_boundary, new_fast_boundary, 1)
+
+    old_ema_boundary = '''        if (
+            accepted
+            %
+            4
+            ==
+            0
+        ):'''
+    new_ema_boundary = '''        if (
+            accepted
+            %
+            GRAD_ACCUM
+            ==
+            0
+        ):'''
+    if source.count(old_ema_boundary) != 1:
+        raise RuntimeError("Colab EMA boundary patch failed")
+    source = source.replace(old_ema_boundary, new_ema_boundary, 1)
+
+    old_expected_fast = '''expected_fast = (
+    accepted
+    //
+    4
+)'''
+    new_expected_fast = '''expected_fast = (
+    accepted
+    //
+    GRAD_ACCUM
+)'''
+    if source.count(old_expected_fast) != 1:
+        raise RuntimeError("Colab expected FAST counter patch failed")
+    source = source.replace(old_expected_fast, new_expected_fast, 1)
+
+    print("Colab memory profile: B8 / accumulation16 / effective batch128")
+    print("Colab E40 schedule:   7,879 microsteps/epoch / 19,698 optimizer steps")
+
+# 4) TPU runtimes may expose different logical device counts. The committed all-in-one
 # source formats the old 8-device guard across several lines, so patch that exact block
 # rather than relying on a fragile regex.
 old_device_guard = '''if len(
