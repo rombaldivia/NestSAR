@@ -1,0 +1,1134 @@
+int("=" * 132)
+
+# NESTSAR-HOPE-XSTREAM-MS T32 D128
+#
+# REAL NTU120 XSUB — FULL RUN
+#
+# FROM TRUE SCRATCH
+#
+# Model:
+#   frames             = 32
+#   Dmodel             = 128
+#   attention dim      = 64
+#   heads              = 4
+#   head dim           = 16
+#   parameters         = 2,428,764
+#   leaves             = 724
+#
+# Training:
+#   official XSUB      = 63,026 train / 50,919 val
+#   TPU                = v5e-8
+#   global batch       = 32
+#   local batch        = 4
+#   grad accumulation  = 4
+#   effective batch    = 128
+#
+# Optimizer:
+#   FAST               = 4 microbatches
+#   MEDIUM             = 8
+#   SLOW               = 16
+#   CONSOLIDATE        = 32
+#   DMGD-L2
+#   AdamW
+#
+# Regularization:
+#   RegMask            = 8% frame / 8% joint / 3% part
+#   EMA                = 0.995
+#
+# Validation:
+#   EMA weights
+#   no RegMask
+#   training=False
+#
+# IMPORTANT:
+#   This cell assumes all previous Attention-Lite audit/smoke cells remain
+#   alive in THIS SAME kernel.
+# ==========================================================================================
+
+from pathlib import Path
+from functools import partial
+import json
+import math
+import pickle
+import time
+import dataclasses
+
+import numpy as np
+
+import jax
+import jax.numpy as jnp
+import optax
+
+from flax import serialization
+from flax import traverse_util
+
+from jax.sharding import (
+    Mesh,
+    NamedSharding,
+    PartitionSpec as P,
+)
+
+from tqdm.auto import tqdm
+
+
+# ==========================================================================================
+# 0. LOCKED EXPERIMENT
+# ==========================================================================================
+
+SEED = 128
+
+EPOCHS = 40
+
+GLOBAL_BATCH = 32
+GRAD_ACCUM = 4
+EFFECTIVE_BATCH = 128
+
+EXPECTED_PARAMS = 2_428_764
+EXPECTED_LEAVES = 724
+
+TRAIN_EXPECTED = 63_026
+VAL_EXPECTED = 50_919
+
+MICROSTEPS_PER_EPOCH = math.ceil(
+    TRAIN_EXPECTED
+    /
+    GLOBAL_BATCH
+)
+
+TOTAL_MICROSTEPS = (
+    MICROSTEPS_PER_EPOCH
+    *
+    EPOCHS
+)
+
+# Same schedule convention as Fidelity production probe.
+TOTAL_STEPS = math.ceil(
+    TOTAL_MICROSTEPS
+    /
+    GRAD_ACCUM
+)
+
+assert MICROSTEPS_PER_EPOCH == 1970
+assert TOTAL_MICROSTEPS == 78_800
+assert TOTAL_STEPS == 19_700
+
+
+# ==========================================================================================
+# IMPORTANT: REBUILD OPTIMIZERS FOR THE 40-EPOCH LR HORIZON
+#
+# The audit cells originally built FAST_ADAM_TX and tier_tx with TOTAL_STEPS=1478
+# for the 3-epoch probe. Rebuild them here BEFORE optimizer-state initialization so
+# the real run uses the correct 19,700-step schedule.
+# ==========================================================================================
+
+FAST_ADAM_TX = [
+    optax.adamw(
+        learning_rate=scaled_schedule(
+            TOTAL_STEPS,
+            1,
+        ),
+        weight_decay=ns.CFG.weight_decay,
+    )
+    for _ in range(NUM_FAST_FRAGMENTS)
+]
+
+tier_tx = {}
+
+for tier, period in PERIODS.items():
+    inner = optax.chain(
+        dmgd_l2_diag(),
+        optax.clip_by_global_norm(
+            ns.CFG.grad_clip
+        ),
+        optax.adamw(
+            learning_rate=scaled_schedule(
+                TOTAL_STEPS,
+                period,
+            ),
+            weight_decay=ns.CFG.weight_decay,
+        ),
+    )
+
+    tier_tx[tier] = optax.MultiSteps(
+        inner,
+        every_k_schedule=max(
+            1,
+            GRAD_ACCUM * period,
+        ),
+        use_grad_mean=True,
+    )
+
+print(
+    f"40-epoch optimizer schedules rebuilt: TOTAL_STEPS={TOTAL_STEPS:,}"
+)
+
+
+OUT = Path(
+    "/kaggle/working/"
+    "NestSAR_HOPE_XSTREAM_MS_T32_D128_XSUB_E40"
+)
+
+OUT.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+
+DATASET_CANDIDATES = [
+
+    Path(
+        "/kaggle/input/models/"
+        "paolamaydana/ntudanno/"
+        "other/default/1/"
+        "ntu120_3danno.pkl"
+    ),
+]
+
+
+if Path(
+    "/kaggle/input"
+).exists():
+
+    DATASET_CANDIDATES += list(
+
+        Path(
+            "/kaggle/input"
+        ).rglob(
+            "ntu120_3danno.pkl"
+        )
+    )
+
+
+DATASET = next(
+
+    (
+        p
+        for p
+        in DATASET_CANDIDATES
+        if p.is_file()
+    ),
+
+    None,
+)
+
+
+if DATASET is None:
+
+    raise FileNotFoundError(
+        "ntu120_3danno.pkl was not found."
+    )
+
+
+# ==========================================================================================
+# 1. REQUIRED OBJECTS FROM ATTENTION-LITE AUDITS
+# ==========================================================================================
+
+REQUIRED = [
+
+    "model",
+
+    "HopeAttentionLiteBlock",
+
+    "joint_module",
+    "nonjoint_module",
+
+    "m4",
+    "ns",
+    "reg",
+
+    "path_to_tier",
+    "extract_tier",
+
+    "fragment_path_sets",
+
+    "extract_paths",
+    "merge_fragments",
+
+    "FAST_ACCUM_TX",
+    "FAST_DMGD_TX",
+    "FAST_ADAM_TX",
+    "FAST_CLIP_TX",
+
+    "tier_tx",
+
+    "preprocess_v2",
+]
+
+
+missing = [
+
+    name
+    for name in REQUIRED
+    if name not in globals()
+]
+
+
+if missing:
+
+    raise RuntimeError(
+
+        "Required production objects are missing.\n"
+        "Do NOT continue with a partial runtime.\n\n"
+        "Missing:\n  - "
+
+        +
+
+        "\n  - ".join(
+            missing
+        )
+    )
+
+
+# ==========================================================================================
+# 2. CONFIG GUARDS
+# ==========================================================================================
+
+assert ns.CFG.frames == 32
+assert ns.CFG.model_dim == 128
+assert ns.CFG.memory_dim == 64
+assert ns.CFG.controller_rank == 32
+
+assert ns.CFG.batch_size == 32
+assert ns.CFG.grad_accum_steps == 4
+
+assert abs(
+    ns.CFG.dropout
+    -
+    0.22
+) < 1e-12
+
+assert abs(
+    ns.CFG.learning_rate
+    -
+    1.0e-3
+) < 1e-12
+
+assert abs(
+    ns.CFG.weight_decay
+    -
+    0.05
+) < 1e-12
+
+assert abs(
+    ns.CFG.label_smoothing
+    -
+    0.05
+) < 1e-12
+
+assert abs(
+    ns.CFG.predictive_loss_weight
+    -
+    0.10
+) < 1e-12
+
+assert abs(
+    reg.EMA_DECAY
+    -
+    0.995
+) < 1e-12
+
+assert abs(
+    reg.FRAME_MASK_PROB
+    -
+    0.08
+) < 1e-12
+
+assert abs(
+    reg.JOINT_MASK_PROB
+    -
+    0.08
+) < 1e-12
+
+assert abs(
+    reg.PART_MASK_PROB
+    -
+    0.03
+) < 1e-12
+
+
+print("=" * 132)
+print(
+    "NESTSAR-HOPE-XSTREAM-MS T32 — "
+    "REAL NTU120 XSUB FULL RUN"
+)
+print("=" * 132)
+
+print(
+    "JAX:               ",
+    jax.__version__
+)
+
+print(
+    "Backend:           ",
+    jax.default_backend()
+)
+
+print(
+    "Devices:           ",
+    len(
+        jax.devices()
+    )
+)
+
+print(
+    "Dataset:           ",
+    DATASET
+)
+
+print(
+    "Output:            ",
+    OUT
+)
+
+print()
+
+print(
+    "Global batch:      ",
+    GLOBAL_BATCH
+)
+
+print(
+    "Grad accumulation: ",
+    GRAD_ACCUM
+)
+
+print(
+    "Effective batch:   ",
+    EFFECTIVE_BATCH
+)
+
+print(
+    "Microsteps/epoch:  ",
+    MICROSTEPS_PER_EPOCH
+)
+
+print(
+    "Total microsteps:  ",
+    TOTAL_MICROSTEPS
+)
+
+print(
+    "Schedule steps:    ",
+    TOTAL_STEPS
+)
+
+
+# ==========================================================================================
+# 3. TPU8 MESH
+# ==========================================================================================
+
+DEVICES = list(
+    jax.devices()
+)
+
+
+if (
+    jax.default_backend()
+    !=
+    "tpu"
+):
+
+    raise RuntimeError(
+        "This production probe is locked to TPU."
+    )
+
+
+if len(
+    DEVICES
+) != 8:
+
+    raise RuntimeError(
+        f"Expected 8 TPU devices; found {len(DEVICES)}"
+    )
+
+
+MESH = Mesh(
+
+    np.asarray(
+        DEVICES,
+        dtype=object,
+    ),
+
+    (
+        "data",
+    ),
+)
+
+
+REPLICATED = NamedSharding(
+    MESH,
+    P(),
+)
+
+
+BATCH_SHARDING = NamedSharding(
+
+    MESH,
+
+    P(
+        "data",
+        None,
+        None,
+    ),
+)
+
+
+VALID_SHARDING = NamedSharding(
+
+    MESH,
+
+    P(
+        "data",
+    ),
+)
+
+
+print()
+print(
+    "Mesh:",
+    MESH
+)
+
+print(
+    "Local batch/TPU:",
+    GLOBAL_BATCH
+    //
+    len(
+        DEVICES
+    )
+)
+
+
+# ==========================================================================================
+# 4. TREE HELPERS
+# ==========================================================================================
+
+def tree_numel(
+    tree,
+):
+
+    return int(
+
+        sum(
+
+            x.size
+
+            for x
+            in jax.tree_util.tree_leaves(
+                tree
+            )
+        )
+    )
+
+
+def tree_leaf_count(
+    tree,
+):
+
+    return len(
+
+        jax.tree_util.tree_leaves(
+            tree
+        )
+    )
+
+
+def merge_disjoint_trees(
+    trees,
+):
+
+    merged = {}
+
+
+    for tree in trees:
+
+        flat = traverse_util.flatten_dict(
+            tree
+        )
+
+
+        for path, value in flat.items():
+
+            if path in merged:
+
+                raise RuntimeError(
+                    f"Duplicate parameter path: {path}"
+                )
+
+
+            merged[
+                path
+            ] = value
+
+
+    return traverse_util.unflatten_dict(
+        merged
+    )
+
+
+def tree_to_replicated(
+    tree,
+):
+
+    return jax.tree_util.tree_map(
+
+        lambda x:
+            jax.device_put(
+                x,
+                REPLICATED,
+            ),
+
+        tree,
+    )
+
+
+def full_param_tree(
+    fast_fragments,
+    medium_params,
+    slow_params,
+    consolidate_params,
+):
+
+    fast = merge_fragments(
+        fast_fragments
+    )
+
+
+    return merge_disjoint_trees(
+        (
+            fast,
+            medium_params,
+            slow_params,
+            consolidate_params,
+        )
+    )
+
+
+# ==========================================================================================
+# 5. TRUE SCRATCH INITIALIZATION
+#
+# DO NOT reuse smoke-updated weights.
+# ==========================================================================================
+
+init_key = jax.random.PRNGKey(
+    SEED
+)
+
+
+dummy_init = jnp.zeros(
+
+    (
+        1,
+        32,
+        150,
+    ),
+
+    dtype=jnp.float32,
+)
+
+
+variables = model.init(
+
+    {
+        "params":
+            init_key,
+
+        "dropout":
+            init_key,
+    },
+
+    dummy_init,
+
+    training=True,
+)
+
+
+scratch_params = variables[
+    "params"
+]
+
+
+SCRATCH_PARAMS = tree_numel(
+    scratch_params
+)
+
+
+SCRATCH_LEAVES = tree_leaf_count(
+    scratch_params
+)
+
+
+if SCRATCH_PARAMS != EXPECTED_PARAMS:
+
+    raise RuntimeError(
+
+        f"Scratch parameter guard failed: "
+        f"{SCRATCH_PARAMS:,} != {EXPECTED_PARAMS:,}"
+    )
+
+
+if SCRATCH_LEAVES != EXPECTED_LEAVES:
+
+    raise RuntimeError(
+
+        f"Scratch leaf guard failed: "
+        f"{SCRATCH_LEAVES} != {EXPECTED_LEAVES}"
+    )
+
+
+scratch_params = tree_to_replicated(
+    scratch_params
+)
+
+
+print()
+print("=" * 132)
+print("TRUE SCRATCH INITIALIZATION")
+print("=" * 132)
+
+print(
+    "Parameters:",
+    f"{SCRATCH_PARAMS:,}"
+)
+
+print(
+    "Leaves:",
+    SCRATCH_LEAVES
+)
+
+print(
+    "Seed:",
+    SEED
+)
+
+print(
+    "Warm start: NONE"
+)
+
+print(
+    "Teacher:    NONE"
+)
+
+
+# ==========================================================================================
+# 6. SPLIT SCRATCH PARAMETERS INTO OPTIMIZER TIERS
+# ==========================================================================================
+
+scratch_fast = extract_tier(
+    scratch_params,
+    "fast",
+)
+
+scratch_medium = extract_tier(
+    scratch_params,
+    "medium",
+)
+
+scratch_slow = extract_tier(
+    scratch_params,
+    "slow",
+)
+
+scratch_consolidate = extract_tier(
+    scratch_params,
+    "consolidate",
+)
+
+
+FAST_TOTAL = tree_numel(
+    scratch_fast
+)
+
+MEDIUM_TOTAL = tree_numel(
+    scratch_medium
+)
+
+SLOW_TOTAL = tree_numel(
+    scratch_slow
+)
+
+CONSOLIDATE_TOTAL = tree_numel(
+    scratch_consolidate
+)
+
+
+assert FAST_TOTAL == 1_180_860
+assert MEDIUM_TOTAL == 485_184
+assert SLOW_TOTAL == 485_184
+assert CONSOLIDATE_TOTAL == 277_536
+
+
+fast_params = [
+
+    extract_paths(
+        scratch_fast,
+        fragment_path_sets[i],
+    )
+
+    for i
+    in range(
+        4
+    )
+]
+
+
+medium_params = scratch_medium
+slow_params = scratch_slow
+consolidate_params = scratch_consolidate
+
+
+online_params = full_param_tree(
+
+    fast_params,
+
+    medium_params,
+
+    slow_params,
+
+    consolidate_params,
+)
+
+
+assert tree_numel(
+    online_params
+) == EXPECTED_PARAMS
+
+
+ema_params = online_params
+
+
+# ==========================================================================================
+# 7. OPTIMIZER STATES — TRUE SCRATCH
+# ==========================================================================================
+
+fast_accum_state = [
+
+    FAST_ACCUM_TX[i].init(
+        fast_params[i]
+    )
+
+    for i
+    in range(
+        4
+    )
+]
+
+
+fast_dmgd_state = [
+
+    FAST_DMGD_TX[i].init(
+        fast_params[i]
+    )
+
+    for i
+    in range(
+        4
+    )
+]
+
+
+fast_adam_state = [
+
+    FAST_ADAM_TX[i].init(
+        fast_params[i]
+    )
+
+    for i
+    in range(
+        4
+    )
+]
+
+
+fast_clip_state = FAST_CLIP_TX.init(
+    scratch_fast
+)
+
+
+medium_state = tier_tx[
+    "medium"
+].init(
+    medium_params
+)
+
+
+slow_state = tier_tx[
+    "slow"
+].init(
+    slow_params
+)
+
+
+consolidate_state = tier_tx[
+    "consolidate"
+].init(
+    consolidate_params
+)
+
+
+# ==========================================================================================
+# 8. DATA
+# ==========================================================================================
+
+raw_data = ns.load_pickle(
+    DATASET
+)
+
+
+train_samples, val_samples = ns.build_samples(
+
+    raw_data,
+
+    protocol="xsub",
+
+    max_train=0,
+    max_val=0,
+
+    seed=SEED,
+)
+
+
+if len(
+    train_samples
+) != TRAIN_EXPECTED:
+
+    raise RuntimeError(
+
+        f"XSUB train mismatch: "
+        f"{len(train_samples):,} != {TRAIN_EXPECTED:,}"
+    )
+
+
+if len(
+    val_samples
+) != VAL_EXPECTED:
+
+    raise RuntimeError(
+
+        f"XSUB val mismatch: "
+        f"{len(val_samples):,} != {VAL_EXPECTED:,}"
+    )
+
+
+# ------------------------------------------------------------------------------------------
+# CD-Former-style temporal reframing: LINEAR INTERPOLATION to exactly T32.
+# No learned temporal embedding and no added model parameters.
+# ------------------------------------------------------------------------------------------
+def preprocess_keypoints_t32_interp(keypoints: np.ndarray) -> np.ndarray:
+    x = ns.to_tmvc(keypoints)
+
+    if x.shape[-1] == 2:
+        zeros = np.zeros((*x.shape[:-1], 1), dtype=np.float32)
+        x = np.concatenate([x, zeros], axis=-1)
+
+    if x.shape[2] < ns.CFG.joints:
+        pad = np.zeros(
+            (x.shape[0], x.shape[1], ns.CFG.joints - x.shape[2], ns.CFG.coords),
+            dtype=np.float32,
+        )
+        x = np.concatenate([x, pad], axis=2)
+    else:
+        x = x[:, :, :ns.CFG.joints, :ns.CFG.coords]
+
+    person_energy = np.sum(np.abs(x), axis=(0, 2, 3))
+    order = np.argsort(-person_energy)
+    x = x[:, order]
+
+    if x.shape[1] < ns.CFG.persons:
+        pad = np.zeros(
+            (x.shape[0], ns.CFG.persons - x.shape[1], ns.CFG.joints, ns.CFG.coords),
+            dtype=np.float32,
+        )
+        x = np.concatenate([x, pad], axis=1)
+    else:
+        x = x[:, :ns.CFG.persons]
+
+    total = int(x.shape[0])
+    target = int(ns.CFG.frames)
+    if total <= 0:
+        x = np.zeros((target, ns.CFG.persons, ns.CFG.joints, ns.CFG.coords), dtype=np.float32)
+    elif total == 1:
+        x = np.repeat(x, target, axis=0)
+    else:
+        pos = np.linspace(0.0, float(total - 1), num=target, dtype=np.float32)
+        lo = np.floor(pos).astype(np.int64)
+        hi = np.minimum(lo + 1, total - 1)
+        w = (pos - lo.astype(np.float32)).reshape(target, 1, 1, 1)
+        x = (1.0 - w) * x[lo] + w * x[hi]
+
+    center = x[:, 0:1, 0:1, :]
+    valid_center = np.any(np.abs(center) > 1e-8, axis=-1, keepdims=True)
+    x = np.where(valid_center, x - center, x)
+
+    valid_joint = np.any(np.abs(x) > 1e-8, axis=-1, keepdims=True)
+    x = np.where(valid_joint, x, 0.0)
+
+    nonzero = np.abs(x) > 1e-8
+    if np.any(nonzero):
+        rms = float(np.sqrt(np.mean(np.square(x[nonzero]))) + 1e-6)
+        x = x / rms
+
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    return x.reshape(target, -1).astype(np.float32)
+
+ns.preprocess_keypoints = preprocess_keypoints_t32_interp
+
+train_dataset = ns.SkeletonDataset(
+    train_samples
+)
+
+
+val_dataset = ns.SkeletonDataset(
+    val_samples
+)
+
+
+print()
+print("=" * 132)
+print("OFFICIAL NTU120 XSUB")
+print("=" * 132)
+
+print(
+    "Train:",
+    f"{len(train_dataset):,}"
+)
+
+print(
+    "Val:  ",
+    f"{len(val_dataset):,}"
+)
+
+
+# ==========================================================================================
+# 9. PAD FINAL PARTIAL BATCH TO GLOBAL B32
+#
+# Validity masking guarantees padded rows contribute:
+#
+#   0 loss
+#   0 gradient
+#   0 metric count
+# ==========================================================================================
+
+def pad_batch32(
+    x,
+    y,
+):
+
+    n = int(
+        x.shape[
+            0
+        ]
+    )
+
+
+    if n > GLOBAL_BATCH:
+
+        raise ValueError(
+            f"Unexpected batch size: {n}"
+        )
+
+
+    valid = np.zeros(
+        (
+            GLOBAL_BATCH,
+        ),
+
+        dtype=np.float32,
+    )
+
+
+    valid[
+        :n
+    ] = 1.0
+
+
+    if n < GLOBAL_BATCH:
+
+        x_pad = np.zeros(
+
+            (
+                GLOBAL_BATCH
+                -
+                n,
+
+                32,
+
+                150,
+            ),
+
+            dtype=np.float32,
+        )
+
+
+        y_pad = np.zeros(
+
+            (
+                GLOBAL_BATCH
+                -
+                n,
+            ),
+
+            dtype=np.int32,
+        )
+
+
+        x = np.concatenate(
+            (
+                x,
+                x_pad,
+            ),
+            axis=0,
+        )
+
+
+        y = np.concatenate(
+            (
+                y,
+                y_pad,
+            ),
+            axis=0,
+        )
+
+
+    return (
+
+        x.astype(
+            np.float32
+        ),
+
+        y.astype(
+            np.int32
+        ),
+
+        valid,
+
+        n,
+    )
+
+
+def device_batch(
+    x,
+    y,
+    valid,
+):
+
+    x = jax.device_put(
+        x,
+        BATCH_SHARDING,
+    )
+
+
+    y = jax.device_put(
+
+        y,
+
+        NamedSharding(
+            MESH,
+            P(
+                "data",
+            ),
+        ),
+    )
+
+
+    valid = jax.de
