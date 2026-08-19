@@ -1,0 +1,614 @@
+ frame_blocks: int = 2
+    chunk_blocks: int = 2
+    clip_blocks: int = 2
+    controller_blocks: int = 2
+    chunk_size: int = 4
+    clip_size: int = 8
+    controller_rank: int = 32
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, training: bool):
+        if x.shape[1] % self.chunk_size:
+            raise ValueError("frames must be divisible by chunk_size")
+        if x.shape[1] % self.clip_size:
+            raise ValueError("frames must be divisible by clip_size")
+
+        streams = m4.build_four_streams(x)
+        joint_xyz = streams["joint"]
+        geometry = m4.geometric_features(joint_xyz)
+        stream_tokens = _stack_stream_tokens(streams)
+
+        cross_hints, cross_attention, cross_gates = CrossStreamMultiScaleHint(
+            model_dim=self.model_dim,
+            attention_dim=CROSS_DIM,
+            heads=CROSS_HEADS,
+            dropout=CROSS_DROPOUT,
+            name="cross_stream_mixer",
+        )(stream_tokens, training)
+        joint_hints, nonjoint_hints = _split_hints(cross_hints)
+
+        joint_out = StreamBackbone(
+            stream_name="joint",
+            num_classes=self.num_classes,
+            model_dim=self.model_dim,
+            memory_dim=self.memory_dim,
+            dropout=self.dropout,
+            memory_residual_scale=self.memory_residual_scale,
+            initial_eta=self.initial_eta,
+            initial_alpha=self.initial_alpha,
+            frame_blocks=self.frame_blocks,
+            chunk_blocks=self.chunk_blocks,
+            clip_blocks=self.clip_blocks,
+            controller_blocks=self.controller_blocks,
+            chunk_size=self.chunk_size,
+            clip_size=self.clip_size,
+            controller_rank=self.controller_rank,
+            use_part_attention=False,
+            name="stream_joint",
+        )(
+            joint_xyz,
+            joint_xyz,
+            geometry,
+            joint_hints[0],
+            joint_hints[1],
+            joint_hints[2],
+            training,
+        )
+
+        nonjoint_xyz = jnp.stack(
+            (
+                streams["bone"],
+                streams["joint_motion"],
+                streams["bone_motion"],
+            ),
+            axis=0,
+        )
+        nonjoint_out = VectorizedNonJointBackbone(
+            stream_name="bone",
+            num_classes=self.num_classes,
+            model_dim=self.model_dim,
+            memory_dim=self.memory_dim,
+            dropout=self.dropout,
+            memory_residual_scale=self.memory_residual_scale,
+            initial_eta=self.initial_eta,
+            initial_alpha=self.initial_alpha,
+            frame_blocks=self.frame_blocks,
+            chunk_blocks=self.chunk_blocks,
+            clip_blocks=self.clip_blocks,
+            controller_blocks=self.controller_blocks,
+            chunk_size=self.chunk_size,
+            clip_size=self.clip_size,
+            controller_rank=self.controller_rank,
+            use_part_attention=False,
+            name="stream_nonjoint_bank",
+        )(
+            nonjoint_xyz,
+            joint_xyz,
+            geometry,
+            nonjoint_hints[0],
+            nonjoint_hints[1],
+            nonjoint_hints[2],
+            training,
+        )
+
+        stream_logits = jnp.swapaxes(
+            jnp.concatenate((joint_out["logits"][None, ...], nonjoint_out["logits"]), axis=0),
+            0,
+            1,
+        )
+        fusion_logits = self.param("stream_fusion_logits", nn.initializers.zeros, (NUM_STREAMS,))
+        fusion_weights = jax.nn.softmax(fusion_logits)
+        logits = jnp.einsum("s,bsc->bc", fusion_weights, stream_logits)
+
+        stream_prediction = jnp.swapaxes(
+            jnp.concatenate((joint_out["prediction"][None, ...], nonjoint_out["prediction"]), axis=0),
+            0,
+            1,
+        )
+        stream_motion_target = jnp.swapaxes(
+            jnp.concatenate((joint_out["motion_target"][None, ...], nonjoint_out["motion_target"]), axis=0),
+            0,
+            1,
+        )
+        prediction = jnp.einsum("s,bstd->btd", fusion_weights, stream_prediction)
+        motion_target = jnp.einsum("s,bstd->btd", fusion_weights, stream_motion_target)
+
+        def average_metric(name: str):
+            joint_mean = jnp.mean(joint_out[name])
+            value = nonjoint_out[name]
+            nonjoint_means = value if value.ndim == 1 else jnp.mean(
+                value, axis=tuple(range(1, value.ndim))
+            )
+            values = jnp.concatenate((joint_mean[None], nonjoint_means.reshape((NUM_NONJOINT,))), axis=0)
+            return jnp.mean(values)
+
+        result = {
+            "logits": logits,
+            "stream_logits": stream_logits,
+            "fusion_weights": fusion_weights,
+            "prediction": prediction,
+            "motion_target": motion_target,
+            "stream_prediction": stream_prediction,
+            "stream_motion_target": stream_motion_target,
+            "memory_delta": jnp.mean(
+                jnp.concatenate((joint_out["memory_delta"][None, ...], nonjoint_out["memory_delta"]), axis=0)
+            ),
+            "cross_stream_attention": cross_attention,
+            "cross_stream_gates": cross_gates,
+        }
+
+        for name in (
+            "motion_gate", "memory_gate", "controller_gate", "fusion_gate",
+            "spatial_gate", "sms_gate", "sms_memory_delta", "l3_state_gate",
+            "part_contrast_energy_ratio",
+        ):
+            if name in joint_out and name in nonjoint_out:
+                result[name] = average_metric(name)
+        return result
+
+
+# ==========================================================================================
+# 7. BUILDER
+# ==========================================================================================
+
+def build_model():
+    return NestSARHOPEXStreamMST32(
+        num_classes=ns.CFG.num_classes,
+        model_dim=ns.CFG.model_dim,
+        memory_dim=ns.CFG.memory_dim,
+        dropout=ns.CFG.dropout,
+        memory_residual_scale=ns.CFG.memory_residual_scale,
+        initial_eta=ns.CFG.initial_eta,
+        initial_alpha=ns.CFG.initial_alpha,
+        frame_blocks=ns.CFG.frame_blocks,
+        chunk_blocks=ns.CFG.chunk_blocks,
+        clip_blocks=ns.CFG.clip_blocks,
+        controller_blocks=ns.CFG.controller_blocks,
+        chunk_size=ns.CFG.chunk_size,
+        clip_size=ns.CFG.clip_size,
+        controller_rank=ns.CFG.controller_rank,
+    )
+
+# 8. INITIALIZE
+# ==========================================================================================
+
+print()
+print("=" * 124)
+print("INITIALIZE HOPE-XSTREAM-MS T32")
+print("=" * 124)
+
+
+model = build_model()
+
+
+dummy = jnp.zeros(
+
+    (
+        1,
+        32,
+        150,
+    ),
+
+    dtype=jnp.float32,
+)
+
+
+rng = jax.random.PRNGKey(
+    128
+)
+
+
+t0 = time.time()
+
+
+variables = model.init(
+
+    {
+        "params":
+            rng,
+
+        "dropout":
+            rng,
+    },
+
+    dummy,
+
+    training=True,
+)
+
+
+params = variables[
+    "params"
+]
+
+
+init_seconds = (
+    time.time()
+    -
+    t0
+)
+
+
+PARAMS = int(
+
+    sum(
+
+        x.size
+
+        for x
+        in jax.tree_util.tree_leaves(
+            params
+        )
+    )
+)
+
+
+LEAVES = len(
+
+    jax.tree_util.tree_leaves(
+        params
+    )
+)
+
+
+print(
+    "Parameters:",
+    f"{PARAMS:,}"
+)
+
+print(
+    "Leaves:",
+    LEAVES
+)
+
+print(
+    "Init:",
+    f"{init_seconds:.2f}s"
+)
+
+
+# ==========================================================================================
+# 9. TOP-LEVEL PARAMETER AUDIT
+# ==========================================================================================
+
+def numel(
+    tree,
+):
+
+    return int(
+
+        sum(
+
+            x.size
+
+            for x
+            in jax.tree_util.tree_leaves(
+                tree
+            )
+        )
+    )
+
+
+def leaves(
+    tree,
+):
+
+    return len(
+
+        jax.tree_util.tree_leaves(
+            tree
+        )
+    )
+
+
+print()
+print("=" * 124)
+print("TOP-LEVEL TREE")
+print("=" * 124)
+
+
+for name in params:
+
+    print(
+
+        f"{name:28s} | "
+
+        f"{numel(params[name]):10,d} params | "
+
+        f"{leaves(params[name]):4d} leaves"
+    )
+
+
+assert set(
+    params.keys()
+) == {
+
+    "cross_stream_mixer",
+
+    "stream_joint",
+
+    "stream_nonjoint_bank",
+
+    "stream_fusion_logits",
+}
+
+
+assert params[
+    "stream_fusion_logits"
+].size == 4
+
+assert PARAMS == 2_428_764
+assert LEAVES == 724
+
+
+
+
+# ==========================================================================================
+# ==========================================================================================
+# REBUILD EXACT JOINT/NONJOINT MODULES + CROSS MODULE + PREPROCESS
+# ==========================================================================================
+
+joint_module = StreamBackbone(
+    stream_name="joint",
+    num_classes=ns.CFG.num_classes,
+    model_dim=ns.CFG.model_dim,
+    memory_dim=ns.CFG.memory_dim,
+    dropout=ns.CFG.dropout,
+    memory_residual_scale=ns.CFG.memory_residual_scale,
+    initial_eta=ns.CFG.initial_eta,
+    initial_alpha=ns.CFG.initial_alpha,
+    frame_blocks=ns.CFG.frame_blocks,
+    chunk_blocks=ns.CFG.chunk_blocks,
+    clip_blocks=ns.CFG.clip_blocks,
+    controller_blocks=ns.CFG.controller_blocks,
+    chunk_size=ns.CFG.chunk_size,
+    clip_size=ns.CFG.clip_size,
+    controller_rank=ns.CFG.controller_rank,
+    use_part_attention=False,
+)
+
+nonjoint_module = VectorizedNonJointBackbone(
+    stream_name="bone",
+    num_classes=ns.CFG.num_classes,
+    model_dim=ns.CFG.model_dim,
+    memory_dim=ns.CFG.memory_dim,
+    dropout=ns.CFG.dropout,
+    memory_residual_scale=ns.CFG.memory_residual_scale,
+    initial_eta=ns.CFG.initial_eta,
+    initial_alpha=ns.CFG.initial_alpha,
+    frame_blocks=ns.CFG.frame_blocks,
+    chunk_blocks=ns.CFG.chunk_blocks,
+    clip_blocks=ns.CFG.clip_blocks,
+    controller_blocks=ns.CFG.controller_blocks,
+    chunk_size=ns.CFG.chunk_size,
+    clip_size=ns.CFG.clip_size,
+    controller_rank=ns.CFG.controller_rank,
+    use_part_attention=False,
+)
+
+cross_module = CrossStreamMultiScaleHint(
+    model_dim=ns.CFG.model_dim,
+    attention_dim=CROSS_DIM,
+    heads=CROSS_HEADS,
+    dropout=CROSS_DROPOUT,
+)
+
+
+def preprocess_v2(x):
+    streams = m4.build_four_streams(x)
+    joint_xyz = streams["joint"]
+    nonjoint_xyz = jnp.stack(
+        (streams["bone"], streams["joint_motion"], streams["bone_motion"]),
+        axis=0,
+    )
+    geometry = m4.geometric_features(joint_xyz)
+    stream_tokens = _stack_stream_tokens(streams)
+    return joint_xyz, nonjoint_xyz, geometry, stream_tokens
+
+
+# Branches remain exactly the same size; the new learned parameters live only in the mixer.
+assert sum(x.size for x in jax.tree_util.tree_leaves(params["stream_joint"])) == 595_256
+assert sum(x.size for x in jax.tree_util.tree_leaves(params["stream_nonjoint_bank"])) == 1_785_768
+assert params["stream_fusion_logits"].size == 4
+assert sum(x.size for x in jax.tree_util.tree_leaves(params["cross_stream_mixer"])) == 47_736
+
+# EXACT OPTIMIZER TIER RULES
+# ==========================================================================================
+
+CMS_P1, CMS_P2, CMS_P3, CMS_P4 = 1, 2, 4, 8
+PERIODS = {
+    "fast": CMS_P1,
+    "medium": CMS_P2,
+    "slow": CMS_P3,
+    "consolidate": CMS_P4,
+}
+
+DMGD_MOMENTUM = 0.90
+DMGD_MEMORY_LR = 0.01
+DMGD_MIX = 0.10
+DMGD_PROJECTION_CAP = 2.0
+DMGD_EPS = 1e-6
+GRAD_ACCUM = 4
+
+def path_to_tier(path_tuple):
+    text = "/".join(str(x) for x in path_tuple).lower()
+    if "cms_f8" in text:
+        return "consolidate"
+    if "cms_f4" in text:
+        return "slow"
+    if "cms_f2" in text:
+        return "medium"
+    if "cms_f1" in text:
+        return "fast"
+    if "l4_slow_controller" in text:
+        return "consolidate"
+    if "l3_clip_memory" in text:
+        return "slow"
+    if "l2_chunk_memory" in text:
+        return "medium"
+    if "l1_frame_memory" in text:
+        return "fast"
+    return "fast"
+
+def extract_tier(tree, wanted_tier):
+    flat = traverse_util.flatten_dict(tree)
+    selected = {
+        path: value
+        for path, value in flat.items()
+        if path_to_tier(path) == wanted_tier
+    }
+    return traverse_util.unflatten_dict(selected)
+
+class DMGDL2DiagState(NamedTuple):
+    momentum: Any
+    projection: Any
+    count: jax.Array
+
+def dmgd_l2_diag():
+    def init_fn(p):
+        zeros = jax.tree_util.tree_map(jnp.zeros_like, p)
+        return DMGDL2DiagState(
+            momentum=zeros,
+            projection=zeros,
+            count=jnp.asarray(0, dtype=jnp.int32),
+        )
+
+    def update_fn(updates, state, params=None):
+        del params
+        new_momentum = jax.tree_util.tree_map(
+            lambda m, g: DMGD_MOMENTUM * m + (1.0 - DMGD_MOMENTUM) * g,
+            state.momentum,
+            updates,
+        )
+        prediction = jax.tree_util.tree_map(
+            lambda p, g: jnp.tanh(p) * g,
+            state.projection,
+            updates,
+        )
+        new_projection = jax.tree_util.tree_map(
+            lambda p, g, pred, target: jnp.clip(
+                p
+                - DMGD_MEMORY_LR
+                * (pred - jax.lax.stop_gradient(target))
+                * g
+                / (jnp.square(g) + DMGD_EPS),
+                -DMGD_PROJECTION_CAP,
+                DMGD_PROJECTION_CAP,
+            ),
+            state.projection,
+            updates,
+            prediction,
+            new_momentum,
+        )
+        processed = jax.tree_util.tree_map(
+            lambda g, pred: g + DMGD_MIX * pred,
+            updates,
+            prediction,
+        )
+        return processed, DMGDL2DiagState(
+            momentum=new_momentum,
+            projection=new_projection,
+            count=state.count + jnp.asarray(1, dtype=jnp.int32),
+        )
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+def scaled_schedule(total_steps, period):
+    base = ns.make_schedule(total_steps)
+    max_index = max(0, int(total_steps) - 1)
+    def schedule(local_count):
+        global_like = jnp.minimum(local_count * period, max_index)
+        return base(global_like)
+    return schedule
+
+# ==========================================================================================
+# ==========================================================================================
+# FAST 4-FRAGMENT MAP — GENERATED FROM THE ACTUAL XSTREAM PARAMETER TREE
+# ==========================================================================================
+
+FAST_PARAMS_FOR_MAP = extract_tier(params, "fast")
+MEDIUM_PARAMS_FOR_MAP = extract_tier(params, "medium")
+SLOW_PARAMS_FOR_MAP = extract_tier(params, "slow")
+CONSOLIDATE_PARAMS_FOR_MAP = extract_tier(params, "consolidate")
+
+def _tree_numel_local(tree):
+    return int(sum(x.size for x in jax.tree_util.tree_leaves(tree)))
+
+def _tree_leaves_local(tree):
+    return len(jax.tree_util.tree_leaves(tree))
+
+assert _tree_numel_local(FAST_PARAMS_FOR_MAP) == 1_180_860
+assert _tree_numel_local(MEDIUM_PARAMS_FOR_MAP) == 485_184
+assert _tree_numel_local(SLOW_PARAMS_FOR_MAP) == 485_184
+assert _tree_numel_local(CONSOLIDATE_PARAMS_FOR_MAP) == 277_536
+assert _tree_leaves_local(FAST_PARAMS_FOR_MAP) == 284
+
+flat_fast_params = traverse_util.flatten_dict(FAST_PARAMS_FOR_MAP)
+NUM_FAST_FRAGMENTS = 4
+_n_fast_leaves = len(flat_fast_params)
+_q, _r = divmod(_n_fast_leaves, NUM_FAST_FRAGMENTS)
+FRAGMENT_CAPACITIES = [_q + (1 if i < _r else 0) for i in range(NUM_FAST_FRAGMENTS)]
+
+items = sorted(flat_fast_params.items(), key=lambda kv: int(kv[1].size), reverse=True)
+fragment_paths = [[] for _ in range(NUM_FAST_FRAGMENTS)]
+fragment_param_load = [0 for _ in range(NUM_FAST_FRAGMENTS)]
+for path, value in items:
+    available = [i for i in range(NUM_FAST_FRAGMENTS) if len(fragment_paths[i]) < FRAGMENT_CAPACITIES[i]]
+    if not available:
+        raise RuntimeError("FAST fragment allocation exhausted unexpectedly.")
+    dst = min(available, key=lambda i: (fragment_param_load[i], len(fragment_paths[i]), i))
+    fragment_paths[dst].append(path)
+    fragment_param_load[dst] += int(value.size)
+
+fragment_path_sets = [set(paths) for paths in fragment_paths]
+assigned = set()
+for paths in fragment_path_sets:
+    if assigned & paths:
+        raise RuntimeError("FAST fragment overlap detected.")
+    assigned |= paths
+if assigned != set(flat_fast_params.keys()):
+    raise RuntimeError("FAST fragmentation incomplete.")
+
+assert sum(fragment_param_load) == 1_180_860
+assert sum(len(x) for x in fragment_paths) == 284
+
+def extract_paths(tree, wanted_paths):
+    flat = traverse_util.flatten_dict(tree)
+    selected = {path: value for path, value in flat.items() if path in wanted_paths}
+    return traverse_util.unflatten_dict(selected)
+
+def merge_fragments(fragments):
+    merged = {}
+    for frag in fragments:
+        flat = traverse_util.flatten_dict(frag)
+        for path, value in flat.items():
+            if path in merged:
+                raise RuntimeError(f"Duplicate merged FAST path: {path}")
+            merged[path] = value
+    if set(merged.keys()) != set(flat_fast_params.keys()):
+        raise RuntimeError("Merged FAST fragments do not reconstruct the original FAST tree.")
+    return traverse_util.unflatten_dict(merged)
+
+FAST_ACCUM_TX = [
+    optax.MultiSteps(optax.identity(), every_k_schedule=4, use_grad_mean=True)
+    for _ in range(NUM_FAST_FRAGMENTS)
+]
+FAST_DMGD_TX = [dmgd_l2_diag() for _ in range(NUM_FAST_FRAGMENTS)]
+FAST_CLIP_TX = optax.clip_by_global_norm(ns.CFG.grad_clip)
+FAST_ADAM_TX = []
+tier_tx = {}
+
+print()
+print("=" * 132)
+print("XSTREAM-MS T32 BOOTSTRAP AUDIT")
+print("=" * 132)
+print("Parameters:        ", f"{PARAMS:,}")
+print("Leaves:            ", LEAVES)
+print("Cross params:      ", f"{_tree_numel_local(params['cross_stream_mixer']):,}")
+print("FAST params:       ", f"{_tree_numel_local(FAST_PARAMS_FOR_MAP):,}")
+print("MEDIUM params:     ", f"{_tree_numel_local(MEDIUM_PARAMS_FOR_MAP):,}")
+print("SLOW params:       ", f"{_tree_numel_local(SLOW_PARAMS_FOR_MAP):,}")
+print("CONSOLIDATE params:", f"{_tree_numel_local(CONSOLIDATE_PARAMS_FOR_MAP):,}")
+for i in range(NUM_FAST_FRAGMENTS):
+    print(f"FAST frag{i}: params={fragment_param_load[i]:,} leaves={len(fragment_paths[i])}")
+pr
