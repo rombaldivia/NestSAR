@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import math
 import os
 import py_compile
 import runpy
@@ -11,10 +12,48 @@ HERE = Path(__file__).resolve().parent
 BASE = HERE / "run.py"
 REAL_EXECV = os.execv
 
-_HELPERS = r'''
+# ============================================================================
+# USER-CONFIGURABLE FULLJOINT SETTINGS
+# ============================================================================
+# Base launcher already consumes:
+#   NESTSAR_EPOCHS
+#   NESTSAR_GLOBAL_BATCH
+#
+# This launcher additionally consumes:
+#   NESTSAR_FJ_ATTN_DIM
+#   NESTSAR_FJ_HEADS
+#   NESTSAR_FJ_GATE_MAX
+#   NESTSAR_FJ_GATE_INIT
+#
+# Safe defaults reproduce the first FullJoint-Hierarchy design.
+FJ_ATTN_DIM = int(os.environ.get("NESTSAR_FJ_ATTN_DIM", "64"))
+FJ_HEADS = int(os.environ.get("NESTSAR_FJ_HEADS", "4"))
+FJ_GATE_MAX = float(os.environ.get("NESTSAR_FJ_GATE_MAX", "0.25"))
+FJ_GATE_INIT = float(os.environ.get("NESTSAR_FJ_GATE_INIT", "0.05"))
+
+if FJ_ATTN_DIM < 1:
+    raise ValueError("NESTSAR_FJ_ATTN_DIM must be >= 1")
+if FJ_HEADS < 1:
+    raise ValueError("NESTSAR_FJ_HEADS must be >= 1")
+if FJ_ATTN_DIM % FJ_HEADS:
+    raise ValueError(
+        f"NESTSAR_FJ_ATTN_DIM={FJ_ATTN_DIM} must be divisible by "
+        f"NESTSAR_FJ_HEADS={FJ_HEADS}"
+    )
+if not (0.0 < FJ_GATE_MAX <= 1.0):
+    raise ValueError("NESTSAR_FJ_GATE_MAX must be in (0, 1]")
+if not (0.0 < FJ_GATE_INIT < FJ_GATE_MAX):
+    raise ValueError(
+        "NESTSAR_FJ_GATE_INIT must satisfy 0 < gate_init < gate_max"
+    )
+
+_gate_ratio = FJ_GATE_INIT / FJ_GATE_MAX
+FJ_GATE_RAW_INIT = math.log(_gate_ratio / (1.0 - _gate_ratio))
+
+_HELPERS_TEMPLATE = r'''
 def _fjh_single(module, x, tag):
     # Learned full-joint attention for a CrossStream hint.
-    # Expected layout: [B, T, J=25, S=4, D=128].
+    # Expected layout: [B, T, J=25, S=4, D].
     if not hasattr(x, "ndim") or x.ndim != 5:
         return x
     if x.shape[-3] != 25 or x.shape[-2] != 4:
@@ -22,8 +61,8 @@ def _fjh_single(module, x, tag):
 
     z = jnp.transpose(x, (0, 1, 3, 2, 4))  # [B,T,S,J,D]
     d_model = int(z.shape[-1])
-    attn_dim = 64
-    heads = 4
+    attn_dim = __FJ_ATTN_DIM__
+    heads = __FJ_HEADS__
     head_dim = attn_dim // heads
 
     # Parameter-free RMS normalization keeps the residual branch stable.
@@ -54,13 +93,12 @@ def _fjh_single(module, x, tag):
     ctx = ctx.reshape(ctx.shape[:-2] + (attn_dim,))
     delta = jnp.einsum("btsja,ad->btsjd", ctx, wo)
 
-    # gate_max=0.25, gate_init=0.05 exactly.
     gate_raw = module.param(
         f"{pfx}_gate_raw",
-        nn.initializers.constant(-1.3862943611198906),
+        nn.initializers.constant(__FJ_GATE_RAW_INIT__),
         (),
     )
-    gate = 0.25 * jax.nn.sigmoid(gate_raw)
+    gate = __FJ_GATE_MAX__ * jax.nn.sigmoid(gate_raw)
     y = z + gate * delta
     return jnp.transpose(y, (0, 1, 3, 2, 4))
 
@@ -83,6 +121,14 @@ def _fjh_mix_tree(module, out, prefix="full_joint"):
         }
     return _fjh_single(module, out, prefix)
 '''
+
+_HELPERS = (
+    _HELPERS_TEMPLATE
+    .replace("__FJ_ATTN_DIM__", repr(FJ_ATTN_DIM))
+    .replace("__FJ_HEADS__", repr(FJ_HEADS))
+    .replace("__FJ_GATE_RAW_INIT__", repr(FJ_GATE_RAW_INIT))
+    .replace("__FJ_GATE_MAX__", repr(FJ_GATE_MAX))
+)
 
 
 class _WrapReturns(ast.NodeTransformer):
@@ -213,7 +259,9 @@ def _patched_execv(path, argv):
         "def _fjh_mix_tree",
         "full_joint",
         "btshjk",
-        "0.25 * jax.nn.sigmoid",
+        f"attn_dim = {FJ_ATTN_DIM}",
+        f"heads = {FJ_HEADS}",
+        f"gate = {repr(FJ_GATE_MAX)} * jax.nn.sigmoid",
     ]
     missing = [marker for marker in required if marker not in source]
     if missing:
@@ -222,8 +270,12 @@ def _patched_execv(path, argv):
     print("=" * 108)
     print("FULLJOINT-HIERARCHY PATCH: PASS")
     print("Existing L1 joint mixer: learned full 25-joint interaction")
-    print("L2/L3/L4 mixers:        learned D64/H4 full 25-joint interaction inside CrossStream hints")
-    print("Residual gate:           max=0.25 init=0.05")
+    print("L2/L3/L4 mixers:        learned full 25-joint interaction inside CrossStream hints")
+    print("FullJoint attention dim: ", FJ_ATTN_DIM)
+    print("FullJoint heads:         ", FJ_HEADS)
+    print("FullJoint head dim:      ", FJ_ATTN_DIM // FJ_HEADS)
+    print("Residual gate max:       ", FJ_GATE_MAX)
+    print("Residual gate init:      ", FJ_GATE_INIT)
     print("Wrapped CrossStream returns:", wrapped_returns)
     print("Added @nn.compact:          ", compact_added)
     print("Cross-VJP axis repair:      PASS [B,T,S,J,D] -> [B,T,J,S,D]")
