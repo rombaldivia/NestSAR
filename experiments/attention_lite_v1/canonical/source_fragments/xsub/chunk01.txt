@@ -1,0 +1,764 @@
+# ==========================================================================================
+# NESTSAR-HOPE-ATTENTION-LITE D128 — TPU v5e-8 — XSUB — E40
+# TRUE ALL-IN-ONE KAGGLE CELL
+#
+# Exact architecture from the successful 3-epoch probe:
+#   T16 / D128 / Attention D64-H4-Dh16
+#   2,381,028 parameters / 705 leaves
+#   Global batch 32 / TPU8 local batch 4
+#   Grad accumulation 4 / effective batch 128
+#   FAST/MEDIUM/SLOW/CONSOLIDATE = 4/8/16/32 microbatches
+#   RegMask 8/8/3 / EMA 0.995
+#
+# This cell embeds the exact v4.1 source bundle, reconstructs Attention-Lite,
+# rebuilds the compiler-safe optimizer partition, and trains E1 -> E40 from scratch.
+# ==========================================================================================
+
+from __future__ import annotations
+
+import os, sys, io, base64, hashlib, zipfile, shutil, types, math, time, json, pickle, dataclasses
+from pathlib import Path
+from functools import partial
+from typing import NamedTuple, Any
+
+# ------------------------------------------------------------------------------------------
+# 0. ENVIRONMENT — set BEFORE importing JAX/source modules
+# ------------------------------------------------------------------------------------------
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+os.environ["NESTSAR_SHORT_L3_POSTWRITE_BLEND"] = "1.0"
+os.environ["NESTSAR_CMS_PERIOD_L1"] = "1"
+os.environ["NESTSAR_CMS_PERIOD_L2"] = "2"
+os.environ["NESTSAR_CMS_PERIOD_L3"] = "4"
+os.environ["NESTSAR_CMS_PERIOD_L4"] = "8"
+os.environ["NESTSAR_DMGD_MOMENTUM"] = "0.90"
+os.environ["NESTSAR_DMGD_MEMORY_LR"] = "0.01"
+os.environ["NESTSAR_DMGD_MIX"] = "0.10"
+os.environ["NESTSAR_DMGD_PROJECTION_CAP"] = "2.0"
+
+# ------------------------------------------------------------------------------------------
+# 1. USE EXACT VENDORED v4.1 SOURCE BUNDLE FROM THIS GITHUB REPOSITORY
+# ------------------------------------------------------------------------------------------
+# Keep this marker for the validated-source guard. The original all-in-one embedded the
+# bundle as base64; this repository-native copy vendors the exact decoded files instead.
+BUNDLE_B64 = "REPO_NATIVE_VENDORED_EXACT_BUNDLE"
+BUNDLE_SHA256 = "c720c2afd9c32648ece4ac4b23e916f325039ba41684ebe4127ae285c6e216dd"
+
+REQUIRED_SOURCE = [
+    "nestsar.py",
+    "nestsar_m4_geom_h4.py",
+    "nestsar_sms_s1c_v2.py",
+    "nestsar_m4_geom_h4_sasm_l3statefix_v1.py",
+    "nestsar_m4_regmask_ema_v3_safe.py",
+]
+
+_repo_root = Path(os.environ.get("NESTSAR_REPO_ROOT", str(Path.cwd()))).resolve()
+ROOT = _repo_root / "experiments" / "attention_lite_v1" / "canonical" / "runtime"
+missing_source = [name for name in REQUIRED_SOURCE if not (ROOT / name).is_file()]
+if missing_source:
+    raise RuntimeError(
+        "Vendored exact Attention-Lite runtime is incomplete: " + repr(missing_source)
+        + f" | expected under {ROOT}"
+    )
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# ------------------------------------------------------------------------------------------
+# 2. IMPORT JAX + NESTSAR
+# ------------------------------------------------------------------------------------------
+import numpy as np
+import jax
+import jax.numpy as jnp
+import optax
+from flax import linen as nn
+from flax import serialization, traverse_util
+from flax.core import FrozenDict, freeze
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from tqdm.auto import tqdm
+
+import nestsar as ns
+import nestsar_m4_geom_h4 as m4
+import nestsar_m4_regmask_ema_v3_safe as reg
+import nestsar_m4_geom_h4_sasm_l3statefix_v1 as l3fix
+
+# Attention-Lite only used Fidelity's exact safe-logit helper.
+def _safe_logit(value: float) -> float:
+    value = float(np.clip(value, 1e-6, 1.0 - 1e-6))
+    return float(np.log(value / (1.0 - value)))
+
+fidelity_core = types.SimpleNamespace(_safe_logit=_safe_logit)
+
+print("=" * 132)
+print("NESTSAR-HOPE-ATTENTION-LITE — ALL-IN-ONE E40 BOOTSTRAP")
+print("=" * 132)
+print("Source root:", ROOT)
+print("JAX:", jax.__version__)
+print("Backend:", jax.default_backend())
+print("Devices:", len(jax.devices()))
+print("Bundle SHA256:", BUNDLE_SHA256)
+print("=" * 132)
+
+
+# ==========================================================================================
+# 2. CONFIG
+# ==========================================================================================
+
+ATTENTION_DIM = 64
+ATTENTION_HEADS = 4
+HEAD_DIM = ATTENTION_DIM // ATTENTION_HEADS
+
+LOCAL_KERNEL = 4
+CMS_BOTTLENECK = 32
+
+ATTENTION_GATE_INIT = 0.50
+LOCAL_CONV_GATE_INIT = 0.05
+
+
+if ATTENTION_DIM % ATTENTION_HEADS:
+
+    raise ValueError(
+        "ATTENTION_DIM must be divisible by ATTENTION_HEADS"
+    )
+
+
+assert HEAD_DIM == 16
+
+
+ns.CFG = dataclasses.replace(
+
+    ns.CFG,
+
+    frames=16,
+
+    persons=2,
+    joints=25,
+    coords=3,
+
+    num_classes=120,
+
+    model_dim=128,
+    memory_dim=64,
+    controller_rank=32,
+
+    frame_blocks=2,
+    chunk_blocks=2,
+    clip_blocks=2,
+    controller_blocks=2,
+
+    chunk_size=4,
+    clip_size=8,
+
+    dropout=0.22,
+
+    batch_size=32,
+    grad_accum_steps=4,
+    eval_batch_size=32,
+
+    learning_rate=1.0e-3,
+    weight_decay=0.05,
+    warmup_fraction=0.10,
+
+    label_smoothing=0.05,
+    grad_clip=1.0,
+
+    predictive_loss_weight=0.10,
+
+    initial_eta=0.02,
+    initial_alpha=0.95,
+
+    seed=128,
+)
+
+
+# ==========================================================================================
+# 3. HOPE-ATTENTION LITE TEMPORAL BLOCK
+# ==========================================================================================
+
+class HopeAttentionLiteBlock(nn.Module):
+
+    """
+    Drop-in replacement for M4 MultiHeadAdaptiveMemoryBlock.
+
+    Sequence mechanism:
+
+        x
+        ↓
+    causal local depthwise Conv1D(k=4)
+        ↓
+    global CAUSAL softmax self-attention
+        ↓
+    residual projection
+        ↓
+    sequential CMS f1→f2→f4→f8
+
+    Attention width is intentionally 64 while the outer model remains D128.
+    """
+
+    model_dim: int
+    memory_dim: int
+
+    dropout: float
+    residual_scale: float
+
+    initial_eta: float
+    initial_alpha: float
+
+    heads: int = ATTENTION_HEADS
+
+
+    @nn.compact
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        training: bool,
+    ):
+
+        if x.ndim != 3:
+
+            raise ValueError(
+                f"Expected [B,T,D], got {x.shape}"
+            )
+
+
+        if self.model_dim != 128:
+
+            raise ValueError(
+                "HOPE-Attention-Lite v1 is locked to D128."
+            )
+
+
+        if self.heads != ATTENTION_HEADS:
+
+            raise ValueError(
+                f"Expected {ATTENTION_HEADS} attention heads."
+            )
+
+
+        batch, time_steps, _ = x.shape
+
+
+        # ==================================================================================
+        # A. INPUT NORMALIZATION
+        # ==================================================================================
+
+        h = nn.LayerNorm(
+            name="input_norm"
+        )(x)
+
+
+        # ==================================================================================
+        # B. HOPE LOCAL CAUSAL CONVOLUTION — k=4
+        #
+        # left pad 3:
+        #
+        # output[t] only sees:
+        #   t, t-1, t-2, t-3
+        #
+        # depthwise:
+        #   groups = D128
+        # ==================================================================================
+
+        padded = jnp.pad(
+
+            h,
+
+            (
+                (0, 0),
+
+                (
+                    LOCAL_KERNEL - 1,
+                    0,
+                ),
+
+                (0, 0),
+            ),
+        )
+
+
+        local = nn.Conv(
+
+            features=self.model_dim,
+
+            kernel_size=(
+                LOCAL_KERNEL,
+            ),
+
+            strides=(
+                1,
+            ),
+
+            padding="VALID",
+
+            feature_group_count=self.model_dim,
+
+            use_bias=True,
+
+            kernel_init=nn.initializers.xavier_uniform(),
+
+            name="hope_local_conv",
+
+        )(
+            padded
+        )
+
+
+        local = jax.nn.silu(
+            local
+        )
+
+
+        local_gate_logit = self.param(
+
+            "hope_local_conv_gate_logit",
+
+            lambda key, shape:
+
+                jnp.full(
+
+                    shape,
+
+                    fidelity_core._safe_logit(
+                        LOCAL_CONV_GATE_INIT
+                    ),
+
+                    dtype=jnp.float32,
+                ),
+
+            (
+                1,
+            ),
+        )
+
+
+        local_gate = jax.nn.sigmoid(
+
+            local_gate_logit
+
+        )[0]
+
+
+        x = nn.LayerNorm(
+
+            name="hope_local_conv_output_norm"
+
+        )(
+            x
+            +
+            local_gate
+            *
+            local
+        )
+
+
+        # ==================================================================================
+        # C. GLOBAL CAUSAL SOFTMAX ATTENTION
+        #
+        # Dmodel   = 128
+        # Dattn    = 64
+        # heads    = 4
+        # head_dim = 16
+        # ==================================================================================
+
+        a = nn.LayerNorm(
+            name="attention_norm"
+        )(x)
+
+
+        def project(
+            name: str,
+        ) -> jnp.ndarray:
+
+            z = nn.Dense(
+
+                features=ATTENTION_DIM,
+
+                use_bias=False,
+
+                kernel_init=
+                    nn.initializers.xavier_uniform(),
+
+                name=name,
+
+            )(
+                a
+            )
+
+
+            return z.reshape(
+
+                batch,
+
+                time_steps,
+
+                ATTENTION_HEADS,
+
+                HEAD_DIM,
+            )
+
+
+        q = project(
+            "attention_query"
+        )
+
+        k = project(
+            "attention_key"
+        )
+
+        v = project(
+            "attention_value"
+        )
+
+
+        # [B,H,T,T]
+        scores = jnp.einsum(
+
+            "bthd,bshd->bhts",
+
+            q,
+            k,
+        )
+
+
+        scores = (
+
+            scores
+
+            *
+
+            jax.lax.rsqrt(
+
+                jnp.asarray(
+
+                    float(
+                        HEAD_DIM
+                    ),
+
+                    dtype=scores.dtype,
+                )
+            )
+        )
+
+
+        # ------------------------------------------------------------------
+        # Causal global attention.
+        #
+        # Query position t may attend only source positions <= t.
+        # ------------------------------------------------------------------
+
+        positions = jnp.arange(
+            time_steps
+        )
+
+
+        causal_mask = (
+
+            positions[
+                None,
+                None,
+                :,
+                None
+            ]
+
+            >=
+
+            positions[
+                None,
+                None,
+                None,
+                :
+            ]
+        )
+
+
+        scores = jnp.where(
+
+            causal_mask,
+
+            scores,
+
+            jnp.asarray(
+                -1.0e30,
+                dtype=scores.dtype,
+            ),
+        )
+
+
+        attention_weights = jax.nn.softmax(
+
+            scores,
+
+            axis=-1,
+        )
+
+
+        # [B,T,H,Dh]
+        attended = jnp.einsum(
+
+            "bhts,bshd->bthd",
+
+            attention_weights,
+
+            v,
+        )
+
+
+        # ------------------------------------------------------------------
+        # Retain the same kind of per-head learned residual gate used by the
+        # previous memory interface.
+        # ------------------------------------------------------------------
+
+        attention_gate_logit = self.param(
+
+            "memory_gate_logit",
+
+            lambda key, shape:
+
+                jnp.full(
+
+                    shape,
+
+                    fidelity_core._safe_logit(
+                        ATTENTION_GATE_INIT
+                    ),
+
+                    dtype=jnp.float32,
+                ),
+
+            (
+                ATTENTION_HEADS,
+            ),
+        )
+
+
+        attention_gate = jax.nn.sigmoid(
+
+            attention_gate_logit
+        )
+
+
+        attended = (
+
+            attended
+
+            *
+
+            attention_gate[
+                None,
+                None,
+                :,
+                None,
+            ]
+        )
+
+
+        attended = attended.reshape(
+
+            batch,
+
+            time_steps,
+
+            ATTENTION_DIM,
+        )
+
+
+        # 64 -> 128
+        context = nn.Dense(
+
+            features=self.model_dim,
+
+            use_bias=True,
+
+            kernel_init=
+                nn.initializers.xavier_uniform(),
+
+            name="readout",
+
+        )(
+            attended
+        )
+
+
+        context = nn.Dropout(
+
+            rate=self.dropout,
+
+            name="context_dropout",
+
+        )(
+            context,
+
+            deterministic=not training,
+        )
+
+
+        scaled_context = (
+
+            self.residual_scale
+
+            *
+
+            context
+        )
+
+
+        x = nn.LayerNorm(
+
+            name="memory_residual_norm"
+
+        )(
+            x
+            +
+            scaled_context
+        )
+
+
+        # ==================================================================================
+        # D. HOPE SEQUENTIAL CONTINUUM MEMORY SYSTEM
+        #
+        # EXACT SAME NAMES AS FIDELITY:
+        #
+        #     cms_f1
+        #        ↓
+        #     cms_f2
+        #        ↓
+        #     cms_f4
+        #        ↓
+        #     cms_f8
+        #
+        # therefore Fidelity's _path_to_tier() still maps:
+        #
+        #     f1 -> FAST
+        #     f2 -> MEDIUM
+        #     f4 -> SLOW
+        #     f8 -> CONSOLIDATE
+        # ==================================================================================
+
+        output = x
+
+
+        for cms_frequency in (
+            1,
+            2,
+            4,
+            8,
+        ):
+
+            cms_h = nn.LayerNorm(
+
+                name=
+                    f"cms_f{cms_frequency}_norm"
+
+            )(
+                output
+            )
+
+
+            cms_h = nn.Dense(
+
+                features=CMS_BOTTLENECK,
+
+                use_bias=True,
+
+                kernel_init=
+                    nn.initializers.xavier_uniform(),
+
+                name=
+                    f"cms_f{cms_frequency}_in",
+
+            )(
+                cms_h
+            )
+
+
+            cms_h = jax.nn.silu(
+                cms_h
+            )
+
+
+            cms_h = nn.Dropout(
+
+                rate=self.dropout,
+
+                name=
+                    f"cms_f{cms_frequency}_dropout",
+
+            )(
+                cms_h,
+
+                deterministic=not training,
+            )
+
+
+            cms_delta = nn.Dense(
+
+                features=self.model_dim,
+
+                use_bias=True,
+
+                kernel_init=
+                    nn.initializers.xavier_uniform(),
+
+                name=
+                    f"cms_f{cms_frequency}_out",
+
+            )(
+                cms_h
+            )
+
+
+            cms_gate_logit = self.param(
+
+                f"cms_f{cms_frequency}_gate_logit",
+
+                lambda key, shape:
+
+                    jnp.full(
+
+                        shape,
+
+                        fidelity_core._safe_logit(
+                            0.05
+                        ),
+
+                        dtype=jnp.float32,
+                    ),
+
+                (
+                    1,
+                ),
+            )
+
+
+            cms_gate = jax.nn.sigmoid(
+
+                cms_gate_logit
+
+            )[0]
+
+
+            output = (
+
+                output
+
+                +
+
+                cms_gate
+                *
+                cms_delta
+            )
+
+
+        output = nn.LayerNorm(
+
+            name="output_norm"
+
+        )(
+            output
+        )
+
+
+        # ==================================================================================
+        # E. COMPATI
