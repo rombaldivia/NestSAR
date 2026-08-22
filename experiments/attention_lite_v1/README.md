@@ -1,10 +1,10 @@
 # Attention-Lite v1
 
-Versioned **NestSAR-HOPE-Attention-Lite D128** TPU v5e-8 experiment for the final NTU120 reproducibility study.
+Versioned **NestSAR-HOPE-Attention-Lite D128** TPU v5e-8 experiment for NTU120 reproducibility and controlled training studies.
 
 ## Golden architecture — frozen
 
-The paper runner must preserve the validated experiment:
+The architecture remains fixed:
 
 - 16 frames
 - D128
@@ -13,37 +13,51 @@ The paper runner must preserve the validated experiment:
 - 705 parameter leaves
 - 0.060416900 GFLOPs per clip from the exact JAX/XLA forward cost audit
 - TPU v5e-8, all 8 devices
-- global batch 32 / local batch 4
-- gradient accumulation 4 / effective batch 128
-- FAST/MEDIUM/SLOW/CONSOLIDATE periods 4/8/16/32 microbatches
+- FAST/MEDIUM/SLOW/CONSOLIDATE stagewise optimizer structure
 - RegMask 8% frame / 8% joint / 3% part
 - EMA 0.995
-- 40 epochs for the paper multi-seed study
 
-Only **protocol** and **seed** are experimental variables in paper mode.
+Golden training defaults are:
 
-Paper seeds are frozen to:
+```text
+epochs                 40
+patience                0   # disabled, matching the original E40 source
+dropout               0.22
+learning_rate        1e-3
+weight_decay          0.05
+warmup_fraction       0.10
+label_smoothing       0.05
+grad_clip              1.0
+predictive_loss_weight 0.10
+initial_eta            0.02
+initial_alpha          0.95
+global_batch             32
+grad_accum                4
+effective_batch          128
+eval_batch                32
+```
+
+Paper seeds are:
 
 ```text
 28, 42, 128, 2026
 ```
 
-Use the same seed set for XSUB and XSET.
+Use the same seed set for XSUB and XSET for the final mean ± std table.
 
 ## Safety strategy
 
-The validated XSUB/XSET all-in-one source remains the mathematical source of truth until the modular refactor passes TPU parity. `trainer.py` does not recreate the model. It:
+The validated XSUB/XSET all-in-one source remains the mathematical source of truth. `trainer.py` does not recreate the model. It:
 
 1. finds the exact validated protocol-specific all-in-one source;
 2. verifies golden architecture markers;
-3. patches only the seed and generated output path;
-4. saves the generated source and SHA256 provenance;
-5. executes it in a clean subprocess;
-6. verifies the final `result.json` protocol, seed, parameters, leaves, frames, and batch/accumulation guards.
+3. patches the requested seed, output path, and training hyperparameters only;
+4. keeps T16/D128/D64-H4-Dh16/parameter-count/leaves architecture guards fixed;
+5. saves the generated source and SHA256 provenance;
+6. executes it in a clean subprocess;
+7. verifies the final result against the requested batch/accumulation configuration.
 
-This avoids silently changing the successful Attention-Lite mathematics during the reproducibility runs.
-
-Expected canonical source filenames:
+Expected canonical filenames:
 
 ```text
 NestSAR_HOPE_Attention_Lite_TPUv5e8_XSUB_E40_ALL_IN_ONE.py
@@ -54,35 +68,34 @@ Put the exact source in `/kaggle/input`, `/kaggle/working`, or pass `canonical_s
 
 ## Deterministic output structure
 
-Each run gets a seed-labeled main directory:
+A golden run uses:
 
 ```text
-/kaggle/working/
-├── NestSAR_HOPE_Attention_Lite_D128_XSUB_SEED_28/
-│   ├── best_ema.msgpack
-│   ├── last_weights.msgpack
-│   ├── last_stagewise_state.pkl
-│   ├── history.json
-│   ├── result.json
-│   ├── generated_source/
-│   │   └── attention_lite_xsub_seed_28_generated.py
-│   ├── logs/
-│   │   └── train.log
-│   └── metadata/
-│       ├── paths.json
-│       └── run_manifest.json
-├── NestSAR_HOPE_Attention_Lite_D128_XSET_SEED_28/
-├── NestSAR_HOPE_Attention_Lite_D128_XSUB_SEED_42/
-├── NestSAR_HOPE_Attention_Lite_D128_XSET_SEED_42/
-├── NestSAR_HOPE_Attention_Lite_D128_XSUB_SEED_128/
-├── NestSAR_HOPE_Attention_Lite_D128_XSET_SEED_128/
-├── NestSAR_HOPE_Attention_Lite_D128_XSUB_SEED_2026/
-└── NestSAR_HOPE_Attention_Lite_D128_XSET_SEED_2026/
+/kaggle/working/NestSAR_HOPE_Attention_Lite_D128_XSUB_SEED_28/
 ```
 
-The canonical trainer's checkpoint/result files stay at the run-root level so exact stagewise resume behavior is preserved.
+A custom training configuration is automatically separated with a stable hash unless `run_tag=` is supplied:
 
-## Kaggle API
+```text
+/kaggle/working/NestSAR_HOPE_Attention_Lite_D128_XSUB_SEED_28_CUSTOM_a1b2c3d4/
+```
+
+or, with `run_tag="p12_lr8e4"`:
+
+```text
+/kaggle/working/NestSAR_HOPE_Attention_Lite_D128_XSUB_SEED_28_p12_lr8e4/
+```
+
+Each run contains the canonical checkpoint/result files plus:
+
+```text
+generated_source/
+logs/train.log
+metadata/paths.json
+metadata/run_manifest.json
+```
+
+## Kaggle API — golden run
 
 ```python
 from nestsar_run import train
@@ -96,37 +109,45 @@ train(
 )
 ```
 
-Then run XSET with the same seed:
+`patience=None` preserves the original E40 behavior: no early stopping.
+
+## Kaggle API — configurable training
 
 ```python
+from nestsar_run import train
+
 train(
     "attention_lite",
-    protocol="xset",
+    protocol="xsub",
     seed=28,
     epochs=40,
+    patience=12,
+    dropout=0.22,
+    learning_rate=1e-3,
+    weight_decay=0.05,
+    warmup_fraction=0.10,
+    label_smoothing=0.05,
+    grad_clip=1.0,
+    predictive_loss_weight=0.10,
+    initial_eta=0.02,
+    initial_alpha=0.95,
+    batch_size=32,
+    grad_accum_steps=4,
+    eval_batch_size=32,
+    run_tag="p12",
     dataset="auto",
 )
 ```
 
-CLI equivalent:
+A positive `patience` enables early stopping in the generated source. `patience=0` or `None` disables it.
 
-```bash
-python -m nestsar_run attention_lite --protocol xsub --seed 28 --epochs 40
-python -m nestsar_run attention_lite --protocol xset --seed 28 --epochs 40
-```
+Architecture-defining values such as frames, model width, attention width/heads, and parameter tree are intentionally not exposed here.
 
-If auto-discovery cannot find the canonical source:
-
-```bash
-python -m nestsar_run attention_lite \
-  --protocol xsub \
-  --seed 28 \
-  --canonical-source /kaggle/input/attention-lite-source/NestSAR_HOPE_Attention_Lite_TPUv5e8_XSUB_E40_ALL_IN_ONE.py
-```
+CLI equivalents are also available with `--patience`, `--dropout`, `--learning-rate`, `--weight-decay`, `--warmup-fraction`, `--label-smoothing`, `--grad-clip`, `--predictive-loss-weight`, `--initial-eta`, `--initial-alpha`, `--batch-size`, `--grad-accum-steps`, and `--eval-batch-size`.
 
 ## Four-seed summary
 
-After the eight protocol/seed directories are present:
+Golden, untagged runs can be aggregated with:
 
 ```bash
 python -m experiments.attention_lite_v1.multiseed_summary
@@ -138,8 +159,6 @@ This writes:
 /kaggle/working/NestSAR_HOPE_Attention_Lite_D128_4SEED_SUMMARY.json
 ```
 
-with the four individual seed results and mean ± sample standard deviation for XSUB and XSET.
-
 ## Merge gate
 
-Do not merge this experiment runner to `main` until an actual TPU smoke/probe verifies that the generated source reproduces the golden Attention-Lite architecture and expected learning behavior. The branch intentionally keeps the validated source as the source of truth rather than approximating it.
+Do not merge this experiment runner to `main` until an actual TPU smoke/probe verifies that the generated source reproduces the golden Attention-Lite architecture and expected learning behavior. Static patch generation and Python compilation are necessary but not a substitute for TPU parity.
