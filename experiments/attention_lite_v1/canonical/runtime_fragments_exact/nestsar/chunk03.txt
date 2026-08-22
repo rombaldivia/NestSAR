@@ -1,0 +1,512 @@
+changed_output = model.apply(
+        {"params": state.params},
+        x_changed,
+        training=False,
+    )
+
+    causal_error = float(
+        np.asarray(
+            jnp.max(
+                jnp.abs(
+                    output["prediction"][:, :-1]
+                    - changed_output["prediction"][:, :-1]
+                )
+            )
+        )
+    )
+
+    if causal_error > 1e-5:
+        raise AssertionError(
+            f"Fallo de causalidad temporal: error={causal_error}"
+        )
+
+    loss = classification_loss(
+        output["logits"],
+        y,
+    )
+
+    if not bool(np.asarray(jnp.isfinite(loss))):
+        raise FloatingPointError("Loss no finito en smoke test.")
+
+    log(
+        f"Smoke test superado | "
+        f"repeat_error={max_repeat_error:.3e} | "
+        f"causal_error={causal_error:.3e}"
+    )
+
+
+def run_experiment(
+    protocol: str,
+    mode: str,
+    dataset_path: Path,
+    output_dir: Path,
+) -> Dict[str, Any]:
+    seed_everything(CFG.seed)
+
+    log("=" * 76)
+    log(f"PROTOCOLO={protocol.upper()} | MODELO={mode}")
+    log("=" * 76)
+    log(f"JAX version: {jax.__version__}")
+    log(f"Devices: {jax.devices()}")
+
+    raw_data = load_pickle(dataset_path)
+
+    train_samples, val_samples = build_samples(
+        raw_data,
+        protocol=protocol,
+        max_train=CFG.max_train_samples,
+        max_val=CFG.max_val_samples,
+        seed=CFG.seed,
+    )
+
+    train_dataset = SkeletonDataset(train_samples)
+    val_dataset = SkeletonDataset(val_samples)
+
+    steps_per_epoch = max(
+        1,
+        math.ceil(len(train_dataset) / CFG.batch_size),
+    )
+    total_steps = CFG.epochs * steps_per_epoch
+
+    model = HOPEModel(
+        mode=mode,
+        num_classes=CFG.num_classes,
+        model_dim=CFG.model_dim,
+        memory_dim=CFG.memory_dim,
+        dropout=CFG.dropout,
+        memory_residual_scale=CFG.memory_residual_scale,
+        initial_eta=CFG.initial_eta,
+        initial_alpha=CFG.initial_alpha,
+    )
+
+    rng = jax.random.PRNGKey(CFG.seed)
+
+    state = create_state(
+        rng,
+        model,
+        total_steps=total_steps,
+    )
+
+    parameter_count = count_parameters(state.params)
+    log(f"Parámetros: {parameter_count:,}")
+
+    smoke_test(model, state)
+
+    train_step, eval_step = build_steps(model)
+
+    best_accuracy = -1.0
+    best_correct = -1
+    best_epoch = 0
+    epochs_without_improvement = 0
+    best_state = state
+    history: List[Dict[str, Any]] = []
+
+    run_start = time.time()
+
+    for epoch in range(1, CFG.epochs + 1):
+        epoch_start = time.time()
+
+        train_totals = {
+            "loss": 0.0,
+            "ce": 0.0,
+            "predictive": 0.0,
+            "accuracy": 0.0,
+            "memory_delta": 0.0,
+            "motion_gate": 0.0,
+            "memory_gate": 0.0,
+            "grad_norm": 0.0,
+        }
+
+        batch_count = 0
+
+        for batch_index, (batch_x, batch_y) in enumerate(
+            batch_iterator(
+                train_dataset,
+                CFG.batch_size,
+                shuffle=True,
+                seed=CFG.seed + epoch,
+                drop_last=False,
+            ),
+            start=1,
+        ):
+            rng, dropout_rng = jax.random.split(rng)
+
+            state, metrics = train_step(
+                state,
+                jnp.asarray(batch_x),
+                jnp.asarray(batch_y),
+                dropout_rng,
+            )
+
+            host_metrics = {
+                key: float(np.asarray(value))
+                for key, value in metrics.items()
+            }
+
+            for key in train_totals:
+                train_totals[key] += host_metrics[key]
+
+            batch_count += 1
+
+            if (
+                batch_index == 1
+                or batch_index % CFG.log_every_batches == 0
+                or batch_index == steps_per_epoch
+            ):
+                elapsed = time.time() - epoch_start
+                rate = batch_index / max(elapsed, 1e-6)
+                remaining = (
+                    steps_per_epoch - batch_index
+                ) / max(rate, 1e-6)
+
+                log(
+                    f"{protocol.upper()} {mode} | "
+                    f"Ep {epoch:03d}/{CFG.epochs} | "
+                    f"batch {batch_index:04d}/{steps_per_epoch:04d} | "
+                    f"loss={host_metrics['loss']:.4f} | "
+                    f"acc={100.0 * host_metrics['accuracy']:.2f}% | "
+                    f"pred={host_metrics['predictive']:.5f} | "
+                    f"memΔ={host_metrics['memory_delta']:.6f} | "
+                    f"ETA={remaining:.0f}s"
+                )
+
+        train_mean = {
+            key: value / max(batch_count, 1)
+            for key, value in train_totals.items()
+        }
+
+        val_metrics = evaluate(
+            state,
+            val_dataset,
+            eval_step,
+        )
+
+        epoch_seconds = time.time() - epoch_start
+
+        record = {
+            "epoch": epoch,
+            "train": train_mean,
+            "validation": val_metrics,
+            "epoch_seconds": epoch_seconds,
+        }
+        history.append(record)
+
+        improved = (
+            val_metrics["correct"] > best_correct
+            or (
+                val_metrics["correct"] == best_correct
+                and val_metrics["loss"]
+                < (
+                    history[best_epoch - 1]["validation"]["loss"]
+                    if best_epoch > 0
+                    else float("inf")
+                )
+            )
+        )
+
+        if improved:
+            best_accuracy = val_metrics["accuracy"]
+            best_correct = val_metrics["correct"]
+            best_epoch = epoch
+            epochs_without_improvement = 0
+            best_state = state
+
+            save_checkpoint(
+                output_dir / f"{protocol}_{mode}_best",
+                best_state,
+                {
+                    "protocol": protocol,
+                    "mode": mode,
+                    "best_epoch": best_epoch,
+                    "best_accuracy": best_accuracy,
+                    "best_correct": best_correct,
+                    "validation_count": val_metrics["count"],
+                    "parameters": parameter_count,
+                    "config": dataclasses.asdict(CFG),
+                    "metrics": val_metrics,
+                },
+            )
+        else:
+            epochs_without_improvement += 1
+
+        log(
+            f"{protocol.upper()} {mode} | "
+            f"Ep {epoch:03d} FINAL | "
+            f"train_acc={100.0 * train_mean['accuracy']:.3f}% | "
+            f"val_acc={100.0 * val_metrics['accuracy']:.6f}% | "
+            f"{val_metrics['correct']}/{val_metrics['count']} | "
+            f"val_loss={val_metrics['loss']:.5f} | "
+            f"pred={val_metrics['predictive']:.6f} | "
+            f"memΔ={val_metrics['memory_delta']:.7f} | "
+            f"motion_gate={val_metrics['motion_gate']:.4f} | "
+            f"memory_gate={val_metrics['memory_gate']:.4f} | "
+            f"best={100.0 * best_accuracy:.6f}%@{best_epoch} | "
+            f"time={epoch_seconds:.1f}s"
+        )
+
+        history_path = output_dir / f"{protocol}_{mode}_history.json"
+        history_path.write_text(
+            json.dumps(history, indent=2),
+            encoding="utf-8",
+        )
+
+        if epochs_without_improvement >= CFG.patience:
+            log(
+                f"Early stopping: {CFG.patience} épocas sin mejora."
+            )
+            break
+
+    total_seconds = time.time() - run_start
+
+    best_metrics = evaluate(
+        best_state,
+        val_dataset,
+        eval_step,
+    )
+
+    result = {
+        "protocol": protocol,
+        "mode": mode,
+        "best_epoch": best_epoch,
+        "best_accuracy": best_metrics["accuracy"],
+        "best_correct": best_metrics["correct"],
+        "validation_count": best_metrics["count"],
+        "best_loss": best_metrics["loss"],
+        "best_ce": best_metrics["ce"],
+        "best_predictive": best_metrics["predictive"],
+        "memory_delta": best_metrics["memory_delta"],
+        "motion_gate": best_metrics["motion_gate"],
+        "memory_gate": best_metrics["memory_gate"],
+        "parameters": parameter_count,
+        "runtime_seconds": total_seconds,
+        "config": dataclasses.asdict(CFG),
+    }
+
+    result_path = output_dir / f"{protocol}_{mode}_result.json"
+    result_path.write_text(
+        json.dumps(result, indent=2),
+        encoding="utf-8",
+    )
+
+    log("=" * 76)
+    log(
+        f"RESULTADO {protocol.upper()} {mode}: "
+        f"{100.0 * result['best_accuracy']:.6f}% | "
+        f"{result['best_correct']}/{result['validation_count']} | "
+        f"época {result['best_epoch']} | "
+        f"loss={result['best_loss']:.6f}"
+    )
+    log("=" * 76)
+
+    return result
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--protocol",
+        required=True,
+        choices=("xsub", "xset"),
+    )
+    parser.add_argument(
+        "--mode",
+        required=True,
+        choices=(
+            "H0_direct_motion",
+            "H2_predictive_memory",
+        ),
+    )
+    parser.add_argument(
+        "--dataset",
+        default=None,
+    )
+    parser.add_argument(
+        "--output-dir",
+        required=True,
+    )
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    dataset_path = find_dataset(args.dataset)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    result = run_experiment(
+        protocol=args.protocol,
+        mode=args.mode,
+        dataset_path=dataset_path,
+        output_dir=output_dir,
+    )
+
+    print(
+        "FINAL_JSON=" + json.dumps(result),
+        flush=True,
+    )
+
+
+
+# ============================================================================
+# NESTSAR MODERN COMPATIBILITY CORE FOR M4/SASM/HOPE-v3 (OFFLINE KAGGLE)
+# ============================================================================
+import hashlib
+import shutil
+
+@dataclasses.dataclass(frozen=True)
+class Config:
+    frames: int = 64
+    persons: int = 2
+    joints: int = 25
+    coords: int = 3
+    num_classes: int = 120
+    model_dim: int = 128
+    memory_dim: int = 64
+    dropout: float = 0.22
+    batch_size: int = 16
+    grad_accum_steps: int = 8
+    eval_batch_size: int = 32
+    epochs: int = 40
+    patience: int = 12
+    learning_rate: float = 1.0e-3
+    weight_decay: float = 0.05
+    warmup_fraction: float = 0.10
+    label_smoothing: float = 0.05
+    grad_clip: float = 1.0
+    memory_residual_scale: float = 0.25
+    initial_eta: float = 0.02
+    initial_alpha: float = 0.95
+    predictive_loss_weight: float = 0.10
+    adapter_rank: int = 8
+    nested_qkv_scale: float = 0.25
+    frame_blocks: int = 2
+    chunk_blocks: int = 2
+    clip_blocks: int = 2
+    controller_blocks: int = 2
+    chunk_size: int = 4
+    clip_size: int = 8
+    controller_rank: int = 32
+    max_train_samples: int = 0
+    max_val_samples: int = 0
+    seed: int = 128
+    log_every_batches: int = 200
+
+CFG = Config()
+MODEL_ALIASES: Dict[str, str] = {}
+
+
+def four_logit(value: float) -> float:
+    value = min(max(float(value), 1e-5), 1.0 - 1e-5)
+    return float(np.log(value / (1.0 - value)))
+
+
+def pool_tokens(x: jnp.ndarray, group_size: int) -> jnp.ndarray:
+    batch, time_dim, dim = x.shape
+    if time_dim % group_size != 0:
+        raise ValueError(f"T={time_dim} no es divisible por group_size={group_size}")
+    return x.reshape(batch, time_dim // group_size, group_size, dim).mean(axis=2)
+
+
+def repeat_tokens(x: jnp.ndarray, repeat: int, target_time: int) -> jnp.ndarray:
+    return jnp.repeat(x, repeats=repeat, axis=1)[:, :target_time]
+
+
+def delay_tokens(x: jnp.ndarray, delay: int) -> jnp.ndarray:
+    if delay <= 0:
+        return x
+    zeros = jnp.zeros_like(x[:, :delay])
+    return jnp.concatenate([zeros, x[:, :-delay]], axis=1)
+
+
+class MemoryBlock(nn.Module):
+    model_dim: int
+    memory_dim: int
+    dropout: float
+    residual_scale: float
+    initial_eta: float
+    initial_alpha: float
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, training: bool):
+        h = nn.LayerNorm(name="input_norm")(x)
+        keys = nn.Dense(self.memory_dim, use_bias=False,
+                        kernel_init=nn.initializers.xavier_uniform(), name="key")(h)
+        queries = nn.Dense(self.memory_dim, use_bias=False,
+                           kernel_init=nn.initializers.xavier_uniform(), name="query")(h)
+        values = nn.Dense(self.memory_dim, use_bias=False,
+                          kernel_init=nn.initializers.xavier_uniform(), name="value")(h)
+        keys = stable_l2_normalize(keys)
+        queries = stable_l2_normalize(queries)
+
+        eta = jax.nn.sigmoid(self.param(
+            "eta_logit", lambda key, shape: jnp.full(shape, four_logit(self.initial_eta)), (1,)
+        ))[0]
+        alpha = jax.nn.sigmoid(self.param(
+            "alpha_logit", lambda key, shape: jnp.full(shape, four_logit(self.initial_alpha)), (1,)
+        ))[0]
+        gate = jax.nn.sigmoid(self.param("memory_gate_logit", nn.initializers.zeros, (1,)))
+
+        scan_inputs = (
+            jnp.swapaxes(keys, 0, 1),
+            jnp.swapaxes(queries, 0, 1),
+            jnp.swapaxes(values, 0, 1),
+        )
+        memory0 = jnp.zeros((x.shape[0], self.memory_dim, self.memory_dim), dtype=x.dtype)
+
+        def step(memory, inputs):
+            key_t, query_t, value_t = inputs
+            read_t = jnp.einsum("bij,bj->bi", memory, query_t)
+            reconstructed_t = jnp.einsum("bij,bj->bi", memory, key_t)
+            error_t = reconstructed_t - value_t
+            update_t = jnp.einsum("bi,bj->bij", error_t, key_t)
+            new_memory = alpha * memory - eta * update_t
+            delta_t = jnp.sqrt(jnp.mean(jnp.square(new_memory-memory), axis=(1,2)) + 1e-12)
+            return new_memory, (read_t, delta_t)
+
+        _, (reads_t, deltas_t) = jax.lax.scan(step, memory0, scan_inputs)
+        reads = jnp.swapaxes(reads_t, 0, 1)
+        delta = jnp.swapaxes(deltas_t, 0, 1)
+        context = nn.Dense(self.model_dim,
+                           kernel_init=nn.initializers.xavier_uniform(), name="readout")(reads)
+        context = nn.Dropout(rate=self.dropout, name="context_dropout")(
+            context, deterministic=not training
+        )
+        scaled_context = self.residual_scale * gate * context
+        x = nn.LayerNorm(name="memory_residual_norm")(x + scaled_context)
+        ff = nn.LayerNorm(name="ff_norm")(x)
+        ff = nn.Dense(self.model_dim, kernel_init=nn.initializers.xavier_uniform(), name="ff_in")(ff)
+        ff = nn.gelu(ff)
+        ff = nn.Dropout(rate=self.dropout, name="ff_dropout")(ff, deterministic=not training)
+        ff = nn.Dense(self.model_dim, kernel_init=nn.initializers.zeros, name="ff_out")(ff)
+        ff_gate = jax.nn.sigmoid(self.param("ff_gate_logit", nn.initializers.zeros, (1,)))
+        out = nn.LayerNorm(name="output_norm")(x + ff_gate * ff)
+        return out, scaled_context, delta, gate
+
+
+class SlowControllerBlock(nn.Module):
+    model_dim: int
+    rank: int
+    dropout: float
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, training: bool):
+        h = nn.LayerNorm(name="controller_norm")(x)
+        update = nn.Dense(self.rank, kernel_init=nn.initializers.xavier_uniform(), name="down")(h)
+        update = nn.gelu(update)
+        update = nn.Dropout(rate=self.dropout, name="dropout")(update, deterministic=not training)
+        update = nn.Dense(self.model_dim, kernel_init=nn.initializers.zeros, name="up")(update)
+        gate = jax.nn.sigmoid(self.param("controller_gate_logit", nn.initializers.zeros, (1,)))
+        return nn.LayerNorm(name="controller_output_norm")(x + gate * update), gate
+
+
+# Base registry hooks; experiment modules monkey-patch these.
+def build_model(model_id: str) -> nn.Module:
+    raise ValueError(f"Modelo no registrado: {model_id}. Importa el wrapper del experimento primero.")
+
+
+def make_schedule(total_steps: int) -> optax.Schedule:
+    warmup_steps = max(1, int(total_steps * CFG.warmup_fraction))
+    decay_steps = m
