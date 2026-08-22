@@ -4,23 +4,43 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import statistics
 from pathlib import Path
 
 from .paths import MODEL_SLUG, PAPER_SEEDS, run_folder_name
 
+LEGACY_SEED128 = {
+    "xsub": "NestSAR_HOPE_ATTENTION_LITE_D128_XSUB_E40",
+    "xset": "NestSAR_HOPE_ATTENTION_LITE_D128_XSET_E40",
+}
+
+
+def _candidate_result_paths(base: Path, protocol: str, seed: int) -> list[tuple[Path, str]]:
+    root = base / run_folder_name(protocol, seed)
+    candidates = [(root / "result.json", "seed_labeled")]
+    if seed == 128:
+        candidates.append((base / LEGACY_SEED128[protocol] / "result.json", "legacy_seed128"))
+    return candidates
+
 
 def _load_one(base: Path, protocol: str, seed: int) -> dict:
-    root = base / run_folder_name(protocol, seed)
-    path = root / "result.json"
-    if not path.is_file():
+    candidates = _candidate_result_paths(base, protocol, seed)
+    selected: tuple[Path, str] | None = None
+    for path, source_kind in candidates:
+        if path.is_file():
+            selected = (path, source_kind)
+            break
+
+    if selected is None:
         return {
             "protocol": protocol,
             "seed": seed,
             "status": "missing",
-            "root": str(root),
+            "root": str(base / run_folder_name(protocol, seed)),
+            "searched": [str(p) for p, _ in candidates],
         }
+
+    path, source_kind = selected
     data = json.loads(path.read_text(encoding="utf-8"))
     raw_acc = data.get("best_val_accuracy")
     if raw_acc is None:
@@ -29,11 +49,21 @@ def _load_one(base: Path, protocol: str, seed: int) -> dict:
     # Canonical result stores accuracy as a fraction (e.g. 0.7311).
     if acc <= 1.0:
         acc *= 100.0
+
+    result_seed = int(data.get("seed", -1))
+    result_protocol = str(data.get("protocol", "")).lower()
+    if result_seed != seed:
+        raise RuntimeError(f"Seed mismatch in {path}: result={result_seed}, expected={seed}")
+    if result_protocol != protocol:
+        raise RuntimeError(f"Protocol mismatch in {path}: result={result_protocol}, expected={protocol}")
+
     return {
         "protocol": protocol,
         "seed": seed,
         "status": "complete",
-        "root": str(root),
+        "source_kind": source_kind,
+        "root": str(path.parent),
+        "result_path": str(path),
         "best_epoch": int(data.get("best_epoch", -1)),
         "best_val_accuracy_percent": acc,
         "parameters": int(data.get("parameters", -1)),
@@ -75,9 +105,10 @@ def _print_table(summary: dict) -> None:
         print("-" * 92)
         for row in block["runs"]:
             if row["status"] == "complete":
+                legacy = " legacy" if row.get("source_kind") == "legacy_seed128" else ""
                 print(
                     f"seed {row['seed']:4d} | best E{row['best_epoch']:02d} | "
-                    f"{row['best_val_accuracy_percent']:.5f}% | rollback={row['rollback']}"
+                    f"{row['best_val_accuracy_percent']:.5f}% | rollback={row['rollback']}{legacy}"
                 )
             else:
                 print(f"seed {row['seed']:4d} | MISSING | {row['root']}")
