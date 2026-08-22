@@ -1,0 +1,513 @@
+al_accuracy":
+            float(
+                val_acc
+            ),
+
+        "val_correct":
+            int(
+                val_metrics[
+                    "correct"
+                ]
+            ),
+
+        "val_count":
+            int(
+                val_metrics[
+                    "count"
+                ]
+            ),
+
+        "stream_accuracy":
+            val_metrics[
+                "stream_accuracy"
+            ],
+
+        "fusion_weights":
+            val_metrics[
+                "fusion_weights"
+            ],
+
+        "accepted":
+            accepted,
+
+        "rollback":
+            rollback,
+
+        "fast_updates":
+            fast_updates,
+
+        "medium_updates":
+            medium_updates,
+
+        "slow_updates":
+            slow_updates,
+
+        "consolidate_updates":
+            consolidate_updates,
+
+        "ema_updates":
+            ema_updates,
+
+        "train_minutes":
+            train_minutes,
+
+        "validation_minutes":
+            val_minutes,
+    }
+
+
+    history.append(
+        epoch_record
+    )
+
+
+    (
+        OUT
+        /
+        "history.json"
+
+    ).write_text(
+
+        json.dumps(
+
+            history,
+
+            indent=2,
+        ),
+
+        encoding="utf-8",
+    )
+
+
+    # ======================================================================================
+    # BEST
+    # ======================================================================================
+
+    online_params = full_param_tree(
+
+        fast_params,
+
+        medium_params,
+
+        slow_params,
+
+        consolidate_params,
+    )
+
+
+    if val_acc > best_val:
+
+        best_val = val_acc
+        best_epoch = epoch
+
+
+        save_weights(
+
+            OUT
+            /
+            "best_ema.msgpack",
+
+            online_params,
+
+            ema_params,
+
+            epoch,
+
+            val_metrics,
+        )
+
+
+        print()
+        print(
+            f"🔥 NEW BEST E{epoch}: "
+            f"{100.0 * best_val:.5f}%"
+        )
+
+
+    # Always save current weights.
+    save_weights(
+
+        OUT
+        /
+        "last_weights.msgpack",
+
+        online_params,
+
+        ema_params,
+
+        epoch,
+
+        val_metrics,
+    )
+
+
+    # Exact stagewise continuation state.
+    print(
+        "Saving exact stagewise resume state..."
+    )
+
+
+    save_resume_state(
+
+        epoch,
+
+        accepted,
+
+        rollback,
+
+        train_rng,
+    )
+
+
+    print(
+        "Resume state saved."
+    )
+
+
+# ==========================================================================================
+# 24. FINAL AUDIT
+# ==========================================================================================
+
+online_params = full_param_tree(
+
+    fast_params,
+
+    medium_params,
+
+    slow_params,
+
+    consolidate_params,
+)
+
+
+ONLINE_FINITE = bool(
+
+    np.asarray(
+
+        full_finite(
+            online_params
+        )
+    )
+)
+
+
+EMA_FINITE = bool(
+
+    np.asarray(
+
+        full_finite(
+            ema_params
+        )
+    )
+)
+
+
+expected_fast = (
+    accepted
+    //
+    4
+)
+
+expected_medium = (
+    accepted
+    //
+    8
+)
+
+expected_slow = (
+    accepted
+    //
+    16
+)
+
+expected_consolidate = (
+    accepted
+    //
+    32
+)
+
+
+result = {
+
+    "model":
+        "NestSAR-HOPE-Attention-Lite-D128-v1",
+
+    "protocol":
+        "xsub",
+
+    "seed":
+        SEED,
+
+    "epochs":
+        EPOCHS,
+
+    "frames":
+        16,
+
+    "parameters":
+        EXPECTED_PARAMS,
+
+    "leaves":
+        EXPECTED_LEAVES,
+
+    "attention_dim":
+        64,
+
+    "attention_heads":
+        4,
+
+    "head_dim":
+        16,
+
+    "global_batch":
+        GLOBAL_BATCH,
+
+    "local_batch":
+        GLOBAL_BATCH
+        //
+        8,
+
+    "grad_accum":
+        GRAD_ACCUM,
+
+    "effective_batch":
+        EFFECTIVE_BATCH,
+
+    "train_samples":
+        TRAIN_EXPECTED,
+
+    "val_samples":
+        VAL_EXPECTED,
+
+    "microsteps_per_epoch":
+        MICROSTEPS_PER_EPOCH,
+
+    "total_microsteps":
+        TOTAL_MICROSTEPS,
+
+    "schedule_total_steps":
+        TOTAL_STEPS,
+
+    "accepted":
+        accepted,
+
+    "rollback":
+        rollback,
+
+    "fast_updates":
+        fast_updates,
+
+    "medium_updates":
+        medium_updates,
+
+    "slow_updates":
+        slow_updates,
+
+    "consolidate_updates":
+        consolidate_updates,
+
+    "ema_updates":
+        ema_updates,
+
+    "expected_fast":
+        expected_fast,
+
+    "expected_medium":
+        expected_medium,
+
+    "expected_slow":
+        expected_slow,
+
+    "expected_consolidate":
+        expected_consolidate,
+
+    "online_finite":
+        ONLINE_FINITE,
+
+    "ema_finite":
+        EMA_FINITE,
+
+    "best_epoch":
+        best_epoch,
+
+    "best_val_accuracy":
+        best_val,
+
+    "history":
+        history,
+
+    "wall_hours":
+        (
+            time.time()
+            -
+            run_start
+        )
+        /
+        3600.0,
+}
+
+
+(
+    OUT
+    /
+    "result.json"
+
+).write_text(
+
+    json.dumps(
+
+        result,
+
+        indent=2,
+    ),
+
+    encoding="utf-8",
+)
+
+
+print()
+print("=" * 132)
+print(
+    "🔥 NESTSAR-HOPE-ATTENTION-LITE "
+    "XSUB 40-EPOCH FULL RUN COMPLETE"
+)
+print("=" * 132)
+
+print(
+    "Parameters:          ",
+    f"{EXPECTED_PARAMS:,}"
+)
+
+print(
+    "Leaves:              ",
+    EXPECTED_LEAVES
+)
+
+print()
+
+print(
+    "Accepted:            ",
+    accepted,
+    "/",
+    TOTAL_MICROSTEPS
+)
+
+print(
+    "Rollback:            ",
+    rollback
+)
+
+print()
+
+print(
+    "FAST:                ",
+    fast_updates,
+    "/",
+    expected_fast
+)
+
+print(
+    "MEDIUM:              ",
+    medium_updates,
+    "/",
+    expected_medium
+)
+
+print(
+    "SLOW:                ",
+    slow_updates,
+    "/",
+    expected_slow
+)
+
+print(
+    "CONSOLIDATE:         ",
+    consolidate_updates,
+    "/",
+    expected_consolidate
+)
+
+print(
+    "EMA:                 ",
+    ema_updates,
+    "/",
+    expected_fast
+)
+
+print()
+
+print(
+    "Online finite:       ",
+    ONLINE_FINITE
+)
+
+print(
+    "EMA finite:          ",
+    EMA_FINITE
+)
+
+print()
+
+for row in history:
+
+    print(
+
+        f"E{row['epoch']:02d} | "
+
+        f"train="
+        f"{100.0 * row['train_accuracy']:.3f}% | "
+
+        f"val="
+        f"{100.0 * row['val_accuracy']:.5f}%"
+    )
+
+
+print()
+print(
+    "BEST:",
+    f"E{best_epoch}",
+    f"{100.0 * best_val:.5f}%"
+)
+
+print()
+print(
+    "Output:",
+    OUT
+)
+
+print(
+    "History:",
+    OUT
+    /
+    "history.json"
+)
+
+print(
+    "Best EMA:",
+    OUT
+    /
+    "best_ema.msgpack"
+)
+
+print(
+    "Last weights:",
+    OUT
+    /
+    "last_weights.msgpack"
+)
+
+print(
+    "Exact resume:",
+    OUT
+    /
+    "last_stagewise_state.pkl"
+)
+
+print(
+    "Result:",
+    OUT
+    /
+    "result.json"
+)
+
+print("=" * 132)
