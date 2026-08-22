@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate Attention-Lite paper runs into mean/std summaries."""
+"""Aggregate Attention-Lite reproducibility runs into mean/std summaries."""
 from __future__ import annotations
 
 import argparse
@@ -7,7 +7,7 @@ import json
 import statistics
 from pathlib import Path
 
-from .paths import MODEL_SLUG, PAPER_SEEDS, run_folder_name
+from .paths import MODEL_SLUG, PAPER_SEEDS, run_folder_name, sanitize_tag
 
 LEGACY_SEED128 = {
     "xsub": "NestSAR_HOPE_ATTENTION_LITE_D128_XSUB_E40",
@@ -15,28 +15,37 @@ LEGACY_SEED128 = {
 }
 
 
-def _candidate_result_paths(base: Path, protocol: str, seed: int) -> list[tuple[Path, str]]:
-    root = base / run_folder_name(protocol, seed)
+def _candidate_result_paths(
+    base: Path,
+    protocol: str,
+    seed: int,
+    run_tag: str | None,
+) -> list[tuple[Path, str]]:
+    root = base / run_folder_name(protocol, seed, run_tag)
     candidates = [(root / "result.json", "seed_labeled")]
-    if seed == 128:
+    # The historical seed-128 checkpoint used the golden untagged recipe.  Never mix
+    # it into a tagged/custom configuration's statistics.
+    if seed == 128 and run_tag is None:
         candidates.append((base / LEGACY_SEED128[protocol] / "result.json", "legacy_seed128"))
     return candidates
 
 
-def _load_one(base: Path, protocol: str, seed: int) -> dict:
-    candidates = _candidate_result_paths(base, protocol, seed)
+def _load_one(base: Path, protocol: str, seed: int, run_tag: str | None) -> dict:
+    candidates = _candidate_result_paths(base, protocol, seed, run_tag)
     selected: tuple[Path, str] | None = None
     for path, source_kind in candidates:
         if path.is_file():
             selected = (path, source_kind)
             break
 
+    expected_root = base / run_folder_name(protocol, seed, run_tag)
     if selected is None:
         return {
             "protocol": protocol,
             "seed": seed,
+            "run_tag": run_tag,
             "status": "missing",
-            "root": str(base / run_folder_name(protocol, seed)),
+            "root": str(expected_root),
             "searched": [str(p) for p, _ in candidates],
         }
 
@@ -46,7 +55,6 @@ def _load_one(base: Path, protocol: str, seed: int) -> dict:
     if raw_acc is None:
         raise KeyError(f"best_val_accuracy missing from {path}")
     acc = float(raw_acc)
-    # Canonical result stores accuracy as a fraction (e.g. 0.7311).
     if acc <= 1.0:
         acc *= 100.0
 
@@ -60,6 +68,7 @@ def _load_one(base: Path, protocol: str, seed: int) -> dict:
     return {
         "protocol": protocol,
         "seed": seed,
+        "run_tag": run_tag,
         "status": "complete",
         "source_kind": source_kind,
         "root": str(path.parent),
@@ -73,15 +82,21 @@ def _load_one(base: Path, protocol: str, seed: int) -> dict:
     }
 
 
-def summarize(base_dir: str | Path = "/kaggle/working") -> dict:
+def summarize(
+    base_dir: str | Path = "/kaggle/working",
+    *,
+    run_tag: str | None = None,
+) -> dict:
     base = Path(base_dir)
+    clean_tag = sanitize_tag(run_tag)
     output: dict[str, object] = {
         "model": "NestSAR-HOPE-Attention-Lite-D128-v1",
+        "run_tag": clean_tag,
         "expected_seeds": list(PAPER_SEEDS),
         "protocols": {},
     }
     for protocol in ("xsub", "xset"):
-        rows = [_load_one(base, protocol, seed) for seed in PAPER_SEEDS]
+        rows = [_load_one(base, protocol, seed, clean_tag) for seed in PAPER_SEEDS]
         values = [r["best_val_accuracy_percent"] for r in rows if r["status"] == "complete"]
         stats = {
             "n_complete": len(values),
@@ -97,7 +112,8 @@ def summarize(base_dir: str | Path = "/kaggle/working") -> dict:
 
 def _print_table(summary: dict) -> None:
     print("=" * 92)
-    print("NESTSAR ATTENTION-LITE — 4-SEED PAPER SUMMARY")
+    print("NESTSAR ATTENTION-LITE — 4-SEED REPRODUCIBILITY SUMMARY")
+    print(f"RUN TAG: {summary.get('run_tag') or '<golden/untagged>'}")
     print("=" * 92)
     for protocol in ("xsub", "xset"):
         block = summary["protocols"][protocol]
@@ -129,11 +145,18 @@ def _print_table(summary: dict) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs-root", default="/kaggle/working")
+    parser.add_argument("--run-tag", default=None)
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
-    summary = summarize(args.runs_root)
+    summary = summarize(args.runs_root, run_tag=args.run_tag)
     _print_table(summary)
-    out = Path(args.output) if args.output else Path(args.runs_root) / f"{MODEL_SLUG}_4SEED_SUMMARY.json"
+
+    clean_tag = sanitize_tag(args.run_tag)
+    if args.output:
+        out = Path(args.output)
+    else:
+        suffix = f"_{clean_tag}" if clean_tag else ""
+        out = Path(args.runs_root) / f"{MODEL_SLUG}_4SEED_SUMMARY{suffix}.json"
     out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"Summary JSON: {out}")
     return 0
