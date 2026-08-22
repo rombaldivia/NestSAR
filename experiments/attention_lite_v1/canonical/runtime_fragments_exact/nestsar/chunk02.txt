@@ -1,0 +1,591 @@
+ndarray,
+        training: bool,
+    ) -> Dict[str, jnp.ndarray]:
+        """
+        x: [B, T, 150]
+        """
+
+        if self.mode not in (
+            "H0_direct_motion",
+            "H2_predictive_memory",
+        ):
+            raise ValueError(f"Modo no soportado: {self.mode}")
+
+        # Stem idéntico para H0 y H2.
+        pose = nn.Dense(
+            self.model_dim,
+            kernel_init=nn.initializers.xavier_uniform(),
+            name="pose_projection",
+        )(x)
+        pose = nn.LayerNorm(name="pose_norm")(pose)
+        pose = nn.gelu(pose)
+
+        # Movimiento latente directo.
+        zero = jnp.zeros_like(pose[:, :1])
+        motion = jnp.concatenate(
+            [zero, pose[:, 1:] - pose[:, :-1]],
+            axis=1,
+        )
+
+        motion_projected = nn.Dense(
+            self.model_dim,
+            kernel_init=nn.initializers.xavier_uniform(),
+            name="motion_projection",
+        )(motion)
+        motion_projected = nn.gelu(motion_projected)
+
+        motion_gate = self.param(
+            "motion_gate_logit",
+            nn.initializers.zeros,
+            (1,),
+        )
+        motion_gate = jax.nn.sigmoid(motion_gate)
+
+        direct_features = pose + motion_gate * motion_projected
+        direct_features = nn.LayerNorm(name="direct_norm")(direct_features)
+
+        prediction = jnp.zeros_like(motion)
+        memory_delta = jnp.zeros((x.shape[0], x.shape[1]), dtype=x.dtype)
+        memory_gate_value = jnp.zeros((1,), dtype=x.dtype)
+
+        if self.mode == "H0_direct_motion":
+            features = direct_features
+
+        else:
+            # Proyecciones lentas. La memoria rápida no es un parámetro
+            # persistente: se crea y reinicia para cada secuencia.
+            keys = nn.Dense(
+                self.memory_dim,
+                use_bias=False,
+                kernel_init=nn.initializers.xavier_uniform(),
+                name="memory_key",
+            )(direct_features)
+
+            queries = nn.Dense(
+                self.memory_dim,
+                use_bias=False,
+                kernel_init=nn.initializers.xavier_uniform(),
+                name="memory_query",
+            )(direct_features)
+
+            values = nn.Dense(
+                self.memory_dim,
+                use_bias=False,
+                kernel_init=nn.initializers.xavier_uniform(),
+                name="memory_value",
+            )(direct_features)
+
+            keys = keys / (
+                jnp.linalg.norm(keys, axis=-1, keepdims=True) + 1e-6
+            )
+            queries = queries / (
+                jnp.linalg.norm(queries, axis=-1, keepdims=True) + 1e-6
+            )
+
+            eta_logit = self.param(
+                "eta_logit",
+                lambda key, shape: jnp.full(
+                    shape,
+                    jnp.log(
+                        self.initial_eta /
+                        max(1.0 - self.initial_eta, 1e-6)
+                    ),
+                ),
+                (1,),
+            )
+
+            alpha_logit = self.param(
+                "alpha_logit",
+                lambda key, shape: jnp.full(
+                    shape,
+                    jnp.log(
+                        self.initial_alpha /
+                        max(1.0 - self.initial_alpha, 1e-6)
+                    ),
+                ),
+                (1,),
+            )
+
+            memory_gate_logit = self.param(
+                "memory_gate_logit",
+                nn.initializers.zeros,
+                (1,),
+            )
+
+            eta = jax.nn.sigmoid(eta_logit)[0]
+            alpha = jax.nn.sigmoid(alpha_logit)[0]
+            memory_gate_value = jax.nn.sigmoid(memory_gate_logit)
+
+            # [B,T,D] -> [T,B,D] para lax.scan.
+            scan_inputs = (
+                jnp.swapaxes(keys, 0, 1),
+                jnp.swapaxes(queries, 0, 1),
+                jnp.swapaxes(values, 0, 1),
+            )
+
+            batch_size = x.shape[0]
+            initial_memory = jnp.zeros(
+                (
+                    batch_size,
+                    self.memory_dim,
+                    self.memory_dim,
+                ),
+                dtype=x.dtype,
+            )
+
+            def memory_step(
+                memory: jnp.ndarray,
+                inputs: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],
+            ) -> Tuple[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]]:
+                key_t, query_t, value_t = inputs
+
+                # --------------------------------------------------------
+                # READ BEFORE WRITE
+                # --------------------------------------------------------
+                read_t = jnp.einsum(
+                    "bij,bj->bi",
+                    memory,
+                    query_t,
+                )
+
+                # Predicción causada únicamente por la memoria previa.
+                predicted_t = read_t
+
+                # Error asociativo actual.
+                reconstructed_t = jnp.einsum(
+                    "bij,bj->bi",
+                    memory,
+                    key_t,
+                )
+                error_t = reconstructed_t - value_t
+
+                # Delta rule:
+                # M_t = alpha*M_(t-1) - eta*(M*k-v)k^T
+                update = jnp.einsum(
+                    "bi,bj->bij",
+                    error_t,
+                    key_t,
+                )
+
+                new_memory = alpha * memory - eta * update
+
+                delta = jnp.sqrt(
+                    jnp.mean(jnp.square(new_memory - memory), axis=(1, 2))
+                    + 1e-12
+                )
+
+                return new_memory, (predicted_t, delta)
+
+            final_memory, (memory_reads, memory_delta_t) = jax.lax.scan(
+                memory_step,
+                initial_memory,
+                scan_inputs,
+            )
+
+            del final_memory
+
+            # [T,B,D] -> [B,T,D]
+            memory_reads = jnp.swapaxes(memory_reads, 0, 1)
+            memory_delta = jnp.swapaxes(memory_delta_t, 0, 1)
+
+            memory_features = nn.Dense(
+                self.model_dim,
+                kernel_init=nn.initializers.xavier_uniform(),
+                name="memory_readout",
+            )(memory_reads)
+
+            prediction = nn.Dense(
+                self.model_dim,
+                kernel_init=nn.initializers.xavier_uniform(),
+                name="next_motion_predictor",
+            )(memory_reads)
+
+            features = (
+                direct_features
+                + self.memory_residual_scale
+                * memory_gate_value
+                * memory_features
+            )
+            features = nn.LayerNorm(name="memory_fusion_norm")(features)
+
+        features = nn.Dropout(
+            rate=self.dropout,
+            name="feature_dropout",
+        )(features, deterministic=not training)
+
+        pooled = jnp.mean(features, axis=1)
+
+        logits = nn.Dense(
+            self.num_classes,
+            kernel_init=nn.initializers.xavier_uniform(),
+            name="classifier",
+        )(pooled)
+
+        return {
+            "logits": logits,
+            "prediction": prediction,
+            "motion_target": motion,
+            "memory_delta": memory_delta,
+            "motion_gate": motion_gate,
+            "memory_gate": memory_gate_value,
+        }
+
+
+# ============================================================
+# ENTRENAMIENTO
+# ============================================================
+
+class TrainState(train_state.TrainState):
+    pass
+
+
+def make_schedule(total_steps: int) -> optax.Schedule:
+    warmup_steps = max(
+        1,
+        int(total_steps * CFG.warmup_fraction),
+    )
+
+    decay_steps = max(1, total_steps - warmup_steps)
+
+    warmup = optax.linear_schedule(
+        init_value=CFG.learning_rate * 0.05,
+        end_value=CFG.learning_rate,
+        transition_steps=warmup_steps,
+    )
+
+    cosine = optax.cosine_decay_schedule(
+        init_value=CFG.learning_rate,
+        decay_steps=decay_steps,
+        alpha=0.05,
+    )
+
+    return optax.join_schedules(
+        schedules=[warmup, cosine],
+        boundaries=[warmup_steps],
+    )
+
+
+def create_state(
+    rng: jax.Array,
+    model: HOPEModel,
+    total_steps: int,
+) -> TrainState:
+    dummy = jnp.zeros(
+        (
+            2,
+            CFG.frames,
+            CFG.persons * CFG.joints * CFG.coords,
+        ),
+        dtype=jnp.float32,
+    )
+
+    variables = model.init(
+        {"params": rng, "dropout": rng},
+        dummy,
+        training=True,
+    )
+    params = variables["params"]
+
+    schedule = make_schedule(total_steps)
+
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(CFG.grad_clip),
+        optax.adamw(
+            learning_rate=schedule,
+            weight_decay=CFG.weight_decay,
+        ),
+    )
+
+    return TrainState.create(
+        apply_fn=model.apply,
+        params=params,
+        tx=optimizer,
+    )
+
+
+def classification_loss(
+    logits: jnp.ndarray,
+    labels: jnp.ndarray,
+) -> jnp.ndarray:
+    one_hot = jax.nn.one_hot(
+        labels,
+        CFG.num_classes,
+    )
+
+    smooth = (
+        one_hot * (1.0 - CFG.label_smoothing)
+        + CFG.label_smoothing / CFG.num_classes
+    )
+
+    return optax.softmax_cross_entropy(
+        logits,
+        smooth,
+    ).mean()
+
+
+def predictive_loss(
+    prediction: jnp.ndarray,
+    motion_target: jnp.ndarray,
+) -> jnp.ndarray:
+    """
+    prediction[:, t] intenta predecir motion_target[:, t+1].
+
+    El objetivo usa stop_gradient para impedir que el stem reduzca
+    artificialmente la dificultad del objetivo auxiliar.
+    """
+
+    predicted_next = prediction[:, :-1]
+    target_next = jax.lax.stop_gradient(motion_target[:, 1:])
+
+    return jnp.mean(
+        jnp.square(predicted_next - target_next)
+    )
+
+
+def build_steps(model: HOPEModel):
+    @jax.jit
+    def train_step(
+        state: TrainState,
+        batch_x: jnp.ndarray,
+        batch_y: jnp.ndarray,
+        dropout_rng: jax.Array,
+    ):
+        def loss_fn(params):
+            output = model.apply(
+                {"params": params},
+                batch_x,
+                training=True,
+                rngs={"dropout": dropout_rng},
+            )
+
+            ce = classification_loss(
+                output["logits"],
+                batch_y,
+            )
+
+            if model.mode == "H2_predictive_memory":
+                pred = predictive_loss(
+                    output["prediction"],
+                    output["motion_target"],
+                )
+            else:
+                pred = jnp.asarray(0.0, dtype=ce.dtype)
+
+            total = ce + CFG.predictive_loss_weight * pred
+
+            accuracy = jnp.mean(
+                jnp.argmax(output["logits"], axis=-1) == batch_y
+            )
+
+            aux = {
+                "loss": total,
+                "ce": ce,
+                "predictive": pred,
+                "accuracy": accuracy,
+                "memory_delta": jnp.mean(output["memory_delta"]),
+                "motion_gate": jnp.mean(output["motion_gate"]),
+                "memory_gate": jnp.mean(output["memory_gate"]),
+            }
+
+            return total, aux
+
+        (loss, metrics), grads = jax.value_and_grad(
+            loss_fn,
+            has_aux=True,
+        )(state.params)
+
+        new_state = state.apply_gradients(grads=grads)
+
+        grad_norm = optax.global_norm(grads)
+        metrics = dict(metrics)
+        metrics["grad_norm"] = grad_norm
+
+        return new_state, metrics
+
+    @jax.jit
+    def eval_step(
+        params: Any,
+        batch_x: jnp.ndarray,
+        batch_y: jnp.ndarray,
+    ):
+        output = model.apply(
+            {"params": params},
+            batch_x,
+            training=False,
+        )
+
+        ce = classification_loss(
+            output["logits"],
+            batch_y,
+        )
+
+        if model.mode == "H2_predictive_memory":
+            pred = predictive_loss(
+                output["prediction"],
+                output["motion_target"],
+            )
+        else:
+            pred = jnp.asarray(0.0, dtype=ce.dtype)
+
+        total = ce + CFG.predictive_loss_weight * pred
+
+        predictions = jnp.argmax(
+            output["logits"],
+            axis=-1,
+        )
+
+        correct = jnp.sum(predictions == batch_y)
+
+        return {
+            "loss_sum": total * batch_y.shape[0],
+            "ce_sum": ce * batch_y.shape[0],
+            "predictive_sum": pred * batch_y.shape[0],
+            "correct": correct,
+            "count": batch_y.shape[0],
+            "memory_delta_sum": (
+                jnp.mean(output["memory_delta"]) * batch_y.shape[0]
+            ),
+            "motion_gate_sum": (
+                jnp.mean(output["motion_gate"]) * batch_y.shape[0]
+            ),
+            "memory_gate_sum": (
+                jnp.mean(output["memory_gate"]) * batch_y.shape[0]
+            ),
+        }
+
+    return train_step, eval_step
+
+
+def evaluate(
+    state: TrainState,
+    dataset: SkeletonDataset,
+    eval_step,
+) -> Dict[str, float]:
+    totals = {
+        "loss_sum": 0.0,
+        "ce_sum": 0.0,
+        "predictive_sum": 0.0,
+        "correct": 0,
+        "count": 0,
+        "memory_delta_sum": 0.0,
+        "motion_gate_sum": 0.0,
+        "memory_gate_sum": 0.0,
+    }
+
+    for batch_x, batch_y in batch_iterator(
+        dataset,
+        CFG.eval_batch_size,
+        shuffle=False,
+        seed=0,
+        drop_last=False,
+    ):
+        metrics = eval_step(
+            state.params,
+            jnp.asarray(batch_x),
+            jnp.asarray(batch_y),
+        )
+
+        for key in totals:
+            value = np.asarray(metrics[key])
+            totals[key] += float(value)
+
+    count = max(1, int(totals["count"]))
+
+    return {
+        "loss": totals["loss_sum"] / count,
+        "ce": totals["ce_sum"] / count,
+        "predictive": totals["predictive_sum"] / count,
+        "accuracy": totals["correct"] / count,
+        "correct": int(totals["correct"]),
+        "count": count,
+        "memory_delta": totals["memory_delta_sum"] / count,
+        "motion_gate": totals["motion_gate_sum"] / count,
+        "memory_gate": totals["memory_gate_sum"] / count,
+    }
+
+
+def save_checkpoint(
+    path: Path,
+    state: TrainState,
+    metadata: Mapping[str, Any],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    params_path = path.with_suffix(".msgpack")
+    metadata_path = path.with_suffix(".json")
+
+    params_path.write_bytes(
+        serialization.to_bytes(state.params)
+    )
+
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2),
+        encoding="utf-8",
+    )
+
+
+def smoke_test(
+    model: HOPEModel,
+    state: TrainState,
+) -> None:
+    log(f"Smoke test: {model.mode}")
+
+    rng = jax.random.PRNGKey(12345)
+
+    x = jax.random.normal(
+        rng,
+        (
+            4,
+            CFG.frames,
+            CFG.persons * CFG.joints * CFG.coords,
+        ),
+    )
+    y = jnp.asarray([0, 1, 2, 3], dtype=jnp.int32)
+
+    output = model.apply(
+        {"params": state.params},
+        x,
+        training=False,
+    )
+
+    assert output["logits"].shape == (4, CFG.num_classes)
+    assert output["prediction"].shape == (
+        4,
+        CFG.frames,
+        CFG.model_dim,
+    )
+    assert output["memory_delta"].shape == (
+        4,
+        CFG.frames,
+    )
+
+    if not tree_all_finite(output):
+        raise FloatingPointError("Smoke test produjo valores no finitos.")
+
+    # Test de reinicio: ejecutar dos veces debe producir lo mismo.
+    output_2 = model.apply(
+        {"params": state.params},
+        x,
+        training=False,
+    )
+
+    max_repeat_error = float(
+        np.asarray(
+            jnp.max(
+                jnp.abs(
+                    output["logits"] - output_2["logits"]
+                )
+            )
+        )
+    )
+
+    if max_repeat_error > 1e-6:
+        raise AssertionError(
+            f"El estado parece persistir entre secuencias: {max_repeat_error}"
+        )
+
+    # Prueba básica de causalidad de la predicción:
+    # modificar el último frame no debe cambiar predicciones anteriores.
+    x_changed = x.at[:, -1].set(x[:, -1] + 100.0)
+
+    
