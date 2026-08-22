@@ -2,15 +2,16 @@
 """Resolve the exact validated Attention-Lite all-in-one source on Kaggle.
 
 The paper runner intentionally does not reconstruct the successful model from the
-modular repository.  This resolver makes that dependency explicit and friendly:
+modular repository. This resolver makes that dependency explicit and friendly:
 
-* accepts an explicit .py or .ipynb path;
+* accepts an explicit .py, .txt, or .ipynb path;
 * searches Kaggle inputs/working and the current repository;
-* can extract a true all-in-one code cell from a Kaggle notebook input;
+* can extract a true all-in-one code cell from any notebook input;
+* can recover a renamed .py/.txt source by validating golden markers;
 * validates protocol-specific golden markers before returning a source path.
 
 It never converts a partial notebook or an unrelated NestSAR script into a paper
-source.  Failure is explicit and includes the exact filenames that must be attached.
+source. Failure is explicit and includes discovery diagnostics.
 """
 from __future__ import annotations
 
@@ -43,6 +44,10 @@ COMMON_MARKERS = (
     "ATTENTION_HEADS = 4",
 )
 
+TEXT_SUFFIXES = {".py", ".txt"}
+NOTEBOOK_SUFFIXES = {".ipynb"}
+MAX_GENERIC_FILE_BYTES = 12 * 1024 * 1024
+
 
 def _protocol(value: str) -> str:
     p = str(value).strip().lower()
@@ -65,10 +70,19 @@ def validate_canonical_source_text(text: str, protocol: str, *, origin: str = "s
         )
 
 
-def _read_python(path: Path, protocol: str) -> Path:
+def _read_text_source(path: Path, protocol: str, cache_dir: Path) -> Path:
     text = path.read_text(encoding="utf-8", errors="strict")
     validate_canonical_source_text(text, protocol, origin=str(path))
-    return path.resolve()
+
+    if path.suffix.lower() == ".py":
+        return path.resolve()
+
+    # Kaggle inputs are often uploaded as text files. Preserve the exact text while
+    # materializing a Python file under /kaggle/working for execution/provenance.
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    target = cache_dir / CANONICAL_FILENAMES[_protocol(protocol)]
+    target.write_text(text, encoding="utf-8")
+    return target.resolve()
 
 
 def _cell_text(cell: dict) -> str:
@@ -95,8 +109,6 @@ def _extract_notebook(path: Path, protocol: str, cache_dir: Path) -> Optional[Pa
     if not candidates:
         return None
 
-    # A true one-cell source is normally much larger than helper/audit cells.  If a
-    # notebook contains more than one matching cell, keep the most complete candidate.
     text = max(candidates, key=len)
     validate_canonical_source_text(text, protocol, origin=str(path))
 
@@ -119,8 +131,7 @@ def _walk_exact(roots: Iterable[Path], filename: str) -> list[Path]:
                 seen.add(key)
                 found.append(direct)
         try:
-            matches = root.rglob(filename)
-            for path in matches:
+            for path in root.rglob(filename):
                 if not path.is_file():
                     continue
                 key = str(path.resolve())
@@ -132,6 +143,59 @@ def _walk_exact(roots: Iterable[Path], filename: str) -> list[Path]:
     return found
 
 
+def _generic_candidates(roots: Iterable[Path]) -> list[Path]:
+    """Return plausible source containers, regardless of Kaggle-renamed filename."""
+    found: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        if not root.exists():
+            continue
+        try:
+            iterator = root.rglob("*")
+            for path in iterator:
+                if not path.is_file():
+                    continue
+                if path.suffix.lower() not in (TEXT_SUFFIXES | NOTEBOOK_SUFFIXES):
+                    continue
+                try:
+                    if path.stat().st_size > MAX_GENERIC_FILE_BYTES:
+                        continue
+                except OSError:
+                    continue
+                key = str(path.resolve())
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(path)
+        except (OSError, PermissionError):
+            pass
+    return found
+
+
+def _try_generic_candidate(path: Path, protocol: str, cache: Path) -> Optional[Path]:
+    suffix = path.suffix.lower()
+    try:
+        if suffix in TEXT_SUFFIXES:
+            # Fast reject avoids decoding every unrelated text file deeply.
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            markers = _source_markers(protocol)
+            if not all(marker in text for marker in markers):
+                return None
+            validate_canonical_source_text(text, protocol, origin=str(path))
+            if suffix == ".py":
+                return path.resolve()
+            cache.mkdir(parents=True, exist_ok=True)
+            target = cache / CANONICAL_FILENAMES[_protocol(protocol)]
+            target.write_text(text, encoding="utf-8")
+            return target.resolve()
+
+        if suffix in NOTEBOOK_SUFFIXES:
+            return _extract_notebook(path, protocol, cache)
+    except Exception:
+        return None
+    return None
+
+
 def resolve_canonical_source(
     protocol: str,
     explicit: str | Path | None = None,
@@ -141,9 +205,10 @@ def resolve_canonical_source(
 ) -> Path:
     """Return a validated protocol-specific all-in-one Python source.
 
-    ``explicit`` may point to the exact .py file or to a one-cell .ipynb that embeds
-    the exact source.  With ``explicit=None`` the resolver searches common Kaggle
-    locations automatically.
+    ``explicit`` may point to the exact source under any .py/.txt filename or to an
+    .ipynb containing a complete all-in-one code cell. With ``explicit=None`` the
+    resolver searches exact names first, then scans plausible Kaggle text/notebook
+    inputs by golden source markers.
     """
     p = _protocol(protocol)
     cache = Path(cache_dir).expanduser()
@@ -152,16 +217,17 @@ def resolve_canonical_source(
         path = Path(explicit).expanduser()
         if not path.is_file():
             raise FileNotFoundError(f"Explicit canonical source does not exist: {path}")
-        if path.suffix.lower() == ".py":
-            result = _read_python(path, p)
-        elif path.suffix.lower() == ".ipynb":
+        suffix = path.suffix.lower()
+        if suffix in TEXT_SUFFIXES:
+            result = _read_text_source(path, p, cache)
+        elif suffix in NOTEBOOK_SUFFIXES:
             result = _extract_notebook(path, p, cache)
             if result is None:
                 raise RuntimeError(
                     f"Notebook does not contain a complete Attention-Lite {p.upper()} all-in-one cell: {path}"
                 )
         else:
-            raise ValueError("canonical source must be a .py or .ipynb file")
+            raise ValueError("canonical source must be a .py, .txt, or .ipynb file")
         if verbose:
             print(f"ATTENTION-LITE SOURCE {p.upper()}: {result}", flush=True)
         return result
@@ -181,9 +247,11 @@ def resolve_canonical_source(
 
     exact = CANONICAL_FILENAMES[p]
     rejected: list[str] = []
+
+    # 1) Exact canonical filename.
     for candidate in _walk_exact(roots, exact):
         try:
-            result = _read_python(candidate, p)
+            result = _read_text_source(candidate, p, cache)
         except Exception as exc:
             rejected.append(f"{candidate}: {exc}")
             continue
@@ -191,8 +259,7 @@ def resolve_canonical_source(
             print(f"ATTENTION-LITE SOURCE {p.upper()}: {result}", flush=True)
         return result
 
-    # If the exact .py was not attached, try an exact/known notebook input and extract
-    # the self-contained code cell into /kaggle/working.
+    # 2) Known notebook names.
     notebook_names = NOTEBOOK_HINTS[p]
     for notebook_name in notebook_names:
         for candidate in _walk_exact(roots, notebook_name):
@@ -203,17 +270,34 @@ def resolve_canonical_source(
                     print(f"ATTENTION-LITE SOURCE {p.upper()}: {result}", flush=True)
                 return result
 
+    # 3) Kaggle may rename an upload or the user may attach a .txt export. Scan all
+    # plausible text/notebook files and accept ONLY a full source with all markers.
+    generic_scanned = 0
+    for candidate in _generic_candidates(roots):
+        generic_scanned += 1
+        result = _try_generic_candidate(candidate, p, cache)
+        if result is not None:
+            if verbose:
+                print(f"ATTENTION-LITE SOURCE {p.upper()} discovered by markers in: {candidate}", flush=True)
+                print(f"ATTENTION-LITE SOURCE {p.upper()}: {result}", flush=True)
+            return result
+
     lines = [
         f"Validated Attention-Lite {p.upper()} source was not found.",
         "",
-        "Attach ONE of these to the Kaggle notebook as an Input, or pass its path explicitly:",
+        "Attach the exact validated source to the Kaggle notebook as an Input, or pass its path explicitly.",
+        "Accepted containers:",
         f"  - {exact}",
+        "  - any renamed .py/.txt containing the complete validated source",
+        "  - any .ipynb containing the complete validated all-in-one code cell",
     ]
     for name in notebook_names:
         lines.append(f"  - {name}")
     lines += [
         "",
         "Searched under /kaggle/input, /kaggle/working, the current directory, and the repo canonical folder.",
+        f"Generic source containers scanned: {generic_scanned}",
+        "No file containing ALL golden Attention-Lite markers was found.",
         "The runner will not silently substitute another architecture for a paper run.",
     ]
     if rejected:
