@@ -1,0 +1,1136 @@
+e = jax.jit(
+    head_backward
+)
+
+
+# ==========================================================================================
+# 13. BRANCH VJPS
+# ==========================================================================================
+
+def joint_vjp_train(
+    p,
+    joint_xyz,
+    geometry,
+    dropout_rng,
+    cotangent,
+):
+
+    def active_only(
+        pp,
+    ):
+
+        (
+            active,
+            _target,
+
+        ) = joint_train_forward(
+
+            pp,
+
+            joint_xyz,
+            geometry,
+
+            dropout_rng,
+        )
+
+
+        return active
+
+
+    (
+        _,
+        pullback,
+
+    ) = jax.vjp(
+
+        active_only,
+
+        p,
+    )
+
+
+    return pullback(
+        cotangent
+    )[0]
+
+
+def nonjoint_vjp_train(
+    p,
+    nonjoint_xyz,
+    joint_xyz,
+    geometry,
+    dropout_rng,
+    cotangent,
+):
+
+    def active_only(
+        pp,
+    ):
+
+        (
+            active,
+            _target,
+
+        ) = nonjoint_train_forward(
+
+            pp,
+
+            nonjoint_xyz,
+            joint_xyz,
+            geometry,
+
+            dropout_rng,
+        )
+
+
+        return active
+
+
+    (
+        _,
+        pullback,
+
+    ) = jax.vjp(
+
+        active_only,
+
+        p,
+    )
+
+
+    return pullback(
+        cotangent
+    )[0]
+
+
+joint_vjp_exe = jax.jit(
+    joint_vjp_train
+)
+
+
+nonjoint_vjp_exe = jax.jit(
+    nonjoint_vjp_train
+)
+
+
+# ==========================================================================================
+# 14. FAST SPLIT OPTIMIZER EXECUTABLES
+# ==========================================================================================
+
+fast_accum_exe = []
+fast_dmgd_exe = []
+fast_adam_exe = []
+
+
+for i in range(
+    4
+):
+
+    tx_acc = FAST_ACCUM_TX[
+        i
+    ]
+
+
+    tx_dmgd = FAST_DMGD_TX[
+        i
+    ]
+
+
+    tx_adam = FAST_ADAM_TX[
+        i
+    ]
+
+
+    @jax.jit
+    def _acc(
+        grads,
+        state,
+        p,
+        tx=tx_acc,
+    ):
+
+        return tx.update(
+            grads,
+            state,
+            p,
+        )
+
+
+    @jax.jit
+    def _dmgd(
+        grads,
+        state,
+        p,
+        tx=tx_dmgd,
+    ):
+
+        return tx.update(
+            grads,
+            state,
+            p,
+        )
+
+
+    @jax.jit
+    def _adam(
+        grads,
+        state,
+        p,
+        tx=tx_adam,
+    ):
+
+        updates, state2 = tx.update(
+
+            grads,
+            state,
+            p,
+        )
+
+
+        p2 = optax.apply_updates(
+            p,
+            updates,
+        )
+
+
+        return (
+            p2,
+            state2,
+        )
+
+
+    fast_accum_exe.append(
+        _acc
+    )
+
+    fast_dmgd_exe.append(
+        _dmgd
+    )
+
+    fast_adam_exe.append(
+        _adam
+    )
+
+
+@jax.jit
+def fast_clip_exe(
+    grads,
+    state,
+    p,
+):
+
+    return FAST_CLIP_TX.update(
+
+        grads,
+        state,
+        p,
+    )
+
+
+# ==========================================================================================
+# 15. MEDIUM / SLOW / CONSOLIDATE
+# ==========================================================================================
+
+def build_tier_step(
+    tier_name,
+):
+
+    tx = tier_tx[
+        tier_name
+    ]
+
+
+    @jax.jit
+    def step(
+        grads,
+        state,
+        p,
+    ):
+
+        updates, state2 = tx.update(
+
+            grads,
+            state,
+            p,
+        )
+
+
+        p2 = optax.apply_updates(
+
+            p,
+
+            updates,
+        )
+
+
+        return (
+            p2,
+            state2,
+        )
+
+
+    return step
+
+
+medium_step_exe = build_tier_step(
+    "medium"
+)
+
+
+slow_step_exe = build_tier_step(
+    "slow"
+)
+
+
+consolidate_step_exe = build_tier_step(
+    "consolidate"
+)
+
+
+# ==========================================================================================
+# 16. EMA / FINITE / GRAD NORM
+# ==========================================================================================
+
+@jax.jit
+def ema_step(
+    ema,
+    p,
+):
+
+    return jax.tree_util.tree_map(
+
+        lambda e, x:
+
+            reg.EMA_DECAY
+            *
+            e
+
+            +
+
+            (
+                1.0
+                -
+                reg.EMA_DECAY
+            )
+            *
+            x,
+
+        ema,
+        p,
+    )
+
+
+@jax.jit
+def full_finite(
+    tree,
+):
+
+    flags = [
+
+        jnp.all(
+            jnp.isfinite(
+                x
+            )
+        )
+
+        for x
+        in jax.tree_util.tree_leaves(
+            tree
+        )
+    ]
+
+
+    return jnp.all(
+
+        jnp.stack(
+            flags
+        )
+    )
+
+
+@jax.jit
+def gradient_norm(
+    tree,
+):
+
+    return optax.global_norm(
+        tree
+    )
+
+
+# ==========================================================================================
+# 17. EVALUATION — FULL MODEL, EMA, NO MASK
+# ==========================================================================================
+
+@jax.jit
+def eval_forward(
+    p,
+    x,
+):
+
+    o = model.apply(
+
+        {
+            "params":
+                p
+        },
+
+        x,
+
+        training=False,
+    )
+
+
+    return (
+
+        o[
+            "logits"
+        ],
+
+        o[
+            "stream_logits"
+        ],
+
+        o[
+            "fusion_weights"
+        ],
+    )
+
+
+# ==========================================================================================
+# 18. ONE TRAINING GRADIENT
+# ==========================================================================================
+
+def compute_gradient(
+    p,
+    batch_x,
+    batch_y,
+    valid,
+    rng,
+):
+
+    mask_rng, dropout_root = jax.random.split(
+        rng
+    )
+
+
+    joint_rng, nonjoint_rng = jax.random.split(
+        dropout_root
+    )
+
+
+    # RegMask.
+    masked_x = regmask_step(
+
+        batch_x,
+
+        mask_rng,
+    )
+
+
+    # Parameter-free skeleton preprocessing.
+    (
+        joint_xyz,
+        nonjoint_xyz,
+        geometry,
+
+    ) = preprocess_step(
+        masked_x
+    )
+
+
+    p_joint = p[
+        "stream_joint"
+    ]
+
+
+    p_nonjoint = p[
+        "stream_nonjoint_bank"
+    ]
+
+
+    p_fusion = p[
+        "stream_fusion_logits"
+    ]
+
+
+    # Forward branches.
+    (
+        joint_active,
+        joint_target,
+
+    ) = joint_train_exe(
+
+        p_joint,
+
+        joint_xyz,
+        geometry,
+
+        joint_rng,
+    )
+
+
+    (
+        nonjoint_active,
+        nonjoint_target,
+
+    ) = nonjoint_train_exe(
+
+        p_nonjoint,
+
+        nonjoint_xyz,
+        joint_xyz,
+        geometry,
+
+        nonjoint_rng,
+    )
+
+
+    # Head backward.
+    (
+        (
+            loss,
+            aux,
+        ),
+
+        (
+            grad_fusion,
+            cot_joint,
+            cot_nonjoint,
+        ),
+
+    ) = head_backward_exe(
+
+        p_fusion,
+
+        joint_active,
+        nonjoint_active,
+
+        joint_target,
+        nonjoint_target,
+
+        batch_y,
+        valid,
+    )
+
+
+    # Branch backward.
+    grad_joint = joint_vjp_exe(
+
+        p_joint,
+
+        joint_xyz,
+        geometry,
+
+        joint_rng,
+
+        cot_joint,
+    )
+
+
+    grad_nonjoint = nonjoint_vjp_exe(
+
+        p_nonjoint,
+
+        nonjoint_xyz,
+        joint_xyz,
+        geometry,
+
+        nonjoint_rng,
+
+        cot_nonjoint,
+    )
+
+
+    grads = {
+
+        "stream_joint":
+            grad_joint,
+
+        "stream_nonjoint_bank":
+            grad_nonjoint,
+
+        "stream_fusion_logits":
+            grad_fusion,
+    }
+
+
+    if tree_numel(
+        grads
+    ) != EXPECTED_PARAMS:
+
+        raise RuntimeError(
+            "Gradient parameter count mismatch."
+        )
+
+
+    return (
+        loss,
+        aux,
+        grads,
+    )
+
+
+# ==========================================================================================
+# 19. OPTIMIZER MICROSTEP
+# ==========================================================================================
+
+def optimizer_microstep(
+    grads,
+    accepted_before,
+):
+
+    global fast_params
+    global medium_params
+    global slow_params
+    global consolidate_params
+
+    global fast_accum_state
+    global fast_dmgd_state
+    global fast_adam_state
+    global fast_clip_state
+
+    global medium_state
+    global slow_state
+    global consolidate_state
+
+
+    next_accepted = (
+        accepted_before
+        +
+        1
+    )
+
+
+    # --------------------------------------------------------------------------------------
+    # Split gradients.
+    # --------------------------------------------------------------------------------------
+
+    g_fast = extract_tier(
+        grads,
+        "fast",
+    )
+
+
+    g_medium = extract_tier(
+        grads,
+        "medium",
+    )
+
+
+    g_slow = extract_tier(
+        grads,
+        "slow",
+    )
+
+
+    g_consolidate = extract_tier(
+        grads,
+        "consolidate",
+    )
+
+
+    g_fast_fragments = [
+
+        extract_paths(
+
+            g_fast,
+
+            fragment_path_sets[i],
+        )
+
+        for i
+        in range(
+            4
+        )
+    ]
+
+
+    # --------------------------------------------------------------------------------------
+    # FAST accumulation.
+    # --------------------------------------------------------------------------------------
+
+    averaged_fast = []
+
+
+    for i in range(
+        4
+    ):
+
+        (
+            avg,
+            state2,
+
+        ) = fast_accum_exe[i](
+
+            g_fast_fragments[i],
+            fast_accum_state[i],
+            fast_params[i],
+        )
+
+
+        fast_accum_state[
+            i
+        ] = state2
+
+
+        averaged_fast.append(
+            avg
+        )
+
+
+    fast_updated = False
+
+
+    if (
+        next_accepted
+        %
+        4
+        ==
+        0
+    ):
+
+        processed = []
+
+
+        for i in range(
+            4
+        ):
+
+            (
+                pg,
+                state2,
+
+            ) = fast_dmgd_exe[i](
+
+                averaged_fast[i],
+                fast_dmgd_state[i],
+                fast_params[i],
+            )
+
+
+            fast_dmgd_state[
+                i
+            ] = state2
+
+
+            processed.append(
+                pg
+            )
+
+
+        processed_full = merge_fragments(
+            processed
+        )
+
+
+        fast_full = merge_fragments(
+            fast_params
+        )
+
+
+        (
+            clipped_full,
+            _,
+
+        ) = fast_clip_exe(
+
+            processed_full,
+            fast_clip_state,
+            fast_full,
+        )
+
+
+        clipped_fragments = [
+
+            extract_paths(
+
+                clipped_full,
+
+                fragment_path_sets[i],
+            )
+
+            for i
+            in range(
+                4
+            )
+        ]
+
+
+        for i in range(
+            4
+        ):
+
+            (
+                p2,
+                s2,
+
+            ) = fast_adam_exe[i](
+
+                clipped_fragments[i],
+                fast_adam_state[i],
+                fast_params[i],
+            )
+
+
+            fast_params[
+                i
+            ] = p2
+
+
+            fast_adam_state[
+                i
+            ] = s2
+
+
+        fast_updated = True
+
+
+    # --------------------------------------------------------------------------------------
+    # Original MultiSteps optimizers.
+    # --------------------------------------------------------------------------------------
+
+    (
+        medium_params,
+        medium_state,
+
+    ) = medium_step_exe(
+
+        g_medium,
+        medium_state,
+        medium_params,
+    )
+
+
+    (
+        slow_params,
+        slow_state,
+
+    ) = slow_step_exe(
+
+        g_slow,
+        slow_state,
+        slow_params,
+    )
+
+
+    (
+        consolidate_params,
+        consolidate_state,
+
+    ) = consolidate_step_exe(
+
+        g_consolidate,
+        consolidate_state,
+        consolidate_params,
+    )
+
+
+    return {
+
+        "fast":
+            fast_updated,
+
+        "medium":
+            (
+                next_accepted
+                %
+                8
+                ==
+                0
+            ),
+
+        "slow":
+            (
+                next_accepted
+                %
+                16
+                ==
+                0
+            ),
+
+        "consolidate":
+            (
+                next_accepted
+                %
+                32
+                ==
+                0
+            ),
+    }
+
+
+# ==========================================================================================
+# 20. VALIDATION
+# ==========================================================================================
+
+def evaluate_ema(
+    ema,
+    epoch,
+):
+
+    total_loss = 0.0
+
+    total_correct = 0
+    total_count = 0
+
+    stream_correct = np.zeros(
+        (
+            4,
+        ),
+
+        dtype=np.int64,
+    )
+
+
+    last_fusion = None
+
+
+    iterator = ns.batch_iterator(
+
+        val_dataset,
+
+        batch_size=GLOBAL_BATCH,
+
+        shuffle=False,
+
+        seed=SEED,
+
+        drop_last=False,
+    )
+
+
+    pbar = tqdm(
+
+        iterator,
+
+        total=math.ceil(
+            VAL_EXPECTED
+            /
+            GLOBAL_BATCH
+        ),
+
+        desc=
+            f"E{epoch:02d} VAL",
+    )
+
+
+    for x_np, y_np in pbar:
+
+        (
+            x_np,
+            y_np,
+            valid_np,
+            real_n,
+
+        ) = pad_batch32(
+            x_np,
+            y_np,
+        )
+
+
+        (
+            x,
+            y,
+            valid,
+
+        ) = device_batch(
+
+            x_np,
+            y_np,
+            valid_np,
+        )
+
+
+        (
+            logits,
+            stream_logits,
+            fusion_weights,
+
+        ) = eval_forward(
+
+            ema,
+
+            x,
+        )
+
+
+        logits_h = np.asarray(
+            jax.device_get(
+                logits
+            )
+        )
+
+
+        stream_h = np.asarray(
+            jax.device_get(
+                stream_logits
+            )
+        )
+
+
+        fusion_h = np.asarray(
+            jax.device_get(
+                fusion_weights
+            )
+        )
+
+
+        labels_h = y_np[
+            :real_n
+        ]
+
+
+        logits_real = logits_h[
+            :real_n
+        ]
+
+
+        stream_real = stream_h[
+            :real_n
+        ]
+
+
+        # CE without using padded samples.
+        one_hot = np.eye(
+            ns.CFG.num_classes,
+            dtype=np.float32,
+        )[
+            labels_h
+        ]
+
+
+        smooth = (
+
+            one_hot
+            *
+            (
+                1.0
+                -
+                ns.CFG.label_smoothing
+            )
+
+            +
+
+            ns.CFG.label_smoothing
+            /
+            ns.CFG.num_classes
+        )
+
+
+        # numerically stable host CE
+        z = logits_real.astype(
+            np.float64
+        )
+
+
+        z = (
+            z
+            -
+            np.max(
+                z,
+                axis=-1,
+                keepdims=True,
+            )
+        )
+
+
+        log_probs = (
+
+            z
+
+            -
+
+            np.log(
+
+                np.sum(
+
+                    np.exp(
+                        z
+                    ),
+
+                    axis=-1,
+                    keepdims=True,
+                )
+            )
+        )
+
+
+        ce = -np.sum(
+
+            smooth
+            *
+            log_probs,
+
+            axis=-1,
+        )
+
+
+        total_loss += float(
+            np.sum(
+                ce
+            )
+        )
+
+
+        pred = np.argmax(
+
+            logits_real,
+
+            axis=-1,
+        )
+
+
+        total_correct += int(
+
+            np.sum(
+                pred
+                ==
+                labels_h
+            )
+        )
+
+
+        for s in range(
+            4
+        ):
+
+            stream_pred = np.argmax(
+
+                stream_real[
+                    :,
+                    s,
+                    :
+                ],
+
+                axis=-1,
+            )
+
+
+            stream_correct[
+                s
+            ] += int(
+
+                np.sum(
+
+                    stream_pred
+                    ==
+                    labels_h
+                )
+            )
+
+
+        total_count += real_n
+
+
+        last_fusion = fusion_h
+
+
+        pbar.set_postfix(
+
+            acc=
+                f"{100.0 * total_correct / max(1,total_count):.2f}%"
+        )
+
+
+    

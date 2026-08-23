@@ -1,0 +1,337 @@
+ax(1, total_steps - warmup_steps)
+    warmup = optax.linear_schedule(
+        init_value=CFG.learning_rate * 0.05,
+        end_value=CFG.learning_rate,
+        transition_steps=warmup_steps,
+    )
+    cosine = optax.cosine_decay_schedule(
+        init_value=CFG.learning_rate,
+        decay_steps=decay_steps,
+        alpha=0.05,
+    )
+    return optax.join_schedules([warmup, cosine], [warmup_steps])
+
+
+def create_state(rng: jax.Array, model: nn.Module, total_steps: int) -> TrainState:
+    dummy = jnp.zeros(
+        (2, CFG.frames, CFG.persons * CFG.joints * CFG.coords), dtype=jnp.float32
+    )
+    variables = model.init({"params": rng, "dropout": rng}, dummy, training=True)
+    base_optimizer = optax.chain(
+        optax.clip_by_global_norm(CFG.grad_clip),
+        optax.adamw(
+            learning_rate=make_schedule(total_steps),
+            weight_decay=CFG.weight_decay,
+        ),
+    )
+    optimizer = (
+        optax.MultiSteps(
+            base_optimizer,
+            every_k_schedule=CFG.grad_accum_steps,
+            use_grad_mean=True,
+        )
+        if CFG.grad_accum_steps > 1
+        else base_optimizer
+    )
+    return TrainState.create(apply_fn=model.apply, params=variables["params"], tx=optimizer)
+
+
+def classification_loss(logits: jnp.ndarray, labels: jnp.ndarray) -> jnp.ndarray:
+    one_hot = jax.nn.one_hot(labels, CFG.num_classes)
+    smooth = one_hot * (1.0 - CFG.label_smoothing) + CFG.label_smoothing / CFG.num_classes
+    return optax.softmax_cross_entropy(logits, smooth).mean()
+
+
+def predictive_loss(prediction: jnp.ndarray, motion_target: jnp.ndarray) -> jnp.ndarray:
+    return jnp.mean(jnp.square(prediction[:, :-1] - jax.lax.stop_gradient(motion_target[:, 1:])))
+
+
+def build_steps(model: nn.Module, model_id: str):
+    @jax.jit
+    def train_step(state, batch_x, batch_y, dropout_rng):
+        def loss_fn(params):
+            out = model.apply({"params": params}, batch_x, training=True, rngs={"dropout": dropout_rng})
+            ce = classification_loss(out["logits"], batch_y)
+            pred = predictive_loss(out["prediction"], out["motion_target"])
+            total = ce + CFG.predictive_loss_weight * pred
+            metrics = {
+                "loss": total,
+                "ce": ce,
+                "predictive": pred,
+                "accuracy": jnp.mean(jnp.argmax(out["logits"], axis=-1) == batch_y),
+                "memory_delta": jnp.mean(out["memory_delta"]),
+                "motion_gate": jnp.mean(out["motion_gate"]),
+                "memory_gate": jnp.mean(out["memory_gate"]),
+            }
+            return total, metrics
+        (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+        new_state = state.apply_gradients(grads=grads)
+        metrics = dict(metrics)
+        metrics["grad_norm"] = optax.global_norm(grads)
+        return new_state, metrics
+
+    @jax.jit
+    def eval_step(params, batch_x, batch_y):
+        out = model.apply({"params": params}, batch_x, training=False)
+        ce = classification_loss(out["logits"], batch_y)
+        pred = predictive_loss(out["prediction"], out["motion_target"])
+        total = ce + CFG.predictive_loss_weight * pred
+        predictions = jnp.argmax(out["logits"], axis=-1)
+        count = batch_y.shape[0]
+        return {
+            "loss_sum": total * count,
+            "ce_sum": ce * count,
+            "predictive_sum": pred * count,
+            "correct": jnp.sum(predictions == batch_y),
+            "count": count,
+            "memory_delta_sum": jnp.mean(out["memory_delta"]) * count,
+            "motion_gate_sum": jnp.mean(out["motion_gate"]) * count,
+            "memory_gate_sum": jnp.mean(out["memory_gate"]) * count,
+        }
+    return train_step, eval_step
+
+
+def evaluate(state, dataset, eval_step, progress_desc=None) -> Dict[str, float]:
+    del progress_desc
+    totals = {k: 0.0 for k in (
+        "loss_sum", "ce_sum", "predictive_sum", "correct", "count",
+        "memory_delta_sum", "motion_gate_sum", "memory_gate_sum"
+    )}
+    for batch_x, batch_y in batch_iterator(dataset, CFG.eval_batch_size, False, 0, False):
+        metrics = eval_step(state.params, jnp.asarray(batch_x), jnp.asarray(batch_y))
+        for key in totals:
+            totals[key] += float(np.asarray(metrics[key]))
+    count = max(1, int(totals["count"]))
+    return {
+        "loss": totals["loss_sum"] / count,
+        "ce": totals["ce_sum"] / count,
+        "predictive": totals["predictive_sum"] / count,
+        "accuracy": totals["correct"] / count,
+        "correct": int(totals["correct"]),
+        "count": count,
+        "memory_delta": totals["memory_delta_sum"] / count,
+        "motion_gate": totals["motion_gate_sum"] / count,
+        "memory_gate": totals["memory_gate_sum"] / count,
+    }
+
+
+def smoke_test(model, state, train_step=None) -> None:
+    rng = jax.random.PRNGKey(12345)
+    x = jax.random.normal(rng, (4, CFG.frames, CFG.persons*CFG.joints*CFG.coords))
+    out = model.apply({"params": state.params}, x, training=False)
+    if not tree_all_finite(out):
+        raise FloatingPointError("Smoke test produjo valores no finitos")
+
+
+def save_full_checkpoint(prefix: Path, state: TrainState, rng: jax.Array, metadata: Mapping[str, Any]) -> None:
+    prefix = Path(prefix)
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"params": state.params, "opt_state": state.opt_state, "step": state.step, "rng": rng}
+    prefix.with_suffix(".msgpack").write_bytes(serialization.to_bytes(payload))
+    prefix.with_suffix(".json").write_text(json.dumps(dict(metadata), indent=2), encoding="utf-8")
+
+
+def restore_full_checkpoint(prefix: Path, state: TrainState, rng: jax.Array):
+    prefix = Path(prefix)
+    template = {"params": state.params, "opt_state": state.opt_state, "step": state.step, "rng": rng}
+    restored = serialization.from_bytes(template, prefix.with_suffix(".msgpack").read_bytes())
+    state = state.replace(params=restored["params"], opt_state=restored["opt_state"], step=restored["step"])
+    metadata = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))
+    return state, restored["rng"], metadata
+
+
+def config_hash(model_id: str, dataset_path: Path) -> str:
+    payload = {
+        "model": model_id,
+        "dataset_name": dataset_path.name,
+        "dataset_size": dataset_path.stat().st_size,
+        "config": dataclasses.asdict(CFG),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def run_experiment(protocol: str, model_id: str, dataset_path: Path, output_dir: Path,
+                   config_hash_value: str, resume: str = "auto", force_rerun: bool = False) -> Dict[str, Any]:
+    seed_everything(CFG.seed)
+    output_dir = Path(output_dir)
+    if force_rerun and output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    log("=" * 76)
+    log(f"PROTOCOLO={protocol.upper()} | MODELO={MODEL_ALIASES.get(model_id, model_id)} | HASH={config_hash_value}")
+    log("=" * 76)
+    log(f"JAX={jax.__version__} | backend={jax.default_backend()}")
+    log(f"Devices visibles al worker: {jax.devices()}")
+    if jax.default_backend() != "gpu":
+        raise RuntimeError("JAX no está usando GPU. Activa GPU en Kaggle.")
+
+    raw_data = load_pickle(dataset_path)
+    train_samples, val_samples = build_samples(
+        raw_data, protocol=protocol, max_train=CFG.max_train_samples,
+        max_val=CFG.max_val_samples, seed=CFG.seed
+    )
+    train_dataset = SkeletonDataset(train_samples)
+    val_dataset = SkeletonDataset(val_samples)
+
+    steps_per_epoch = max(1, math.ceil(len(train_dataset) / CFG.batch_size))
+    total_micro_steps = CFG.epochs * steps_per_epoch
+    total_steps = max(1, math.ceil(total_micro_steps / max(1, CFG.grad_accum_steps)))
+    updates_per_epoch = steps_per_epoch / max(1, CFG.grad_accum_steps)
+
+    model = build_model(model_id)
+    rng = jax.random.PRNGKey(CFG.seed)
+    state = create_state(rng, model, total_steps)
+    parameter_count = count_parameters(state.params)
+    log(f"Parámetros: {parameter_count:,}")
+    log(
+        f"Batch físico={CFG.batch_size} | acumulación={CFG.grad_accum_steps} | "
+        f"batch efectivo≈{CFG.batch_size*CFG.grad_accum_steps} | updates/época≈{updates_per_epoch:.2f}"
+    )
+    if model_id == "nestsar_m4_sasm_l3fix_hope_fullselfref_v3" and parameter_count != 2_033_988:
+        raise RuntimeError(f"Parameter count mismatch: {parameter_count:,} != 2,033,988")
+
+    train_step, eval_step = build_steps(model, model_id)
+    log("Preflight local ya validado; smoke redundante OMITIDO en esta corrida Kaggle.")
+
+    mode = MODEL_ALIASES.get(model_id, model_id)
+    last_prefix = output_dir / f"{protocol}_{mode}_checkpoint_last"
+    best_prefix = output_dir / f"{protocol}_{mode}_checkpoint_best"
+    history_path = output_dir / f"{protocol}_{mode}_history.json"
+    result_path = output_dir / f"{protocol}_{mode}_result.json"
+
+    start_epoch = 1
+    best_accuracy = -1.0
+    best_correct = -1
+    best_epoch = 0
+    best_loss = float("inf")
+    epochs_without_improvement = 0
+    history: List[Dict[str, Any]] = []
+
+    if resume == "auto" and last_prefix.with_suffix(".msgpack").is_file():
+        state, rng, metadata = restore_full_checkpoint(last_prefix, state, rng)
+        if metadata.get("config_hash") != config_hash_value:
+            raise RuntimeError("Checkpoint/config mismatch; use FORCE_FRESH=True to restart.")
+        start_epoch = int(metadata["epoch"]) + 1
+        best_accuracy = float(metadata["best_accuracy"])
+        best_correct = int(metadata["best_correct"])
+        best_epoch = int(metadata["best_epoch"])
+        best_loss = float(metadata["best_loss"])
+        epochs_without_improvement = int(metadata["epochs_without_improvement"])
+        if history_path.is_file():
+            history = json.loads(history_path.read_text(encoding="utf-8"))
+        log(f"Reanudación exacta desde época {start_epoch-1}; siguiente={start_epoch}; step={int(np.asarray(state.step))}")
+
+    run_start = time.time()
+    for epoch in range(start_epoch, CFG.epochs + 1):
+        epoch_start = time.time()
+        train_totals = {k: 0.0 for k in (
+            "loss", "ce", "predictive", "accuracy", "memory_delta", "motion_gate", "memory_gate", "grad_norm"
+        )}
+        batch_count = 0
+
+        for batch_index, (batch_x, batch_y) in enumerate(
+            batch_iterator(train_dataset, CFG.batch_size, True, CFG.seed + epoch, False), start=1
+        ):
+            rng, dropout_rng = jax.random.split(rng)
+            state, metrics = train_step(state, jnp.asarray(batch_x), jnp.asarray(batch_y), dropout_rng)
+            host = {k: float(np.asarray(v)) for k, v in metrics.items()}
+            for key in train_totals:
+                if key in host:
+                    train_totals[key] += host[key]
+            batch_count += 1
+            if batch_index % CFG.log_every_batches == 0:
+                elapsed = time.time() - epoch_start
+                rate = batch_index / max(elapsed, 1e-6)
+                eta_s = (steps_per_epoch - batch_index) / max(rate, 1e-6)
+                log(f"E{epoch:03d} batch {batch_index}/{steps_per_epoch} loss={host['loss']:.4f} acc={100*host['accuracy']:.2f}% mem={host['memory_delta']:.4f} ETA={eta_s:.0f}s")
+
+        train_mean = {k: v/max(batch_count,1) for k,v in train_totals.items()}
+        val_metrics = evaluate(state, val_dataset, eval_step)
+        epoch_seconds = time.time() - epoch_start
+
+        improved = (
+            val_metrics["correct"] > best_correct or
+            (val_metrics["correct"] == best_correct and val_metrics["loss"] < best_loss)
+        )
+        if improved:
+            best_accuracy = val_metrics["accuracy"]
+            best_correct = val_metrics["correct"]
+            best_epoch = epoch
+            best_loss = val_metrics["loss"]
+            epochs_without_improvement = 0
+            save_full_checkpoint(best_prefix, state, rng, {
+                "config_hash": config_hash_value, "protocol": protocol, "mode": mode,
+                "epoch": epoch, "best_epoch": best_epoch, "best_accuracy": best_accuracy,
+                "best_correct": best_correct, "best_loss": best_loss,
+                "epochs_without_improvement": epochs_without_improvement,
+                "validation_count": val_metrics["count"], "parameters": parameter_count,
+                "config": dataclasses.asdict(CFG),
+            })
+        else:
+            epochs_without_improvement += 1
+
+        record = {"epoch": epoch, "train": train_mean, "validation": val_metrics, "epoch_seconds": epoch_seconds}
+        history.append(record)
+        history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+        save_full_checkpoint(last_prefix, state, rng, {
+            "config_hash": config_hash_value, "protocol": protocol, "mode": mode,
+            "epoch": epoch, "best_epoch": best_epoch, "best_accuracy": best_accuracy,
+            "best_correct": best_correct, "best_loss": best_loss,
+            "epochs_without_improvement": epochs_without_improvement,
+            "validation_count": val_metrics["count"], "parameters": parameter_count,
+            "config": dataclasses.asdict(CFG),
+        })
+
+        lr_step = int(np.asarray(state.step)) // max(1, CFG.grad_accum_steps)
+        lr = float(np.asarray(make_schedule(total_steps)(lr_step)))
+        print(
+            f"E{epoch:03d} {protocol.upper()} | train loss={train_mean['loss']:.4f} "
+            f"acc={100*train_mean['accuracy']:.2f}% mem={train_mean['memory_delta']:.4f} "
+            f"pred={train_mean['predictive']:.4f} | val loss={val_metrics['loss']:.4f} "
+            f"acc={100*val_metrics['accuracy']:.2f}% | best={100*best_accuracy:.2f}% | "
+            f"lr={lr:.2e} | {epoch_seconds:.1f}s",
+            flush=True,
+        )
+        if epochs_without_improvement >= CFG.patience:
+            log(f"Early stopping: {CFG.patience} épocas sin mejora.")
+            break
+
+    total_seconds = time.time() - run_start
+    if best_prefix.with_suffix(".msgpack").is_file():
+        best_state, _, _ = restore_full_checkpoint(best_prefix, state, rng)
+    else:
+        best_state = state
+    best_metrics = evaluate(best_state, val_dataset, eval_step)
+    result = {
+        "protocol": protocol, "model": model_id, "mode": mode,
+        "best_epoch": best_epoch, "best_accuracy": best_metrics["accuracy"],
+        "best_correct": best_metrics["correct"], "validation_count": best_metrics["count"],
+        "best_loss": best_metrics["loss"], "best_ce": best_metrics["ce"],
+        "best_predictive": best_metrics["predictive"], "memory_delta": best_metrics["memory_delta"],
+        "motion_gate": best_metrics["motion_gate"], "memory_gate": best_metrics["memory_gate"],
+        "parameters": parameter_count, "runtime_seconds": total_seconds,
+        "config_hash": config_hash_value, "config": dataclasses.asdict(CFG),
+    }
+    result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    print("FINAL_JSON=" + json.dumps(result), flush=True)
+    return result
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Offline Kaggle NestSAR-HOPE v3 trainer")
+    p.add_argument("--model", required=True)
+    p.add_argument("--protocol", choices=("xsub","xset"), default="xsub")
+    p.add_argument("--dataset", default="auto")
+    p.add_argument("--output-dir", default="runs_hope")
+    p.add_argument("--seed", type=int, default=128)
+    p.add_argument("--frames", type=int, default=64)
+    p.add_argument("--num-classes", type=int, default=120)
+    p.add_argument("--model-dim", type=int, default=128)
+    p.add_argument("--memory-dim", type=int, default=64)
+    p.add_argument("--dropout", type=float, default=0.22)
+    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--grad-accum-steps", type=int, default=8)
+    p.add_argument("--eval-batch-size", type=int, default=32)
+    p.add_argument("--epochs", type=int, default

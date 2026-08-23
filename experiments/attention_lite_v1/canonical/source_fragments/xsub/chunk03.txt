@@ -1,0 +1,749 @@
+ontroller_blocks,
+    chunk_size=ns.CFG.chunk_size,
+    clip_size=ns.CFG.clip_size,
+    controller_rank=ns.CFG.controller_rank,
+    use_part_attention=False,
+)
+
+def preprocess_v2(x):
+    streams = m4.build_four_streams(x)
+    joint_xyz = streams["joint"]
+    nonjoint_xyz = jnp.stack(
+        (streams["bone"], streams["joint_motion"], streams["bone_motion"]),
+        axis=0,
+    )
+    geometry = m4.geometric_features(joint_xyz)
+    return joint_xyz, nonjoint_xyz, geometry
+
+# Exact branch-size guard from the successful audit.
+assert sum(x.size for x in jax.tree_util.tree_leaves(params["stream_joint"])) == 595_256
+assert sum(x.size for x in jax.tree_util.tree_leaves(params["stream_nonjoint_bank"])) == 1_785_768
+assert params["stream_fusion_logits"].size == 4
+
+# ==========================================================================================
+# EXACT OPTIMIZER TIER RULES
+# ==========================================================================================
+
+CMS_P1, CMS_P2, CMS_P3, CMS_P4 = 1, 2, 4, 8
+PERIODS = {
+    "fast": CMS_P1,
+    "medium": CMS_P2,
+    "slow": CMS_P3,
+    "consolidate": CMS_P4,
+}
+
+DMGD_MOMENTUM = 0.90
+DMGD_MEMORY_LR = 0.01
+DMGD_MIX = 0.10
+DMGD_PROJECTION_CAP = 2.0
+DMGD_EPS = 1e-6
+GRAD_ACCUM = 4
+
+def path_to_tier(path_tuple):
+    text = "/".join(str(x) for x in path_tuple).lower()
+    if "cms_f8" in text:
+        return "consolidate"
+    if "cms_f4" in text:
+        return "slow"
+    if "cms_f2" in text:
+        return "medium"
+    if "cms_f1" in text:
+        return "fast"
+    if "l4_slow_controller" in text:
+        return "consolidate"
+    if "l3_clip_memory" in text:
+        return "slow"
+    if "l2_chunk_memory" in text:
+        return "medium"
+    if "l1_frame_memory" in text:
+        return "fast"
+    return "fast"
+
+def extract_tier(tree, wanted_tier):
+    flat = traverse_util.flatten_dict(tree)
+    selected = {
+        path: value
+        for path, value in flat.items()
+        if path_to_tier(path) == wanted_tier
+    }
+    return traverse_util.unflatten_dict(selected)
+
+class DMGDL2DiagState(NamedTuple):
+    momentum: Any
+    projection: Any
+    count: jax.Array
+
+def dmgd_l2_diag():
+    def init_fn(p):
+        zeros = jax.tree_util.tree_map(jnp.zeros_like, p)
+        return DMGDL2DiagState(
+            momentum=zeros,
+            projection=zeros,
+            count=jnp.asarray(0, dtype=jnp.int32),
+        )
+
+    def update_fn(updates, state, params=None):
+        del params
+        new_momentum = jax.tree_util.tree_map(
+            lambda m, g: DMGD_MOMENTUM * m + (1.0 - DMGD_MOMENTUM) * g,
+            state.momentum,
+            updates,
+        )
+        prediction = jax.tree_util.tree_map(
+            lambda p, g: jnp.tanh(p) * g,
+            state.projection,
+            updates,
+        )
+        new_projection = jax.tree_util.tree_map(
+            lambda p, g, pred, target: jnp.clip(
+                p
+                - DMGD_MEMORY_LR
+                * (pred - jax.lax.stop_gradient(target))
+                * g
+                / (jnp.square(g) + DMGD_EPS),
+                -DMGD_PROJECTION_CAP,
+                DMGD_PROJECTION_CAP,
+            ),
+            state.projection,
+            updates,
+            prediction,
+            new_momentum,
+        )
+        processed = jax.tree_util.tree_map(
+            lambda g, pred: g + DMGD_MIX * pred,
+            updates,
+            prediction,
+        )
+        return processed, DMGDL2DiagState(
+            momentum=new_momentum,
+            projection=new_projection,
+            count=state.count + jnp.asarray(1, dtype=jnp.int32),
+        )
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+def scaled_schedule(total_steps, period):
+    base = ns.make_schedule(total_steps)
+    max_index = max(0, int(total_steps) - 1)
+    def schedule(local_count):
+        global_like = jnp.minimum(local_count * period, max_index)
+        return base(global_like)
+    return schedule
+
+# ==========================================================================================
+# EXACT FAST 4-FRAGMENT MAP — GENERATED FROM THE ACTUAL PARAMETER TREE
+# ==========================================================================================
+
+FAST_PARAMS_FOR_MAP = extract_tier(params, "fast")
+MEDIUM_PARAMS_FOR_MAP = extract_tier(params, "medium")
+SLOW_PARAMS_FOR_MAP = extract_tier(params, "slow")
+CONSOLIDATE_PARAMS_FOR_MAP = extract_tier(params, "consolidate")
+
+def _tree_numel_local(tree):
+    return int(sum(x.size for x in jax.tree_util.tree_leaves(tree)))
+
+def _tree_leaves_local(tree):
+    return len(jax.tree_util.tree_leaves(tree))
+
+assert _tree_numel_local(FAST_PARAMS_FOR_MAP) == 1_133_124
+assert _tree_numel_local(MEDIUM_PARAMS_FOR_MAP) == 485_184
+assert _tree_numel_local(SLOW_PARAMS_FOR_MAP) == 485_184
+assert _tree_numel_local(CONSOLIDATE_PARAMS_FOR_MAP) == 277_536
+assert _tree_leaves_local(FAST_PARAMS_FOR_MAP) == 265
+
+flat_fast_params = traverse_util.flatten_dict(FAST_PARAMS_FOR_MAP)
+
+NUM_FAST_FRAGMENTS = 4
+FRAGMENT_CAPACITIES = [67, 66, 66, 66]
+
+items = sorted(
+    flat_fast_params.items(),
+    key=lambda kv: int(kv[1].size),
+    reverse=True,
+)
+
+fragment_paths = [[] for _ in range(NUM_FAST_FRAGMENTS)]
+fragment_param_load = [0 for _ in range(NUM_FAST_FRAGMENTS)]
+
+for path, value in items:
+    available = [
+        i for i in range(NUM_FAST_FRAGMENTS)
+        if len(fragment_paths[i]) < FRAGMENT_CAPACITIES[i]
+    ]
+    if not available:
+        raise RuntimeError("FAST fragment allocation exhausted unexpectedly.")
+    dst = min(
+        available,
+        key=lambda i: (fragment_param_load[i], len(fragment_paths[i]), i),
+    )
+    fragment_paths[dst].append(path)
+    fragment_param_load[dst] += int(value.size)
+
+fragment_path_sets = [set(paths) for paths in fragment_paths]
+
+assigned = set()
+for paths in fragment_path_sets:
+    if assigned & paths:
+        raise RuntimeError("FAST fragment overlap detected.")
+    assigned |= paths
+
+if assigned != set(flat_fast_params.keys()):
+    raise RuntimeError("FAST fragmentation incomplete.")
+
+assert sum(fragment_param_load) == 1_133_124
+assert sum(len(x) for x in fragment_paths) == 265
+
+def extract_paths(tree, wanted_paths):
+    flat = traverse_util.flatten_dict(tree)
+    selected = {
+        path: value
+        for path, value in flat.items()
+        if path in wanted_paths
+    }
+    return traverse_util.unflatten_dict(selected)
+
+def merge_fragments(fragments):
+    merged = {}
+    for frag in fragments:
+        flat = traverse_util.flatten_dict(frag)
+        for path, value in flat.items():
+            if path in merged:
+                raise RuntimeError(f"Duplicate merged FAST path: {path}")
+            merged[path] = value
+    if set(merged.keys()) != set(flat_fast_params.keys()):
+        raise RuntimeError("Merged FAST fragments do not reconstruct the original FAST tree.")
+    return traverse_util.unflatten_dict(merged)
+
+# Raw accumulation + DMGD + shared clipping are schedule-independent.
+FAST_ACCUM_TX = [
+    optax.MultiSteps(
+        optax.identity(),
+        every_k_schedule=4,
+        use_grad_mean=True,
+    )
+    for _ in range(NUM_FAST_FRAGMENTS)
+]
+
+FAST_DMGD_TX = [
+    dmgd_l2_diag()
+    for _ in range(NUM_FAST_FRAGMENTS)
+]
+
+FAST_CLIP_TX = optax.clip_by_global_norm(ns.CFG.grad_clip)
+
+# FAST_ADAM_TX and tier_tx are deliberately rebuilt at the top of the E40 trainer
+# with TOTAL_STEPS=19,700. Define placeholders only so the namespace is complete.
+FAST_ADAM_TX = []
+tier_tx = {}
+
+print()
+print("=" * 132)
+print("ATTENTION-LITE BOOTSTRAP AUDIT")
+print("=" * 132)
+print("Parameters:        ", f"{PARAMS:,}")
+print("Leaves:            ", LEAVES)
+print("FAST params:       ", f"{_tree_numel_local(FAST_PARAMS_FOR_MAP):,}")
+print("MEDIUM params:     ", f"{_tree_numel_local(MEDIUM_PARAMS_FOR_MAP):,}")
+print("SLOW params:       ", f"{_tree_numel_local(SLOW_PARAMS_FOR_MAP):,}")
+print("CONSOLIDATE params:", f"{_tree_numel_local(CONSOLIDATE_PARAMS_FOR_MAP):,}")
+for i in range(NUM_FAST_FRAGMENTS):
+    print(f"FAST frag{i}: params={fragment_param_load[i]:,} leaves={len(fragment_paths[i])}")
+print("=" * 132)
+
+
+# ==========================================================================================
+# NESTSAR-HOPE-ATTENTION-LITE D128
+#
+# REAL NTU120 XSUB — 40 EPOCH FULL RUN
+#
+# FROM TRUE SCRATCH
+#
+# Model:
+#   frames             = 16
+#   Dmodel             = 128
+#   attention dim      = 64
+#   heads              = 4
+#   head dim           = 16
+#   parameters         = 2,381,028
+#   leaves             = 705
+#
+# Training:
+#   official XSUB      = 63,026 train / 50,919 val
+#   TPU                = v5e-8
+#   global batch       = 32
+#   local batch        = 4
+#   grad accumulation  = 4
+#   effective batch    = 128
+#
+# Optimizer:
+#   FAST               = 4 microbatches
+#   MEDIUM             = 8
+#   SLOW               = 16
+#   CONSOLIDATE        = 32
+#   DMGD-L2
+#   AdamW
+#
+# Regularization:
+#   RegMask            = 8% frame / 8% joint / 3% part
+#   EMA                = 0.995
+#
+# Validation:
+#   EMA weights
+#   no RegMask
+#   training=False
+#
+# IMPORTANT:
+#   This cell assumes all previous Attention-Lite audit/smoke cells remain
+#   alive in THIS SAME kernel.
+# ==========================================================================================
+
+from pathlib import Path
+from functools import partial
+import json
+import math
+import pickle
+import time
+import dataclasses
+
+import numpy as np
+
+import jax
+import jax.numpy as jnp
+import optax
+
+from flax import serialization
+from flax import traverse_util
+
+from jax.sharding import (
+    Mesh,
+    NamedSharding,
+    PartitionSpec as P,
+)
+
+from tqdm.auto import tqdm
+
+
+# ==========================================================================================
+# 0. LOCKED EXPERIMENT
+# ==========================================================================================
+
+SEED = 128
+
+EPOCHS = 40
+
+GLOBAL_BATCH = 32
+GRAD_ACCUM = 4
+EFFECTIVE_BATCH = 128
+
+EXPECTED_PARAMS = 2_381_028
+EXPECTED_LEAVES = 705
+
+TRAIN_EXPECTED = 63_026
+VAL_EXPECTED = 50_919
+
+MICROSTEPS_PER_EPOCH = math.ceil(
+    TRAIN_EXPECTED
+    /
+    GLOBAL_BATCH
+)
+
+TOTAL_MICROSTEPS = (
+    MICROSTEPS_PER_EPOCH
+    *
+    EPOCHS
+)
+
+# Same schedule convention as Fidelity production probe.
+TOTAL_STEPS = math.ceil(
+    TOTAL_MICROSTEPS
+    /
+    GRAD_ACCUM
+)
+
+assert MICROSTEPS_PER_EPOCH == 1970
+assert TOTAL_MICROSTEPS == 78_800
+assert TOTAL_STEPS == 19_700
+
+
+# ==========================================================================================
+# IMPORTANT: REBUILD OPTIMIZERS FOR THE 40-EPOCH LR HORIZON
+#
+# The audit cells originally built FAST_ADAM_TX and tier_tx with TOTAL_STEPS=1478
+# for the 3-epoch probe. Rebuild them here BEFORE optimizer-state initialization so
+# the real E1->E40 run uses the correct 19,700-step schedule.
+# ==========================================================================================
+
+FAST_ADAM_TX = [
+    optax.adamw(
+        learning_rate=scaled_schedule(
+            TOTAL_STEPS,
+            1,
+        ),
+        weight_decay=ns.CFG.weight_decay,
+    )
+    for _ in range(NUM_FAST_FRAGMENTS)
+]
+
+tier_tx = {}
+
+for tier, period in PERIODS.items():
+    inner = optax.chain(
+        dmgd_l2_diag(),
+        optax.clip_by_global_norm(
+            ns.CFG.grad_clip
+        ),
+        optax.adamw(
+            learning_rate=scaled_schedule(
+                TOTAL_STEPS,
+                period,
+            ),
+            weight_decay=ns.CFG.weight_decay,
+        ),
+    )
+
+    tier_tx[tier] = optax.MultiSteps(
+        inner,
+        every_k_schedule=max(
+            1,
+            GRAD_ACCUM * period,
+        ),
+        use_grad_mean=True,
+    )
+
+print(
+    f"40-epoch optimizer schedules rebuilt: TOTAL_STEPS={TOTAL_STEPS:,}"
+)
+
+
+OUT = Path(
+    "/kaggle/working/"
+    "NestSAR_HOPE_ATTENTION_LITE_D128_XSUB_E40"
+)
+
+OUT.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+
+DATASET_CANDIDATES = [
+
+    Path(
+        "/kaggle/input/models/"
+        "paolamaydana/ntudanno/"
+        "other/default/1/"
+        "ntu120_3danno.pkl"
+    ),
+]
+
+
+if Path(
+    "/kaggle/input"
+).exists():
+
+    DATASET_CANDIDATES += list(
+
+        Path(
+            "/kaggle/input"
+        ).rglob(
+            "ntu120_3danno.pkl"
+        )
+    )
+
+
+DATASET = next(
+
+    (
+        p
+        for p
+        in DATASET_CANDIDATES
+        if p.is_file()
+    ),
+
+    None,
+)
+
+
+if DATASET is None:
+
+    raise FileNotFoundError(
+        "ntu120_3danno.pkl was not found."
+    )
+
+
+# ==========================================================================================
+# 1. REQUIRED OBJECTS FROM ATTENTION-LITE AUDITS
+# ==========================================================================================
+
+REQUIRED = [
+
+    "model",
+
+    "HopeAttentionLiteBlock",
+
+    "joint_module",
+    "nonjoint_module",
+
+    "m4",
+    "ns",
+    "reg",
+
+    "path_to_tier",
+    "extract_tier",
+
+    "fragment_path_sets",
+
+    "extract_paths",
+    "merge_fragments",
+
+    "FAST_ACCUM_TX",
+    "FAST_DMGD_TX",
+    "FAST_ADAM_TX",
+    "FAST_CLIP_TX",
+
+    "tier_tx",
+
+    "preprocess_v2",
+]
+
+
+missing = [
+
+    name
+    for name in REQUIRED
+    if name not in globals()
+]
+
+
+if missing:
+
+    raise RuntimeError(
+
+        "Required production objects are missing.\n"
+        "Do NOT continue with a partial runtime.\n\n"
+        "Missing:\n  - "
+
+        +
+
+        "\n  - ".join(
+            missing
+        )
+    )
+
+
+# ==========================================================================================
+# 2. CONFIG GUARDS
+# ==========================================================================================
+
+assert ns.CFG.frames == 16
+assert ns.CFG.model_dim == 128
+assert ns.CFG.memory_dim == 64
+assert ns.CFG.controller_rank == 32
+
+assert ns.CFG.batch_size == 32
+assert ns.CFG.grad_accum_steps == 4
+
+assert abs(
+    ns.CFG.dropout
+    -
+    0.22
+) < 1e-12
+
+assert abs(
+    ns.CFG.learning_rate
+    -
+    1.0e-3
+) < 1e-12
+
+assert abs(
+    ns.CFG.weight_decay
+    -
+    0.05
+) < 1e-12
+
+assert abs(
+    ns.CFG.label_smoothing
+    -
+    0.05
+) < 1e-12
+
+assert abs(
+    ns.CFG.predictive_loss_weight
+    -
+    0.10
+) < 1e-12
+
+assert abs(
+    reg.EMA_DECAY
+    -
+    0.995
+) < 1e-12
+
+assert abs(
+    reg.FRAME_MASK_PROB
+    -
+    0.08
+) < 1e-12
+
+assert abs(
+    reg.JOINT_MASK_PROB
+    -
+    0.08
+) < 1e-12
+
+assert abs(
+    reg.PART_MASK_PROB
+    -
+    0.03
+) < 1e-12
+
+
+print("=" * 132)
+print(
+    "NESTSAR-HOPE-ATTENTION-LITE — "
+    "REAL NTU120 XSUB 40-EPOCH FULL RUN"
+)
+print("=" * 132)
+
+print(
+    "JAX:               ",
+    jax.__version__
+)
+
+print(
+    "Backend:           ",
+    jax.default_backend()
+)
+
+print(
+    "Devices:           ",
+    len(
+        jax.devices()
+    )
+)
+
+print(
+    "Dataset:           ",
+    DATASET
+)
+
+print(
+    "Output:            ",
+    OUT
+)
+
+print()
+
+print(
+    "Global batch:      ",
+    GLOBAL_BATCH
+)
+
+print(
+    "Grad accumulation: ",
+    GRAD_ACCUM
+)
+
+print(
+    "Effective batch:   ",
+    EFFECTIVE_BATCH
+)
+
+print(
+    "Microsteps/epoch:  ",
+    MICROSTEPS_PER_EPOCH
+)
+
+print(
+    "Total microsteps:  ",
+    TOTAL_MICROSTEPS
+)
+
+print(
+    "Schedule steps:    ",
+    TOTAL_STEPS
+)
+
+
+# ==========================================================================================
+# 3. TPU8 MESH
+# ==========================================================================================
+
+DEVICES = list(
+    jax.devices()
+)
+
+
+if (
+    jax.default_backend()
+    !=
+    "tpu"
+):
+
+    raise RuntimeError(
+        "This production probe is locked to TPU."
+    )
+
+
+if len(
+    DEVICES
+) != 8:
+
+    raise RuntimeError(
+        f"Expected 8 TPU devices; found {len(DEVICES)}"
+    )
+
+
+MESH = Mesh(
+
+    np.asarray(
+        DEVICES,
+        dtype=object,
+    ),
+
+    (
+        "data",
+    ),
+)
+
+
+REPLICATED = NamedSharding(
+    MESH,
+    P(),
+)
+
+
+BATCH_SHARDING = NamedSharding(
+
+    MESH,
+
+    P(
+        "data",
+        None,
+        None,
+    ),
+)
+
+
+VALID_SHARDING = NamedSharding(
+
+    MESH,
+
+    P(
+        "data",
+    ),
+)
+
+
+print()
+print(
+    "Mesh:",
+    MESH
+)
+
+print(
+    "Local batch/TPU:",
+    GLOBAL_BATCH
+    //
+    len(
+        DEV

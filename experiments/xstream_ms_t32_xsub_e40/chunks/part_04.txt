@@ -1,0 +1,656 @@
+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"""
+
+raw_bundle = base64.b64decode(BUNDLE_B64.encode("ascii"))
+if hashlib.sha256(raw_bundle).hexdigest() != BUNDLE_SHA256:
+    raise RuntimeError("Embedded NestSAR source bundle checksum mismatch.")
+
+bundle_zip = ROOT / "_attention_lite_source_bundle.zip"
+bundle_zip.write_bytes(raw_bundle)
+with zipfile.ZipFile(io.BytesIO(raw_bundle), "r") as zf:
+    zf.extractall(ROOT)
+
+REQUIRED_SOURCE = [
+    "nestsar.py",
+    "nestsar_fcjm_b2.py",
+    "nestsar_hope_fullselfref_v3_3_shortl3fix.py",
+    "nestsar_hope_v4_1_cms_dmgd_l2_shortl3fix.py",
+    "nestsar_m4_geom_h4.py",
+    "nestsar_m4_geom_h4_sasm_l3statefix_v1.py",
+    "nestsar_m4_regmask_ema_v3_safe.py",
+    "nestsar_selfweight_clean.py",
+    "nestsar_sms_s1c_v2.py",
+]
+missing_source = [name for name in REQUIRED_SOURCE if not (ROOT / name).is_file()]
+if missing_source:
+    raise RuntimeError("Embedded source extraction incomplete: " + repr(missing_source))
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# ------------------------------------------------------------------------------------------
+# 2. IMPORT JAX + NESTSAR
+# ------------------------------------------------------------------------------------------
+import numpy as np
+import jax
+import jax.numpy as jnp
+import optax
+from flax import linen as nn
+from flax import serialization, traverse_util
+from flax.core import FrozenDict, freeze
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from tqdm.auto import tqdm
+
+import nestsar as ns
+import nestsar_m4_geom_h4 as m4
+import nestsar_m4_regmask_ema_v3_safe as reg
+import nestsar_m4_geom_h4_sasm_l3statefix_v1 as l3fix
+
+# Attention-Lite/XStream uses Fidelity's exact safe-logit helper.
+def _safe_logit(value: float) -> float:
+    value = float(np.clip(value, 1e-6, 1.0 - 1e-6))
+    return float(np.log(value / (1.0 - value)))
+
+fidelity_core = types.SimpleNamespace(_safe_logit=_safe_logit)
+
+print("=" * 132)
+print("NESTSAR-HOPE-ATTENTION-LITE — ALL-IN-ONE E40 BOOTSTRAP")
+print("=" * 132)
+print("Source root:", ROOT)
+print("JAX:", jax.__version__)
+print("Backend:", jax.default_backend())
+print("Devices:", len(jax.devices()))
+print("Bundle SHA256:", BUNDLE_SHA256)
+print("=" * 132)
+
+
+# ==========================================================================================
+# 2. CONFIG
+# ==========================================================================================
+
+ATTENTION_DIM = 64
+ATTENTION_HEADS = 4
+HEAD_DIM = ATTENTION_DIM // ATTENTION_HEADS
+
+LOCAL_KERNEL = 4
+CMS_BOTTLENECK = 32
+
+ATTENTION_GATE_INIT = 0.50
+LOCAL_CONV_GATE_INIT = 0.05
+
+
+if ATTENTION_DIM % ATTENTION_HEADS:
+
+    raise ValueError(
+        "ATTENTION_DIM must be divisible by ATTENTION_HEADS"
+    )
+
+
+assert HEAD_DIM == 16
+
+
+ns.CFG = dataclasses.replace(
+
+    ns.CFG,
+
+    frames=32,
+
+    persons=2,
+    joints=25,
+    coords=3,
+
+    num_classes=120,
+
+    model_dim=128,
+    memory_dim=64,
+    controller_rank=32,
+
+    frame_blocks=2,
+    chunk_blocks=2,
+    clip_blocks=2,
+    controller_blocks=2,
+
+    chunk_size=4,
+    clip_size=8,
+
+    dropout=0.22,
+
+    batch_size=32,
+    grad_accum_steps=4,
+    eval_batch_size=32,
+
+    learning_rate=1.0e-3,
+    weight_decay=0.05,
+    warmup_fraction=0.10,
+
+    label_smoothing=0.05,
+    grad_clip=1.0,
+
+    predictive_loss_weight=0.10,
+
+    initial_eta=0.02,
+    initial_alpha=0.95,
+
+    seed=128,
+)
+
+
+# ==========================================================================================
+# 3. HOPE-ATTENTION LITE TEMPORAL BLOCK
+# ==========================================================================================
+
+class HopeAttentionLiteBlock(nn.Module):
+
+    """
+    Drop-in replacement for M4 MultiHeadAdaptiveMemoryBlock.
+
+    Sequence mechanism:
+
+        x
+        ↓
+    causal local depthwise Conv1D(k=4)
+        ↓
+    global CAUSAL softmax self-attention
+        ↓
+    residual projection
+        ↓
+    sequential CMS f1→f2→f4→f8
+
+    Attention width is intentionally 64 while the outer model remains D128.
+    """
+
+    model_dim: int
+    memory_dim: int
+
+    dropout: float
+    residual_scale: float
+
+    initial_eta: float
+    initial_alpha: float
+
+    heads: int = ATTENTION_HEADS
+
+
+    @nn.compact
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        training: bool,
+    ):
+
+        if x.ndim != 3:
+
+            raise ValueError(
+                f"Expected [B,T,D], got {x.shape}"
+            )
+
+
+        if self.model_dim != 128:
+
+            raise ValueError(
+                "HOPE-Attention-Lite v1 is locked to D128."
+            )
+
+
+        if self.heads != ATTENTION_HEADS:
+
+            raise ValueError(
+                f"Expected {ATTENTION_HEADS} attention heads."
+            )
+
+
+        batch, time_steps, _ = x.shape
+
+
+        # ==================================================================================
+        # A. INPUT NORMALIZATION
+        # ==================================================================================
+
+        h = nn.LayerNorm(
+            name="input_norm"
+        )(x)
+
+
+        # ==================================================================================
+        # B. HOPE LOCAL CAUSAL CONVOLUTION — k=4
+        #
+        # left pad 3:
+        #
+        # output[t] only sees:
+        #   t, t-1, t-2, t-3
+        #
+        # depthwise:
+        #   groups = D128
+        # ==================================================================================
+
+        padded = jnp.pad(
+
+            h,
+
+            (
+                (0, 0),
+
+                (
+                    LOCAL_KERNEL - 1,
+                    0,
+                ),
+
+                (0, 0),
+            ),
+        )
+
+
+        local = nn.Conv(
+
+            features=self.model_dim,
+
+            kernel_size=(
+                LOCAL_KERNEL,
+            ),
+
+            strides=(
+                1,
+            ),
+
+            padding="VALID",
+
+            feature_group_count=self.model_dim,
+
+            use_bias=True,
+
+            kernel_init=nn.initializers.xavier_uniform(),
+
+            name="hope_local_conv",
+
+        )(
+            padded
+        )
+
+
+        local = jax.nn.silu(
+            local
+        )
+
+
+        local_gate_logit = self.param(
+
+            "hope_local_conv_gate_logit",
+
+            lambda key, shape:
+
+                jnp.full(
+
+                    shape,
+
+                    fidelity_core._safe_logit(
+                        LOCAL_CONV_GATE_INIT
+                    ),
+
+                    dtype=jnp.float32,
+                ),
+
+            (
+                1,
+            ),
+        )
+
+
+        local_gate = jax.nn.sigmoid(
+
+            local_gate_logit
+
+        )[0]
+
+
+        x = nn.LayerNorm(
+
+            name="hope_local_conv_output_norm"
+
+        )(
+            x
+            +
+            local_gate
+            *
+            local
+        )
+
+
+        # ==================================================================================
+        # C. GLOBAL CAUSAL SOFTMAX ATTENTION
+        #
+        # Dmodel   = 128
+        # Dattn    = 64
+        # heads    = 4
+        # head_dim = 16
+        # ==================================================================================
+
+        a = nn.LayerNorm(
+            name="attention_norm"
+        )(x)
+
+
+        def project(
+            name: str,
+        ) -> jnp.ndarray:
+
+            z = nn.Dense(
+
+                features=ATTENTION_DIM,
+
+                use_bias=False,
+
+                kernel_init=
+                    nn.initializers.xavier_uniform(),
+
+                name=name,
+
+            )(
+                a
+            )
+
+
+            return z.reshape(
+
+                batch,
+
+                time_steps,
+
+                ATTENTION_HEADS,
+
+                HEAD_DIM,
+            )
+
+
+        q = project(
+            "attention_query"
+        )
+
+        k = project(
+            "attention_key"
+        )
+
+        v = project(
+            "attention_value"
+        )
+
+
+        # [B,H,T,T]
+        scores = jnp.einsum(
+
+            "bthd,bshd->bhts",
+
+            q,
+            k,
+        )
+
+
+        scores = (
+
+            scores
+
+            *
+
+            jax.lax.rsqrt(
+
+                jnp.asarray(
+
+                    float(
+                        HEAD_DIM
+                    ),
+
+                    dtype=scores.dtype,
+                )
+            )
+        )
+
+
+        # ------------------------------------------------------------------
+        # Causal global attention.
+        #
+        # Query position t may attend only source positions <= t.
+        # ------------------------------------------------------------------
+
+        positions = jnp.arange(
+            time_steps
+        )
+
+
+        causal_mask = (
+
+            positions[
+                None,
+                None,
+                :,
+                None
+            ]
+
+            >=
+
+            positions[
+                None,
+                None,
+                None,
+                :
+            ]
+        )
+
+
+        scores = jnp.where(
+
+            causal_mask,
+
+            scores,
+
+            jnp.asarray(
+                -1.0e30,
+                dtype=scores.dtype,
+            ),
+        )
+
+
+        attention_weights = jax.nn.softmax(
+
+            scores,
+
+            axis=-1,
+        )
+
+
+        # [B,T,H,Dh]
+        attended = jnp.einsum(
+
+            "bhts,bshd->bthd",
+
+            attention_weights,
+
+            v,
+        )
+
+
+        # ------------------------------------------------------------------
+        # Retain the same kind of per-head learned residual gate used by the
+        # previous memory interface.
+        # ------------------------------------------------------------------
+
+        attention_gate_logit = self.param(
+
+            "memory_gate_logit",
+
+            lambda key, shape:
+
+                jnp.full(
+
+                    shape,
+
+                    fidelity_core._safe_logit(
+                        ATTENTION_GATE_INIT
+                    ),
+
+                    dtype=jnp.float32,
+                ),
+
+            (
+                ATTENTION_HEADS,
+            ),
+        )
+
+
+        attention_gate = jax.nn.sigmoid(
+
+            attention_gate_logit
+        )
+
+
+        attended = (
+
+            attended
+
+            *
+
+            attention_gate[
+                None,
+                None,
+                :,
+                None,
+            ]
+        )
+
+
+        attended = attended.reshape(
+
+            batch,
+
+            time_steps,
+
+            ATTENTION_DIM,
+        )
+
+
+        # 64 -> 128
+        context = nn.Dense(
+
+            features=self.model_dim,
+
+            use_bias=True,
+
+            kernel_init=
+                nn.initializers.xavier_uniform(),
+
+            name="readout",
+
+        )(
+            attended
+        )
+
+
+        context = nn.Dropout(
+
+            rate=self.dropout,
+
+            name="context_dropout",
+
+        )(
+            context,
+
+            deterministic=not training,
+        )
+
+
+        scaled_context = (
+
+            self.residual_scale
+
+            *
+
+            context
+        )
+
+
+        x = nn.LayerNorm(
+
+            name="memory_residual_norm"
+
+        )(
+            x
+            +
+            scaled_context
+        )
+
+
+        # ==================================================================================
+        # D. HOPE SEQUENTIAL CONTINUUM MEMORY SYSTEM
+        #
+        # EXACT SAME NAMES AS FIDELITY:
+        #
+        #     cms_f1
+        #        ↓
+        #     cms_f2
+        #        ↓
+        #     cms_f4
+        #        ↓
+        #     cms_f8
+        #
+        # therefore Fidelity's _path_to_tier() still maps:
+        #
+        #     f1 -> FAST
+        #     f2 -> MEDIUM
+        #     f4 -> SLOW
+        #     f8 -> CONSOLIDATE
+        # ==================================================================================
+
+        output = x
+
+
+        for cms_frequency in (
+            1,
+            2,
+            4,
+            8,
+        ):
+
+            cms_h = nn.LayerNorm(
+
+                name=
+                    f"cms_f{cms_frequency}_norm"
+
+            )(
+                output
+            )
+
+
+            cms_h = nn.Dense(
+
+                features=CMS_BOTTLENECK,
+
+                use_bias=True,
+
+                kernel_init=
+                    nn.initializers.xavier_uniform(),
+
+                name=
+                    f"cms_f{cms_frequency}_in",
+
+            )(
+                cms_h
+            )
+
+
+            cms_h = jax.nn.silu(
+                cms_h
+            )
+
+
+            cms_h = nn.Dropout(
+
+                rate=self.dropout,
+
+                name=
+                    f"cms_f{cms_frequency}_dropout",
+
+            )(
+                cms_h,
+
+                deterministic=not training,
+            )
+
+
+            cms_delta = nn.Dens

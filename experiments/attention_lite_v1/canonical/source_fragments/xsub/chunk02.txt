@@ -1,0 +1,856 @@
+BILITY DIAGNOSTIC
+        #
+        # This is no longer a recurrent-memory state delta.
+        #
+        # For compatibility with the M4 trainer we return the RMS magnitude
+        # of the attention residual per token:
+        #
+        #     [B,T]
+        #
+        # It is diagnostic only; it does NOT enter the classification loss.
+        # ==================================================================================
+
+        attention_residual_delta = jnp.sqrt(
+
+            jnp.mean(
+
+                jnp.square(
+                    scaled_context
+                ),
+
+                axis=-1,
+            )
+
+            +
+
+            1.0e-12
+        )
+
+
+        return (
+
+            output,
+
+            scaled_context,
+
+            attention_residual_delta,
+
+            jnp.mean(
+                attention_gate
+            ),
+        )
+
+
+# ==========================================================================================
+# 4. INSTALL THE HOPE-ATTENTION BLOCK
+#
+# The repaired L3 backbone resolves this symbol at runtime.
+# ==========================================================================================
+
+m4.MultiHeadAdaptiveMemoryBlock = (
+    HopeAttentionLiteBlock
+)
+
+
+# Also make the patch explicit in the L3 module's shared M4 reference.
+l3fix.m4.MultiHeadAdaptiveMemoryBlock = (
+    HopeAttentionLiteBlock
+)
+
+
+# ==========================================================================================
+# 5. VEC31
+#
+# JOINT:
+#     exact independent backbone
+#
+# NONJOINT:
+#     bone / joint_motion / bone_motion
+#     vectorized with INDEPENDENT parameters stacked on leading axis=3
+# ==========================================================================================
+
+STREAM_NAMES = (
+    "joint",
+    "bone",
+    "joint_motion",
+    "bone_motion",
+)
+
+
+NUM_STREAMS = 4
+NUM_NONJOINT = 3
+
+
+StreamBackbone = (
+    l3fix.L3StateFixedStreamBackbone
+)
+
+
+VectorizedNonJointBackbone = nn.vmap(
+
+    StreamBackbone,
+
+    variable_axes={
+        "params":
+            0,
+    },
+
+    split_rngs={
+        "params":
+            True,
+
+        "dropout":
+            True,
+    },
+
+    in_axes=(
+        0,
+        None,
+        None,
+        None,
+    ),
+
+    out_axes=0,
+
+    axis_size=NUM_NONJOINT,
+)
+
+
+# ==========================================================================================
+# 6. TOP-LEVEL MODEL
+# ==========================================================================================
+
+class NestSARHOPEAttentionLiteVec31(
+    nn.Module
+):
+
+    num_classes: int
+
+    model_dim: int
+    memory_dim: int
+
+    dropout: float
+
+    memory_residual_scale: float
+
+    initial_eta: float
+    initial_alpha: float
+
+    frame_blocks: int = 2
+    chunk_blocks: int = 2
+    clip_blocks: int = 2
+
+    controller_blocks: int = 2
+
+    chunk_size: int = 4
+    clip_size: int = 8
+
+    controller_rank: int = 32
+
+
+    @nn.compact
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        training: bool,
+    ):
+
+        if x.shape[1] % self.chunk_size:
+
+            raise ValueError(
+                "frames must be divisible by chunk_size"
+            )
+
+
+        if x.shape[1] % self.clip_size:
+
+            raise ValueError(
+                "frames must be divisible by clip_size"
+            )
+
+
+        streams = m4.build_four_streams(
+            x
+        )
+
+
+        joint_xyz = streams[
+            "joint"
+        ]
+
+
+        geometry = m4.geometric_features(
+            joint_xyz
+        )
+
+
+        # ==================================================================================
+        # JOINT
+        # ==================================================================================
+
+        joint_out = StreamBackbone(
+
+            stream_name="joint",
+
+            num_classes=self.num_classes,
+
+            model_dim=self.model_dim,
+
+            memory_dim=self.memory_dim,
+
+            dropout=self.dropout,
+
+            memory_residual_scale=
+                self.memory_residual_scale,
+
+            initial_eta=self.initial_eta,
+
+            initial_alpha=self.initial_alpha,
+
+            frame_blocks=self.frame_blocks,
+
+            chunk_blocks=self.chunk_blocks,
+
+            clip_blocks=self.clip_blocks,
+
+            controller_blocks=
+                self.controller_blocks,
+
+            chunk_size=self.chunk_size,
+
+            clip_size=self.clip_size,
+
+            controller_rank=
+                self.controller_rank,
+
+            use_part_attention=False,
+
+            name="stream_joint",
+
+        )(
+            joint_xyz,
+
+            joint_xyz,
+
+            geometry,
+
+            training,
+        )
+
+
+        # ==================================================================================
+        # NONJOINT ×3
+        # ==================================================================================
+
+        nonjoint_xyz = jnp.stack(
+
+            (
+                streams[
+                    "bone"
+                ],
+
+                streams[
+                    "joint_motion"
+                ],
+
+                streams[
+                    "bone_motion"
+                ],
+            ),
+
+            axis=0,
+        )
+
+
+        # Spatial behavior only distinguishes joint vs non-joint.
+        # "bone" is therefore the canonical static non-joint name.
+        nonjoint_out = VectorizedNonJointBackbone(
+
+            stream_name="bone",
+
+            num_classes=self.num_classes,
+
+            model_dim=self.model_dim,
+
+            memory_dim=self.memory_dim,
+
+            dropout=self.dropout,
+
+            memory_residual_scale=
+                self.memory_residual_scale,
+
+            initial_eta=self.initial_eta,
+
+            initial_alpha=self.initial_alpha,
+
+            frame_blocks=self.frame_blocks,
+
+            chunk_blocks=self.chunk_blocks,
+
+            clip_blocks=self.clip_blocks,
+
+            controller_blocks=
+                self.controller_blocks,
+
+            chunk_size=self.chunk_size,
+
+            clip_size=self.clip_size,
+
+            controller_rank=
+                self.controller_rank,
+
+            use_part_attention=False,
+
+            name="stream_nonjoint_bank",
+
+        )(
+            nonjoint_xyz,
+
+            joint_xyz,
+
+            geometry,
+
+            training,
+        )
+
+
+        # ==================================================================================
+        # EXACT FOUR-STREAM FUSION
+        # ==================================================================================
+
+        stream_logits = jnp.swapaxes(
+
+            jnp.concatenate(
+
+                (
+                    joint_out[
+                        "logits"
+                    ][
+                        None,
+                        ...
+                    ],
+
+                    nonjoint_out[
+                        "logits"
+                    ],
+                ),
+
+                axis=0,
+            ),
+
+            0,
+            1,
+        )
+
+
+        fusion_logits = self.param(
+
+            "stream_fusion_logits",
+
+            nn.initializers.zeros,
+
+            (
+                NUM_STREAMS,
+            ),
+        )
+
+
+        fusion_weights = jax.nn.softmax(
+
+            fusion_logits
+        )
+
+
+        logits = jnp.einsum(
+
+            "s,bsc->bc",
+
+            fusion_weights,
+
+            stream_logits,
+        )
+
+
+        # ==================================================================================
+        # PREDICTIVE STREAMS
+        # ==================================================================================
+
+        stream_prediction = jnp.swapaxes(
+
+            jnp.concatenate(
+
+                (
+                    joint_out[
+                        "prediction"
+                    ][
+                        None,
+                        ...
+                    ],
+
+                    nonjoint_out[
+                        "prediction"
+                    ],
+                ),
+
+                axis=0,
+            ),
+
+            0,
+            1,
+        )
+
+
+        stream_motion_target = jnp.swapaxes(
+
+            jnp.concatenate(
+
+                (
+                    joint_out[
+                        "motion_target"
+                    ][
+                        None,
+                        ...
+                    ],
+
+                    nonjoint_out[
+                        "motion_target"
+                    ],
+                ),
+
+                axis=0,
+            ),
+
+            0,
+            1,
+        )
+
+
+        prediction = jnp.einsum(
+
+            "s,bstd->btd",
+
+            fusion_weights,
+
+            stream_prediction,
+        )
+
+
+        motion_target = jnp.einsum(
+
+            "s,bstd->btd",
+
+            fusion_weights,
+
+            stream_motion_target,
+        )
+
+
+        # ==================================================================================
+        # METRIC AGGREGATION
+        # ==================================================================================
+
+        def average_metric(
+            name: str,
+        ):
+
+            joint_mean = jnp.mean(
+
+                joint_out[
+                    name
+                ]
+            )
+
+
+            value = nonjoint_out[
+                name
+            ]
+
+
+            if value.ndim == 1:
+
+                nonjoint_means = value
+
+            else:
+
+                nonjoint_means = jnp.mean(
+
+                    value,
+
+                    axis=tuple(
+
+                        range(
+                            1,
+                            value.ndim,
+                        )
+                    ),
+                )
+
+
+            values = jnp.concatenate(
+
+                (
+                    joint_mean[
+                        None
+                    ],
+
+                    nonjoint_means.reshape(
+                        (
+                            NUM_NONJOINT,
+                        )
+                    ),
+                ),
+
+                axis=0,
+            )
+
+
+            return jnp.mean(
+                values
+            )
+
+
+        result = {
+
+            "logits":
+                logits,
+
+            "stream_logits":
+                stream_logits,
+
+            "fusion_weights":
+                fusion_weights,
+
+            "prediction":
+                prediction,
+
+            "motion_target":
+                motion_target,
+
+            "stream_prediction":
+                stream_prediction,
+
+            "stream_motion_target":
+                stream_motion_target,
+
+            "memory_delta":
+                jnp.mean(
+
+                    jnp.concatenate(
+
+                        (
+                            joint_out[
+                                "memory_delta"
+                            ][
+                                None,
+                                ...
+                            ],
+
+                            nonjoint_out[
+                                "memory_delta"
+                            ],
+                        ),
+
+                        axis=0,
+                    )
+                ),
+        }
+
+
+        candidate_metrics = (
+
+            "motion_gate",
+
+            "memory_gate",
+
+            "controller_gate",
+
+            "fusion_gate",
+
+            "spatial_gate",
+
+            "sms_gate",
+
+            "sms_memory_delta",
+
+            "l3_state_gate",
+
+            "part_contrast_energy_ratio",
+        )
+
+
+        for name in candidate_metrics:
+
+            if (
+                name in joint_out
+                and
+                name in nonjoint_out
+            ):
+
+                result[
+                    name
+                ] = average_metric(
+                    name
+                )
+
+
+        return result
+
+
+# ==========================================================================================
+# 7. BUILDER
+# ==========================================================================================
+
+def build_model():
+
+    return NestSARHOPEAttentionLiteVec31(
+
+        num_classes=
+            ns.CFG.num_classes,
+
+        model_dim=
+            ns.CFG.model_dim,
+
+        memory_dim=
+            ns.CFG.memory_dim,
+
+        dropout=
+            ns.CFG.dropout,
+
+        memory_residual_scale=
+            ns.CFG.memory_residual_scale,
+
+        initial_eta=
+            ns.CFG.initial_eta,
+
+        initial_alpha=
+            ns.CFG.initial_alpha,
+
+        frame_blocks=
+            ns.CFG.frame_blocks,
+
+        chunk_blocks=
+            ns.CFG.chunk_blocks,
+
+        clip_blocks=
+            ns.CFG.clip_blocks,
+
+        controller_blocks=
+            ns.CFG.controller_blocks,
+
+        chunk_size=
+            ns.CFG.chunk_size,
+
+        clip_size=
+            ns.CFG.clip_size,
+
+        controller_rank=
+            ns.CFG.controller_rank,
+    )
+
+
+# ==========================================================================================
+# 8. INITIALIZE
+# ==========================================================================================
+
+print()
+print("=" * 124)
+print("INITIALIZE HOPE-ATTENTION-LITE VEC31")
+print("=" * 124)
+
+
+model = build_model()
+
+
+dummy = jnp.zeros(
+
+    (
+        1,
+        16,
+        150,
+    ),
+
+    dtype=jnp.float32,
+)
+
+
+rng = jax.random.PRNGKey(
+    128
+)
+
+
+t0 = time.time()
+
+
+variables = model.init(
+
+    {
+        "params":
+            rng,
+
+        "dropout":
+            rng,
+    },
+
+    dummy,
+
+    training=True,
+)
+
+
+params = variables[
+    "params"
+]
+
+
+init_seconds = (
+    time.time()
+    -
+    t0
+)
+
+
+PARAMS = int(
+
+    sum(
+
+        x.size
+
+        for x
+        in jax.tree_util.tree_leaves(
+            params
+        )
+    )
+)
+
+
+LEAVES = len(
+
+    jax.tree_util.tree_leaves(
+        params
+    )
+)
+
+
+print(
+    "Parameters:",
+    f"{PARAMS:,}"
+)
+
+print(
+    "Leaves:",
+    LEAVES
+)
+
+print(
+    "Init:",
+    f"{init_seconds:.2f}s"
+)
+
+
+# ==========================================================================================
+# 9. TOP-LEVEL PARAMETER AUDIT
+# ==========================================================================================
+
+def numel(
+    tree,
+):
+
+    return int(
+
+        sum(
+
+            x.size
+
+            for x
+            in jax.tree_util.tree_leaves(
+                tree
+            )
+        )
+    )
+
+
+def leaves(
+    tree,
+):
+
+    return len(
+
+        jax.tree_util.tree_leaves(
+            tree
+        )
+    )
+
+
+print()
+print("=" * 124)
+print("TOP-LEVEL TREE")
+print("=" * 124)
+
+
+for name in params:
+
+    print(
+
+        f"{name:28s} | "
+
+        f"{numel(params[name]):10,d} params | "
+
+        f"{leaves(params[name]):4d} leaves"
+    )
+
+
+assert set(
+    params.keys()
+) == {
+
+    "stream_joint",
+
+    "stream_nonjoint_bank",
+
+    "stream_fusion_logits",
+}
+
+
+assert params[
+    "stream_fusion_logits"
+].size == 4
+
+
+
+
+# ==========================================================================================
+# REBUILD EXACT JOINT/NONJOINT MODULES + PREPROCESS
+# ==========================================================================================
+
+joint_module = StreamBackbone(
+    stream_name="joint",
+    num_classes=ns.CFG.num_classes,
+    model_dim=ns.CFG.model_dim,
+    memory_dim=ns.CFG.memory_dim,
+    dropout=ns.CFG.dropout,
+    memory_residual_scale=ns.CFG.memory_residual_scale,
+    initial_eta=ns.CFG.initial_eta,
+    initial_alpha=ns.CFG.initial_alpha,
+    frame_blocks=ns.CFG.frame_blocks,
+    chunk_blocks=ns.CFG.chunk_blocks,
+    clip_blocks=ns.CFG.clip_blocks,
+    controller_blocks=ns.CFG.controller_blocks,
+    chunk_size=ns.CFG.chunk_size,
+    clip_size=ns.CFG.clip_size,
+    controller_rank=ns.CFG.controller_rank,
+    use_part_attention=False,
+)
+
+nonjoint_module = VectorizedNonJointBackbone(
+    stream_name="bone",
+    num_classes=ns.CFG.num_classes,
+    model_dim=ns.CFG.model_dim,
+    memory_dim=ns.CFG.memory_dim,
+    dropout=ns.CFG.dropout,
+    memory_residual_scale=ns.CFG.memory_residual_scale,
+    initial_eta=ns.CFG.initial_eta,
+    initial_alpha=ns.CFG.initial_alpha,
+    frame_blocks=ns.CFG.frame_blocks,
+    chunk_blocks=ns.CFG.chunk_blocks,
+    clip_blocks=ns.CFG.clip_blocks,
+    controller_blocks=ns.CFG.c

@@ -1,0 +1,574 @@
+e(
+
+                features=self.model_dim,
+
+                use_bias=True,
+
+                kernel_init=
+                    nn.initializers.xavier_uniform(),
+
+                name=
+                    f"cms_f{cms_frequency}_out",
+
+            )(
+                cms_h
+            )
+
+
+            cms_gate_logit = self.param(
+
+                f"cms_f{cms_frequency}_gate_logit",
+
+                lambda key, shape:
+
+                    jnp.full(
+
+                        shape,
+
+                        fidelity_core._safe_logit(
+                            0.05
+                        ),
+
+                        dtype=jnp.float32,
+                    ),
+
+                (
+                    1,
+                ),
+            )
+
+
+            cms_gate = jax.nn.sigmoid(
+
+                cms_gate_logit
+
+            )[0]
+
+
+            output = (
+
+                output
+
+                +
+
+                cms_gate
+                *
+                cms_delta
+            )
+
+
+        output = nn.LayerNorm(
+
+            name="output_norm"
+
+        )(
+            output
+        )
+
+
+        # ==================================================================================
+        # E. COMPATIBILITY DIAGNOSTIC
+        #
+        # This is no longer a recurrent-memory state delta.
+        #
+        # For compatibility with the M4 trainer we return the RMS magnitude
+        # of the attention residual per token:
+        #
+        #     [B,T]
+        #
+        # It is diagnostic only; it does NOT enter the classification loss.
+        # ==================================================================================
+
+        attention_residual_delta = jnp.sqrt(
+
+            jnp.mean(
+
+                jnp.square(
+                    scaled_context
+                ),
+
+                axis=-1,
+            )
+
+            +
+
+            1.0e-12
+        )
+
+
+        return (
+
+            output,
+
+            scaled_context,
+
+            attention_residual_delta,
+
+            jnp.mean(
+                attention_gate
+            ),
+        )
+
+
+# ==========================================================================================
+# 4. INSTALL THE HOPE-ATTENTION BLOCK
+#
+# The repaired L3 backbone resolves this symbol at runtime.
+# ==========================================================================================
+
+m4.MultiHeadAdaptiveMemoryBlock = (
+    HopeAttentionLiteBlock
+)
+
+
+# Also make the patch explicit in the L3 module's shared M4 reference.
+l3fix.m4.MultiHeadAdaptiveMemoryBlock = (
+    HopeAttentionLiteBlock
+)
+
+
+# ==========================================================================================
+# ==========================================================================================
+# 5. MULTISCALE CROSS-STREAM ARCHITECTURE
+#
+# Four streams remain independently parameterized, but they receive learned information from
+# the other streams BEFORE L1 and again at L2/L3 temporal scales.
+#
+# Cross attention is only across S=4 streams at the SAME temporal position:
+#     [joint, bone, joint_motion, bone_motion]
+# Diagonal attention is masked, so every update must come from another stream.
+# ==========================================================================================
+
+STREAM_NAMES = (
+    "joint",
+    "bone",
+    "joint_motion",
+    "bone_motion",
+)
+NUM_STREAMS = 4
+NUM_NONJOINT = 3
+
+CROSS_DIM = 64
+CROSS_HEADS = 4
+CROSS_HEAD_DIM = CROSS_DIM // CROSS_HEADS
+CROSS_GATE_MAX = 0.25
+CROSS_GATE_INIT = 0.05
+CROSS_DROPOUT = 0.10
+
+assert CROSS_DIM % CROSS_HEADS == 0
+assert CROSS_HEAD_DIM == 16
+
+
+class CrossStreamMultiScaleHint(nn.Module):
+    """
+    Input:
+        stream_tokens [B,T,4,150]
+
+    Output:
+        three gated cross-stream hints [B,T,4,Dmodel] for L1/L2/L3.
+
+    The attention matrix is [4,4] per frame and has its diagonal masked.
+    """
+    model_dim: int = 128
+    attention_dim: int = CROSS_DIM
+    heads: int = CROSS_HEADS
+    dropout: float = CROSS_DROPOUT
+
+    @nn.compact
+    def __call__(self, stream_tokens: jnp.ndarray, training: bool):
+        if stream_tokens.ndim != 4:
+            raise ValueError(f"Expected [B,T,4,F], got {stream_tokens.shape}")
+        if stream_tokens.shape[2] != NUM_STREAMS:
+            raise ValueError(f"Expected 4 streams, got {stream_tokens.shape[2]}")
+        if self.model_dim != 128:
+            raise ValueError("XStream-MS v1 is locked to D128.")
+
+        b, t, s, _ = stream_tokens.shape
+        head_dim = self.attention_dim // self.heads
+
+        h = nn.LayerNorm(name="input_norm")(stream_tokens)
+        h = nn.Dense(
+            self.attention_dim,
+            use_bias=True,
+            kernel_init=nn.initializers.xavier_uniform(),
+            name="input_projection",
+        )(h)
+        h = nn.gelu(h)
+        h = nn.Dropout(rate=self.dropout, name="input_dropout")(
+            h, deterministic=not training
+        )
+
+        stream_embedding = self.param(
+            "stream_embedding",
+            nn.initializers.normal(stddev=0.02),
+            (1, 1, NUM_STREAMS, self.attention_dim),
+        )
+        h = nn.LayerNorm(name="latent_norm")(h + stream_embedding)
+
+        def proj(name):
+            z = nn.Dense(
+                self.attention_dim,
+                use_bias=False,
+                kernel_init=nn.initializers.xavier_uniform(),
+                name=name,
+            )(h)
+            return z.reshape(b, t, s, self.heads, head_dim)
+
+        q = proj("query")
+        k = proj("key")
+        v = proj("value")
+
+        # [B,T,H,target_stream,source_stream]
+        scores = jnp.einsum("btshd,btuhd->bthsu", q, k)
+        scores = scores * jax.lax.rsqrt(
+            jnp.asarray(float(head_dim), dtype=scores.dtype)
+        )
+
+        # Force genuine cross-stream transfer: no stream may attend to itself here.
+        diagonal = jnp.eye(NUM_STREAMS, dtype=bool)[None, None, None, :, :]
+        scores = jnp.where(
+            diagonal,
+            jnp.asarray(-1.0e30, dtype=scores.dtype),
+            scores,
+        )
+        weights = jax.nn.softmax(scores, axis=-1)
+
+        context = jnp.einsum("bthsu,btuhd->btshd", weights, v)
+        context = context.reshape(b, t, s, self.attention_dim)
+        context = nn.LayerNorm(name="context_norm")(h + context)
+
+        # One independently learned projection and bounded gate per temporal scale.
+        gate_ratio = CROSS_GATE_INIT / CROSS_GATE_MAX
+        gate_logits = self.param(
+            "multiscale_gate_logits",
+            lambda key, shape: jnp.full(
+                shape,
+                fidelity_core._safe_logit(gate_ratio),
+                dtype=jnp.float32,
+            ),
+            (3, NUM_STREAMS),
+        )
+        gates = CROSS_GATE_MAX * jax.nn.sigmoid(gate_logits)
+
+        hints = []
+        for scale_index, scale_name in enumerate(("l1", "l2", "l3")):
+            delta = nn.Dense(
+                self.model_dim,
+                use_bias=True,
+                kernel_init=nn.initializers.xavier_uniform(),
+                name=f"{scale_name}_readout",
+            )(context)
+            delta = nn.Dropout(
+                rate=self.dropout,
+                name=f"{scale_name}_dropout",
+            )(delta, deterministic=not training)
+            delta = delta * gates[scale_index][None, None, :, None]
+            hints.append(delta)
+
+        # [4,4], average across batch/time/heads, useful for paper diagnostics.
+        mean_attention = jnp.mean(weights, axis=(0, 1, 2))
+        return tuple(hints), mean_attention, gates
+
+
+class CrossHintStreamBackbone(nn.Module):
+    """L3-state-fixed backbone with bounded external cross-stream hints at L1/L2/L3."""
+    stream_name: str
+    num_classes: int
+    model_dim: int
+    memory_dim: int
+    dropout: float
+    memory_residual_scale: float
+    initial_eta: float
+    initial_alpha: float
+    frame_blocks: int = 2
+    chunk_blocks: int = 2
+    clip_blocks: int = 2
+    controller_blocks: int = 2
+    chunk_size: int = 4
+    clip_size: int = 8
+    controller_rank: int = 32
+    use_part_attention: bool = False
+
+    @nn.compact
+    def __call__(
+        self,
+        stream_xyz: jnp.ndarray,
+        joint_xyz: jnp.ndarray,
+        geometry: jnp.ndarray,
+        cross_l1: jnp.ndarray,
+        cross_l2: jnp.ndarray,
+        cross_l3: jnp.ndarray,
+        training: bool,
+    ):
+        x = m4._flatten_xyz(stream_xyz)
+
+        pose = nn.Dense(
+            self.model_dim,
+            kernel_init=nn.initializers.xavier_uniform(),
+            name="pose_projection",
+        )(x)
+        pose = nn.LayerNorm(name="pose_norm")(pose)
+        pose = nn.gelu(pose)
+
+        spatial_summary, spatial_metrics = l3fix.SASMGeometricSpatialPartEncoder(
+            stream_name=self.stream_name,
+            persons=ns.CFG.persons,
+            joints=ns.CFG.joints,
+            coords=ns.CFG.coords,
+            token_dim=l3fix.sms.PART_TOKEN_DIM,
+            spatial_memory_dim=l3fix.sms.SPATIAL_MEMORY_DIM,
+            spatial_dim=32,
+            dropout=self.dropout,
+            use_part_attention=False,
+            name="spatial_encoder",
+        )(stream_xyz, joint_xyz, geometry, training)
+
+        fusion_input = jnp.concatenate([pose, spatial_summary], axis=-1)
+        spatial_delta = nn.Dense(
+            self.model_dim,
+            kernel_init=nn.initializers.xavier_uniform(),
+            bias_init=nn.initializers.zeros,
+            name="spatial_late_fusion",
+        )(fusion_input)
+        spatial_delta = nn.gelu(spatial_delta)
+        spatial_delta = nn.Dropout(
+            rate=self.dropout,
+            name="spatial_late_fusion_dropout",
+        )(spatial_delta, deterministic=not training)
+
+        spatial_gate_logit = self.param(
+            "spatial_late_gate_logit",
+            l3fix.sms._effective_gate_initializer(0.25, 0.10),
+            (1,),
+        )
+        spatial_gate = 0.25 * jax.nn.sigmoid(spatial_gate_logit)[0]
+
+        frame_present = jnp.any(
+            jnp.abs(joint_xyz) > 1e-6,
+            axis=(2, 3, 4),
+            keepdims=False,
+        )[..., None].astype(pose.dtype)
+        spatial_delta = spatial_delta * frame_present
+        pose = pose + spatial_gate * spatial_delta
+
+        zero = jnp.zeros_like(pose[:, :1])
+        motion = jnp.concatenate([zero, pose[:, 1:] - pose[:, :-1]], axis=1)
+        motion_projected = nn.Dense(
+            self.model_dim,
+            kernel_init=nn.initializers.xavier_uniform(),
+            name="motion_projection",
+        )(motion)
+        motion_projected = nn.gelu(motion_projected)
+        motion_gate = jax.nn.sigmoid(
+            self.param("motion_gate_logit", nn.initializers.zeros, (1,))
+        )
+        direct = nn.LayerNorm(name="direct_norm")(
+            pose + motion_gate * motion_projected
+        )
+
+        all_deltas = []
+        all_gates = []
+
+        # L1: cross-stream evidence enters BEFORE frame-level temporal reasoning.
+        l1 = direct + cross_l1
+        l1_contexts = []
+        for index in range(self.frame_blocks):
+            l1, context, delta, gate = m4.MultiHeadAdaptiveMemoryBlock(
+                model_dim=self.model_dim,
+                memory_dim=self.memory_dim,
+                dropout=self.dropout,
+                residual_scale=self.memory_residual_scale,
+                initial_eta=self.initial_eta,
+                initial_alpha=self.initial_alpha,
+                heads=m4.TEMPORAL_HEADS,
+                name=f"l1_frame_memory_{index + 1}",
+            )(l1, training)
+            l1_contexts.append(context)
+            all_deltas.append(delta)
+            all_gates.append(gate)
+        l1_context = sum(l1_contexts)
+
+        # L2: independently projected cross hint pooled to chunk resolution.
+        l2 = ns.pool_tokens(l1, self.chunk_size)
+        l2 = l2 + ns.pool_tokens(cross_l2, self.chunk_size)
+        l2_contexts = []
+        l2_deltas = []
+        for index in range(self.chunk_blocks):
+            l2, context, delta, gate = m4.MultiHeadAdaptiveMemoryBlock(
+                model_dim=self.model_dim,
+                memory_dim=self.memory_dim,
+                dropout=self.dropout,
+                residual_scale=self.memory_residual_scale,
+                initial_eta=self.initial_eta,
+                initial_alpha=self.initial_alpha,
+                heads=m4.TEMPORAL_HEADS,
+                name=f"l2_chunk_memory_{index + 1}",
+            )(l2, training)
+            l2_contexts.append(context)
+            l2_deltas.append(delta)
+            all_gates.append(gate)
+
+        l2_context = ns.delay_tokens(
+            ns.repeat_tokens(sum(l2_contexts), self.chunk_size, x.shape[1]),
+            self.chunk_size,
+        )
+        all_deltas.extend(
+            ns.repeat_tokens(delta, self.chunk_size, x.shape[1])
+            for delta in l2_deltas
+        )
+
+        # L3: independently projected cross hint pooled directly to clip resolution.
+        l3 = ns.pool_tokens(l2, self.clip_size // self.chunk_size)
+        l3 = l3 + ns.pool_tokens(cross_l3, self.clip_size)
+        l3_contexts = []
+        l3_deltas = []
+        for index in range(self.clip_blocks):
+            l3, context, delta, gate = m4.MultiHeadAdaptiveMemoryBlock(
+                model_dim=self.model_dim,
+                memory_dim=self.memory_dim,
+                dropout=self.dropout,
+                residual_scale=self.memory_residual_scale,
+                initial_eta=self.initial_eta,
+                initial_alpha=self.initial_alpha,
+                heads=m4.TEMPORAL_HEADS,
+                name=f"l3_clip_memory_{index + 1}",
+            )(l3, training)
+            l3_contexts.append(context)
+            l3_deltas.append(delta)
+            all_gates.append(gate)
+
+        l3_context = ns.delay_tokens(
+            ns.repeat_tokens(sum(l3_contexts), self.clip_size, x.shape[1]),
+            self.clip_size,
+        )
+
+        l3_final_state = ns.delay_tokens(
+            ns.repeat_tokens(l3, self.clip_size, x.shape[1]),
+            self.clip_size,
+        )
+        l3_state_gate_logit = self.param(
+            "l3_state_gate_logit",
+            l3fix.sms._effective_gate_initializer(
+                l3fix.L3_STATE_RESIDUAL_MAX,
+                l3fix.L3_STATE_RESIDUAL_INIT,
+            ),
+            (1,),
+        )
+        l3_state_gate = (
+            l3fix.L3_STATE_RESIDUAL_MAX * jax.nn.sigmoid(l3_state_gate_logit)[0]
+        )
+        l3_context = l3_context + l3_state_gate * l3_final_state
+
+        all_deltas.extend(
+            ns.repeat_tokens(delta, self.clip_size, x.shape[1])
+            for delta in l3_deltas
+        )
+
+        multiscale = jnp.concatenate(
+            [direct, l1_context, l2_context, l3_context], axis=-1
+        )
+        fusion = nn.Dense(
+            self.model_dim,
+            kernel_init=nn.initializers.xavier_uniform(),
+            name="multilevel_fusion",
+        )(multiscale)
+        fusion = nn.gelu(fusion)
+        fusion = nn.Dropout(rate=self.dropout, name="fusion_dropout")(
+            fusion, deterministic=not training
+        )
+        fusion_gate = jax.nn.sigmoid(
+            self.param("fusion_gate_logit", nn.initializers.zeros, (1,))
+        )
+        features = nn.LayerNorm(name="fusion_norm")(
+            direct + fusion_gate * fusion
+        )
+
+        controller_gates = []
+        for index in range(self.controller_blocks):
+            features, gate = ns.SlowControllerBlock(
+                model_dim=self.model_dim,
+                rank=self.controller_rank,
+                dropout=self.dropout,
+                name=f"l4_slow_controller_{index + 1}",
+            )(features, training)
+            controller_gates.append(gate)
+
+        features = nn.Dropout(rate=self.dropout, name="feature_dropout")(
+            features, deterministic=not training
+        )
+        prediction = nn.Dense(
+            self.model_dim,
+            kernel_init=nn.initializers.xavier_uniform(),
+            name="next_motion_predictor",
+        )(features)
+
+        pooled = jnp.mean(features, axis=1)
+        pooled = nn.LayerNorm(name="classifier_norm")(pooled)
+        logits = nn.Dense(
+            self.num_classes,
+            kernel_init=nn.initializers.xavier_uniform(),
+            name="classifier",
+        )(pooled)
+
+        return {
+            "logits": logits,
+            "prediction": prediction,
+            "motion_target": motion,
+            "memory_delta": sum(all_deltas) / float(len(all_deltas)),
+            "motion_gate": motion_gate,
+            "memory_gate": sum(all_gates) / float(len(all_gates)),
+            "controller_gate": sum(controller_gates) / float(len(controller_gates)),
+            "fusion_gate": fusion_gate,
+            "spatial_gate": spatial_gate,
+            "l3_state_gate": l3_state_gate,
+            **spatial_metrics,
+        }
+
+
+StreamBackbone = CrossHintStreamBackbone
+
+VectorizedNonJointBackbone = nn.vmap(
+    StreamBackbone,
+    variable_axes={"params": 0},
+    split_rngs={"params": True, "dropout": True},
+    in_axes=(0, None, None, 0, 0, 0, None),
+    out_axes=0,
+    axis_size=NUM_NONJOINT,
+)
+
+
+def _stack_stream_tokens(streams):
+    # [B,T,4,M,V,C] -> [B,T,4,150]
+    stacked = jnp.stack(
+        (
+            streams["joint"],
+            streams["bone"],
+            streams["joint_motion"],
+            streams["bone_motion"],
+        ),
+        axis=2,
+    )
+    return stacked.reshape(stacked.shape[0], stacked.shape[1], NUM_STREAMS, -1)
+
+
+def _split_hints(hints):
+    joint_hints = tuple(h[:, :, 0, :] for h in hints)
+    nonjoint_hints = tuple(
+        jnp.transpose(h[:, :, 1:, :], (2, 0, 1, 3)) for h in hints
+    )
+    return joint_hints, nonjoint_hints
+
+
+# ==========================================================================================
+# 6. TOP-LEVEL MODEL — cross-stream interaction + existing late fusion
+# ==========================================================================================
+
+class NestSARHOPEXStreamMST32(nn.Module):
+    num_classes: int
+    model_dim: int
+    memory_dim: int
+    dropout: float
+    memory_residual_scale: float
+    initial_eta: float
+    initial_alpha: float
+    

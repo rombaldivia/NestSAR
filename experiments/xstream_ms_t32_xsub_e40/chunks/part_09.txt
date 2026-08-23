@@ -1,0 +1,1182 @@
+               fast_dmgd_state[i],
+                fast_params[i],
+            )
+
+
+            fast_dmgd_state[
+                i
+            ] = state2
+
+
+            processed.append(
+                pg
+            )
+
+
+        processed_full = merge_fragments(
+            processed
+        )
+
+
+        fast_full = merge_fragments(
+            fast_params
+        )
+
+
+        (
+            clipped_full,
+            _,
+
+        ) = fast_clip_exe(
+
+            processed_full,
+            fast_clip_state,
+            fast_full,
+        )
+
+
+        clipped_fragments = [
+
+            extract_paths(
+
+                clipped_full,
+
+                fragment_path_sets[i],
+            )
+
+            for i
+            in range(
+                4
+            )
+        ]
+
+
+        for i in range(
+            4
+        ):
+
+            (
+                p2,
+                s2,
+
+            ) = fast_adam_exe[i](
+
+                clipped_fragments[i],
+                fast_adam_state[i],
+                fast_params[i],
+            )
+
+
+            fast_params[
+                i
+            ] = p2
+
+
+            fast_adam_state[
+                i
+            ] = s2
+
+
+        fast_updated = True
+
+
+    # --------------------------------------------------------------------------------------
+    # Original MultiSteps optimizers.
+    # --------------------------------------------------------------------------------------
+
+    (
+        medium_params,
+        medium_state,
+
+    ) = medium_step_exe(
+
+        g_medium,
+        medium_state,
+        medium_params,
+    )
+
+
+    (
+        slow_params,
+        slow_state,
+
+    ) = slow_step_exe(
+
+        g_slow,
+        slow_state,
+        slow_params,
+    )
+
+
+    (
+        consolidate_params,
+        consolidate_state,
+
+    ) = consolidate_step_exe(
+
+        g_consolidate,
+        consolidate_state,
+        consolidate_params,
+    )
+
+
+    return {
+
+        "fast":
+            fast_updated,
+
+        "medium":
+            (
+                next_accepted
+                %
+                8
+                ==
+                0
+            ),
+
+        "slow":
+            (
+                next_accepted
+                %
+                16
+                ==
+                0
+            ),
+
+        "consolidate":
+            (
+                next_accepted
+                %
+                32
+                ==
+                0
+            ),
+    }
+
+
+# ==========================================================================================
+# 20. VALIDATION
+# ==========================================================================================
+
+def evaluate_ema(
+    ema,
+    epoch,
+):
+
+    total_loss = 0.0
+
+    total_correct = 0
+    total_count = 0
+
+    stream_correct = np.zeros(
+        (
+            4,
+        ),
+
+        dtype=np.int64,
+    )
+
+
+    last_fusion = None
+
+
+    iterator = ns.batch_iterator(
+
+        val_dataset,
+
+        batch_size=GLOBAL_BATCH,
+
+        shuffle=False,
+
+        seed=SEED,
+
+        drop_last=False,
+    )
+
+
+    pbar = tqdm(
+
+        iterator,
+
+        total=math.ceil(
+            VAL_EXPECTED
+            /
+            GLOBAL_BATCH
+        ),
+
+        desc=
+            f"E{epoch:02d} VAL",
+    )
+
+
+    for x_np, y_np in pbar:
+
+        (
+            x_np,
+            y_np,
+            valid_np,
+            real_n,
+
+        ) = pad_batch32(
+            x_np,
+            y_np,
+        )
+
+
+        (
+            x,
+            y,
+            valid,
+
+        ) = device_batch(
+
+            x_np,
+            y_np,
+            valid_np,
+        )
+
+
+        (
+            logits,
+            stream_logits,
+            fusion_weights,
+
+        ) = eval_forward(
+
+            ema,
+
+            x,
+        )
+
+
+        logits_h = np.asarray(
+            jax.device_get(
+                logits
+            )
+        )
+
+
+        stream_h = np.asarray(
+            jax.device_get(
+                stream_logits
+            )
+        )
+
+
+        fusion_h = np.asarray(
+            jax.device_get(
+                fusion_weights
+            )
+        )
+
+
+        labels_h = y_np[
+            :real_n
+        ]
+
+
+        logits_real = logits_h[
+            :real_n
+        ]
+
+
+        stream_real = stream_h[
+            :real_n
+        ]
+
+
+        # CE without using padded samples.
+        one_hot = np.eye(
+            ns.CFG.num_classes,
+            dtype=np.float32,
+        )[
+            labels_h
+        ]
+
+
+        smooth = (
+
+            one_hot
+            *
+            (
+                1.0
+                -
+                ns.CFG.label_smoothing
+            )
+
+            +
+
+            ns.CFG.label_smoothing
+            /
+            ns.CFG.num_classes
+        )
+
+
+        # numerically stable host CE
+        z = logits_real.astype(
+            np.float64
+        )
+
+
+        z = (
+            z
+            -
+            np.max(
+                z,
+                axis=-1,
+                keepdims=True,
+            )
+        )
+
+
+        log_probs = (
+
+            z
+
+            -
+
+            np.log(
+
+                np.sum(
+
+                    np.exp(
+                        z
+                    ),
+
+                    axis=-1,
+                    keepdims=True,
+                )
+            )
+        )
+
+
+        ce = -np.sum(
+
+            smooth
+            *
+            log_probs,
+
+            axis=-1,
+        )
+
+
+        total_loss += float(
+            np.sum(
+                ce
+            )
+        )
+
+
+        pred = np.argmax(
+
+            logits_real,
+
+            axis=-1,
+        )
+
+
+        total_correct += int(
+
+            np.sum(
+                pred
+                ==
+                labels_h
+            )
+        )
+
+
+        for s in range(
+            4
+        ):
+
+            stream_pred = np.argmax(
+
+                stream_real[
+                    :,
+                    s,
+                    :
+                ],
+
+                axis=-1,
+            )
+
+
+            stream_correct[
+                s
+            ] += int(
+
+                np.sum(
+
+                    stream_pred
+                    ==
+                    labels_h
+                )
+            )
+
+
+        total_count += real_n
+
+
+        last_fusion = fusion_h
+
+
+        pbar.set_postfix(
+
+            acc=
+                f"{100.0 * total_correct / max(1,total_count):.2f}%"
+        )
+
+
+    if total_count != VAL_EXPECTED:
+
+        raise RuntimeError(
+
+            f"Validation count mismatch: "
+            f"{total_count} != {VAL_EXPECTED}"
+        )
+
+
+    return {
+
+        "loss":
+            total_loss
+            /
+            total_count,
+
+        "accuracy":
+            total_correct
+            /
+            total_count,
+
+        "correct":
+            total_correct,
+
+        "count":
+            total_count,
+
+        "stream_accuracy":
+            (
+                stream_correct
+                /
+                total_count
+            ).tolist(),
+
+        "fusion_weights":
+            last_fusion.tolist(),
+    }
+
+
+# ==========================================================================================
+# 21. CHECKPOINTS
+# ==========================================================================================
+
+def host_tree(
+    x,
+):
+
+    return jax.device_get(
+        x
+    )
+
+
+def save_weights(
+    path,
+    online,
+    ema,
+    epoch,
+    val_metrics,
+):
+
+    payload = {
+
+        "params":
+            host_tree(
+                online
+            ),
+
+        "ema_params":
+            host_tree(
+                ema
+            ),
+
+        "epoch":
+            int(
+                epoch
+            ),
+
+        "val_accuracy":
+            float(
+                val_metrics[
+                    "accuracy"
+                ]
+            ),
+    }
+
+
+    path.write_bytes(
+
+        serialization.to_bytes(
+            payload
+        )
+    )
+
+
+def save_resume_state(
+    epoch,
+    accepted,
+    rollback,
+    rng,
+):
+
+    payload = {
+
+        "epoch":
+            epoch,
+
+        "accepted":
+            accepted,
+
+        "rollback":
+            rollback,
+
+        "rng":
+            host_tree(
+                rng
+            ),
+
+        "fast_params":
+            host_tree(
+                fast_params
+            ),
+
+        "medium_params":
+            host_tree(
+                medium_params
+            ),
+
+        "slow_params":
+            host_tree(
+                slow_params
+            ),
+
+        "consolidate_params":
+            host_tree(
+                consolidate_params
+            ),
+
+        "ema_params":
+            host_tree(
+                ema_params
+            ),
+
+        "fast_accum_state":
+            host_tree(
+                fast_accum_state
+            ),
+
+        "fast_dmgd_state":
+            host_tree(
+                fast_dmgd_state
+            ),
+
+        "fast_adam_state":
+            host_tree(
+                fast_adam_state
+            ),
+
+        "medium_state":
+            host_tree(
+                medium_state
+            ),
+
+        "slow_state":
+            host_tree(
+                slow_state
+            ),
+
+        "consolidate_state":
+            host_tree(
+                consolidate_state
+            ),
+    }
+
+
+    path = (
+        OUT
+        /
+        "last_stagewise_state.pkl"
+    )
+
+
+    with path.open(
+        "wb"
+    ) as f:
+
+        pickle.dump(
+
+            payload,
+
+            f,
+
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+
+
+# ==========================================================================================
+# 22. COMPILE WARMUP ON ONE REAL B32
+#
+# Compiles the exact training graphs BEFORE starting E1 timing.
+# ==========================================================================================
+
+print()
+print("=" * 132)
+print("PRODUCTION GRAPH WARMUP / COMPILE")
+print("=" * 132)
+
+
+warm_iterator = ns.batch_iterator(
+
+    train_dataset,
+
+    batch_size=GLOBAL_BATCH,
+
+    shuffle=True,
+
+    seed=SEED,
+
+    drop_last=False,
+)
+
+
+warm_x_np, warm_y_np = next(
+    iter(
+        warm_iterator
+    )
+)
+
+
+(
+    warm_x_np,
+    warm_y_np,
+    warm_valid_np,
+    _,
+
+) = pad_batch32(
+    warm_x_np,
+    warm_y_np,
+)
+
+
+(
+    warm_x,
+    warm_y,
+    warm_valid,
+
+) = device_batch(
+
+    warm_x_np,
+    warm_y_np,
+    warm_valid_np,
+)
+
+
+compile_rng = jax.random.PRNGKey(
+    SEED
+    +
+    999
+)
+
+
+t0 = time.time()
+
+
+(
+    compile_loss,
+    compile_aux,
+    compile_grad,
+
+) = compute_gradient(
+
+    online_params,
+
+    warm_x,
+    warm_y,
+    warm_valid,
+
+    compile_rng,
+)
+
+
+jax.block_until_ready(
+    compile_loss
+)
+
+
+compile_seconds = (
+    time.time()
+    -
+    t0
+)
+
+
+print(
+    "Training graph ready:",
+    f"{compile_seconds:.2f}s"
+)
+
+print(
+    "Initial real loss:",
+    float(
+        np.asarray(
+            compile_loss
+        )
+    )
+)
+
+print(
+    "Gradient params:",
+    f"{tree_numel(compile_grad):,}"
+)
+
+print(
+    "Gradient leaves:",
+    tree_leaf_count(
+        compile_grad
+    )
+)
+
+
+if tree_numel(
+    compile_grad
+) != EXPECTED_PARAMS:
+
+    raise RuntimeError(
+        "Production gradient guard failed."
+    )
+
+
+if tree_leaf_count(
+    compile_grad
+) != EXPECTED_LEAVES:
+
+    raise RuntimeError(
+        "Production gradient leaf guard failed."
+    )
+
+
+# Check parameter gradients are globally replicated.
+first_grad_leaf = jax.tree_util.tree_leaves(
+    compile_grad
+)[
+    0
+]
+
+
+print(
+    "Gradient sharding:",
+    first_grad_leaf.sharding
+)
+
+
+if not getattr(
+
+    first_grad_leaf.sharding,
+
+    "is_fully_replicated",
+
+    False,
+):
+
+    raise RuntimeError(
+
+        "Parameter gradient is not fully replicated. "
+        "Do not train."
+    )
+
+
+print(
+    "Global gradient replication: PASS"
+)
+
+
+# ==========================================================================================
+# 23. TRAIN
+# ==========================================================================================
+
+history = []
+
+
+best_val = -1.0
+best_epoch = 0
+
+
+accepted = 0
+rollback = 0
+
+fast_updates = 0
+medium_updates = 0
+slow_updates = 0
+consolidate_updates = 0
+ema_updates = 0
+
+
+train_rng = jax.random.PRNGKey(
+    SEED
+    +
+    12345
+)
+
+
+run_start = time.time()
+
+
+for epoch in range(
+    1,
+    EPOCHS
+    +
+    1,
+):
+
+    epoch_start = time.time()
+
+
+    train_loss_sum = 0.0
+    train_correct = 0.0
+    train_count = 0
+
+
+    iterator = ns.batch_iterator(
+
+        train_dataset,
+
+        batch_size=GLOBAL_BATCH,
+
+        shuffle=True,
+
+        seed=
+            SEED
+            +
+            epoch,
+
+        drop_last=False,
+    )
+
+
+    pbar = tqdm(
+
+        iterator,
+
+        total=MICROSTEPS_PER_EPOCH,
+
+        desc=
+            f"E{epoch:02d} TRAIN",
+    )
+
+
+    for batch_index, (
+        x_np,
+        y_np,
+
+    ) in enumerate(
+        pbar,
+        start=1,
+    ):
+
+        (
+            x_np,
+            y_np,
+            valid_np,
+            real_n,
+
+        ) = pad_batch32(
+            x_np,
+            y_np,
+        )
+
+
+        (
+            x,
+            y,
+            valid,
+
+        ) = device_batch(
+
+            x_np,
+            y_np,
+            valid_np,
+        )
+
+
+        train_rng, step_rng = jax.random.split(
+            train_rng
+        )
+
+
+        # ----------------------------------------------------------------------------------
+        # Current full online params.
+        # ----------------------------------------------------------------------------------
+
+        online_params = full_param_tree(
+
+            fast_params,
+
+            medium_params,
+
+            slow_params,
+
+            consolidate_params,
+        )
+
+
+        # ----------------------------------------------------------------------------------
+        # Exact split gradient.
+        # ----------------------------------------------------------------------------------
+
+        (
+            loss,
+            aux,
+            grads,
+
+        ) = compute_gradient(
+
+            online_params,
+
+            x,
+            y,
+            valid,
+
+            step_rng,
+        )
+
+
+        (
+            fused_ce,
+            stream_ce,
+            predictive,
+
+            correct,
+            valid_count,
+
+            fusion_weights,
+            stream_correct,
+
+        ) = aux
+
+
+        # ----------------------------------------------------------------------------------
+        # Snapshot optimizer state for exact rollback.
+        #
+        # Arrays are immutable, so Python references are sufficient.
+        # ----------------------------------------------------------------------------------
+
+        old_fast_params = list(
+            fast_params
+        )
+
+        old_medium_params = medium_params
+        old_slow_params = slow_params
+        old_consolidate_params = consolidate_params
+
+        old_fast_accum = list(
+            fast_accum_state
+        )
+
+        old_fast_dmgd = list(
+            fast_dmgd_state
+        )
+
+        old_fast_adam = list(
+            fast_adam_state
+        )
+
+        old_medium_state = medium_state
+        old_slow_state = slow_state
+        old_consolidate_state = consolidate_state
+
+
+        update_flags = optimizer_microstep(
+
+            grads,
+
+            accepted,
+        )
+
+
+        candidate_params = full_param_tree(
+
+            fast_params,
+
+            medium_params,
+
+            slow_params,
+
+            consolidate_params,
+        )
+
+
+        candidate_finite = bool(
+
+            np.asarray(
+
+                full_finite(
+                    candidate_params
+                )
+            )
+        )
+
+
+        if not candidate_finite:
+
+            rollback += 1
+
+
+            fast_params = old_fast_params
+
+            medium_params = old_medium_params
+            slow_params = old_slow_params
+            consolidate_params = old_consolidate_params
+
+            fast_accum_state = old_fast_accum
+            fast_dmgd_state = old_fast_dmgd
+            fast_adam_state = old_fast_adam
+
+            medium_state = old_medium_state
+            slow_state = old_slow_state
+            consolidate_state = old_consolidate_state
+
+
+            pbar.set_postfix(
+
+                rb=rollback,
+
+                status="ROLLBACK",
+            )
+
+
+            continue
+
+
+        # ----------------------------------------------------------------------------------
+        # Accepted update.
+        # ----------------------------------------------------------------------------------
+
+        accepted += 1
+
+
+        if update_flags[
+            "fast"
+        ]:
+
+            fast_updates += 1
+
+
+        if update_flags[
+            "medium"
+        ]:
+
+            medium_updates += 1
+
+
+        if update_flags[
+            "slow"
+        ]:
+
+            slow_updates += 1
+
+
+        if update_flags[
+            "consolidate"
+        ]:
+
+            consolidate_updates += 1
+
+
+        online_params = candidate_params
+
+
+        # EMA at FAST boundaries.
+        if (
+            accepted
+            %
+            4
+            ==
+            0
+        ):
+
+            ema_params = ema_step(
+
+                ema_params,
+
+                online_params,
+            )
+
+
+            ema_updates += 1
+
+
+        # ----------------------------------------------------------------------------------
+        # Metrics.
+        # ----------------------------------------------------------------------------------
+
+        loss_h = float(
+            np.asarray(
+                loss
+            )
+        )
+
+
+        correct_h = float(
+            np.asarray(
+                correct
+            )
+        )
+
+
+        valid_h = float(
+            np.asarray(
+                valid_count
+            )
+        )
+
+
+        train_loss_sum += (
+            loss_h
+            *
+            valid_h
+        )
+
+
+        train_correct += correct_h
+
+        train_count += int(
+            valid_h
+        )
+
+
+        running_loss = (
+
+            train_loss_sum
+
+            /
+
+            max(
+                1,
+                train_count,
+            )
+        )
+
+
+        running_acc = (
+
+            100.0
+
+            *
+
+            train_correct
+
+            /
+
+            max(
+                1,
+                train_count,
+            )

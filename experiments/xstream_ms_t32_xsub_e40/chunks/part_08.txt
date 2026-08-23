@@ -1,0 +1,1087 @@
+vice_put(
+        valid,
+        VALID_SHARDING,
+    )
+
+
+    return (
+        x,
+        y,
+        valid,
+    )
+
+
+# ==========================================================================================
+# 10. REGMASK + PREPROCESS
+# ==========================================================================================
+
+@jax.jit
+def regmask_step(
+    x,
+    rng,
+):
+
+    return reg.skeleton_mask(
+        x,
+        rng,
+    )
+
+
+@jax.jit
+def preprocess_step(
+    x,
+):
+
+    return preprocess_v2(
+        x
+    )
+
+
+# ==========================================================================================
+# ==========================================================================================
+# 11. CROSS + BRANCH TRAINING FORWARDS
+# ==========================================================================================
+
+def cross_train_forward(p, stream_tokens, dropout_rng):
+    hints, _attention, _gates = cross_module.apply(
+        {"params": p},
+        stream_tokens,
+        True,
+        rngs={"dropout": dropout_rng},
+    )
+    return hints
+
+
+def joint_train_forward(
+    p, joint_xyz, geometry, cross_hints, dropout_rng,
+):
+    o = joint_module.apply(
+        {"params": p},
+        joint_xyz,
+        joint_xyz,
+        geometry,
+        cross_hints[0],
+        cross_hints[1],
+        cross_hints[2],
+        True,
+        rngs={"dropout": dropout_rng},
+    )
+    active = (o["logits"], o["prediction"])
+    target = jax.lax.stop_gradient(o["motion_target"])
+    return active, target
+
+
+def nonjoint_train_forward(
+    p, nonjoint_xyz, joint_xyz, geometry, cross_hints, dropout_rng,
+):
+    o = nonjoint_module.apply(
+        {"params": p},
+        nonjoint_xyz,
+        joint_xyz,
+        geometry,
+        cross_hints[0],
+        cross_hints[1],
+        cross_hints[2],
+        True,
+        rngs={"dropout": dropout_rng},
+    )
+    active = (o["logits"], o["prediction"])
+    target = jax.lax.stop_gradient(o["motion_target"])
+    return active, target
+
+
+cross_train_exe = jax.jit(cross_train_forward)
+joint_train_exe = jax.jit(joint_train_forward)
+nonjoint_train_exe = jax.jit(nonjoint_train_forward)
+
+# 12. EXACT MASKED HEAD
+# ==========================================================================================
+
+def head_outputs(
+    fusion_logits,
+    joint_active,
+    nonjoint_active,
+    joint_target,
+    nonjoint_target,
+):
+
+    (
+        joint_logits,
+        joint_prediction,
+
+    ) = joint_active
+
+
+    (
+        nonjoint_logits,
+        nonjoint_prediction,
+
+    ) = nonjoint_active
+
+
+    stream_logits = jnp.swapaxes(
+
+        jnp.concatenate(
+
+            (
+
+                joint_logits[
+                    None,
+                    ...
+                ],
+
+                nonjoint_logits,
+            ),
+
+            axis=0,
+        ),
+
+        0,
+        1,
+    )
+
+
+    fusion_weights = jax.nn.softmax(
+        fusion_logits
+    )
+
+
+    logits = jnp.einsum(
+
+        "s,bsc->bc",
+
+        fusion_weights,
+
+        stream_logits,
+    )
+
+
+    stream_prediction = jnp.swapaxes(
+
+        jnp.concatenate(
+
+            (
+
+                joint_prediction[
+                    None,
+                    ...
+                ],
+
+                nonjoint_prediction,
+            ),
+
+            axis=0,
+        ),
+
+        0,
+        1,
+    )
+
+
+    stream_target = jax.lax.stop_gradient(
+
+        jnp.swapaxes(
+
+            jnp.concatenate(
+
+                (
+
+                    joint_target[
+                        None,
+                        ...
+                    ],
+
+                    nonjoint_target,
+                ),
+
+                axis=0,
+            ),
+
+            0,
+            1,
+        )
+    )
+
+
+    return (
+
+        logits,
+
+        stream_logits,
+
+        fusion_weights,
+
+        stream_prediction,
+
+        stream_target,
+    )
+
+
+def masked_head_loss(
+    fusion_logits,
+    joint_active,
+    nonjoint_active,
+    joint_target,
+    nonjoint_target,
+    labels,
+    valid,
+):
+
+    (
+        logits,
+        stream_logits,
+        fusion_weights,
+        stream_prediction,
+        stream_target,
+
+    ) = head_outputs(
+
+        fusion_logits,
+
+        joint_active,
+        nonjoint_active,
+
+        joint_target,
+        nonjoint_target,
+    )
+
+
+    valid = valid.astype(
+        jnp.float32
+    )
+
+
+    denom = jnp.maximum(
+
+        jnp.sum(
+            valid
+        ),
+
+        1.0,
+    )
+
+
+    # --------------------------------------------------------------------------------------
+    # FUSED CE
+    # --------------------------------------------------------------------------------------
+
+    one_hot = jax.nn.one_hot(
+
+        labels,
+
+        ns.CFG.num_classes,
+    )
+
+
+    smooth = (
+
+        one_hot
+        *
+        (
+            1.0
+            -
+            ns.CFG.label_smoothing
+        )
+
+        +
+
+        ns.CFG.label_smoothing
+        /
+        ns.CFG.num_classes
+    )
+
+
+    fused_ce_each = optax.softmax_cross_entropy(
+
+        logits,
+
+        smooth,
+    )
+
+
+    fused_ce = (
+
+        jnp.sum(
+
+            fused_ce_each
+            *
+            valid
+        )
+
+        /
+
+        denom
+    )
+
+
+    # --------------------------------------------------------------------------------------
+    # AUX STREAM CE
+    # [B,4,C]
+    # --------------------------------------------------------------------------------------
+
+    smooth_stream = smooth[
+        :,
+        None,
+        :
+    ]
+
+
+    stream_ce_each = optax.softmax_cross_entropy(
+
+        stream_logits,
+
+        smooth_stream,
+    )
+
+
+    stream_ce_each = jnp.mean(
+
+        stream_ce_each,
+
+        axis=1,
+    )
+
+
+    stream_ce = (
+
+        jnp.sum(
+
+            stream_ce_each
+            *
+            valid
+        )
+
+        /
+
+        denom
+    )
+
+
+    # --------------------------------------------------------------------------------------
+    # PREDICTIVE
+    #
+    # prediction t predicts target t+1
+    # --------------------------------------------------------------------------------------
+
+    pred_now = stream_prediction[
+        :,
+        :,
+        :-1,
+        :
+    ]
+
+
+    target_next = jax.lax.stop_gradient(
+
+        stream_target[
+            :,
+            :,
+            1:,
+            :
+        ]
+    )
+
+
+    pred_each = jnp.mean(
+
+        jnp.square(
+
+            pred_now
+            -
+            target_next
+        ),
+
+        axis=(
+            1,
+            2,
+            3,
+        ),
+    )
+
+
+    predictive = (
+
+        jnp.sum(
+
+            pred_each
+            *
+            valid
+        )
+
+        /
+
+        denom
+    )
+
+
+    total = (
+
+        fused_ce
+
+        +
+
+        m4.AUX_STREAM_CE_WEIGHT
+        *
+        stream_ce
+
+        +
+
+        ns.CFG.predictive_loss_weight
+        *
+        predictive
+    )
+
+
+    predicted_class = jnp.argmax(
+
+        logits,
+
+        axis=-1,
+    )
+
+
+    correct = jnp.sum(
+
+        (
+            predicted_class
+            ==
+            labels
+        ).astype(
+            jnp.float32
+        )
+
+        *
+
+        valid
+    )
+
+
+    # Stream correct counts.
+    stream_pred_class = jnp.argmax(
+
+        stream_logits,
+
+        axis=-1,
+    )
+
+
+    stream_correct = jnp.sum(
+
+        (
+            stream_pred_class
+            ==
+            labels[
+                :,
+                None
+            ]
+        ).astype(
+            jnp.float32
+        )
+
+        *
+
+        valid[
+            :,
+            None
+        ],
+
+        axis=0,
+    )
+
+
+    aux = (
+
+        fused_ce,
+        stream_ce,
+        predictive,
+
+        correct,
+        denom,
+
+        fusion_weights,
+
+        stream_correct,
+    )
+
+
+    return (
+        total,
+        aux,
+    )
+
+
+def head_backward(
+    fusion_logits,
+    joint_active,
+    nonjoint_active,
+    joint_target,
+    nonjoint_target,
+    labels,
+    valid,
+):
+
+    return jax.value_and_grad(
+
+        masked_head_loss,
+
+        argnums=(
+            0,
+            1,
+            2,
+        ),
+
+        has_aux=True,
+
+    )(
+        fusion_logits,
+
+        joint_active,
+        nonjoint_active,
+
+        joint_target,
+        nonjoint_target,
+
+        labels,
+        valid,
+    )
+
+
+head_backward_exe = jax.jit(
+    head_backward
+)
+
+
+# ==========================================================================================
+# ==========================================================================================
+# 13. CROSS + BRANCH VJPS
+# ==========================================================================================
+
+def joint_vjp_train(p, joint_xyz, geometry, cross_hints, dropout_rng, cotangent):
+    def active_only(pp, hh):
+        active, _target = joint_train_forward(
+            pp, joint_xyz, geometry, hh, dropout_rng
+        )
+        return active
+    _, pullback = jax.vjp(active_only, p, cross_hints)
+    grad_p, cot_hints = pullback(cotangent)
+    return grad_p, cot_hints
+
+
+def nonjoint_vjp_train(
+    p, nonjoint_xyz, joint_xyz, geometry, cross_hints, dropout_rng, cotangent,
+):
+    def active_only(pp, hh):
+        active, _target = nonjoint_train_forward(
+            pp, nonjoint_xyz, joint_xyz, geometry, hh, dropout_rng
+        )
+        return active
+    _, pullback = jax.vjp(active_only, p, cross_hints)
+    grad_p, cot_hints = pullback(cotangent)
+    return grad_p, cot_hints
+
+
+def cross_vjp_train(p, stream_tokens, dropout_rng, cotangent_hints):
+    def hints_only(pp):
+        return cross_train_forward(pp, stream_tokens, dropout_rng)
+    _, pullback = jax.vjp(hints_only, p)
+    return pullback(cotangent_hints)[0]
+
+
+joint_vjp_exe = jax.jit(joint_vjp_train)
+nonjoint_vjp_exe = jax.jit(nonjoint_vjp_train)
+cross_vjp_exe = jax.jit(cross_vjp_train)
+
+# 14. FAST SPLIT OPTIMIZER EXECUTABLES
+# ==========================================================================================
+
+fast_accum_exe = []
+fast_dmgd_exe = []
+fast_adam_exe = []
+
+
+for i in range(
+    4
+):
+
+    tx_acc = FAST_ACCUM_TX[
+        i
+    ]
+
+
+    tx_dmgd = FAST_DMGD_TX[
+        i
+    ]
+
+
+    tx_adam = FAST_ADAM_TX[
+        i
+    ]
+
+
+    @jax.jit
+    def _acc(
+        grads,
+        state,
+        p,
+        tx=tx_acc,
+    ):
+
+        return tx.update(
+            grads,
+            state,
+            p,
+        )
+
+
+    @jax.jit
+    def _dmgd(
+        grads,
+        state,
+        p,
+        tx=tx_dmgd,
+    ):
+
+        return tx.update(
+            grads,
+            state,
+            p,
+        )
+
+
+    @jax.jit
+    def _adam(
+        grads,
+        state,
+        p,
+        tx=tx_adam,
+    ):
+
+        updates, state2 = tx.update(
+
+            grads,
+            state,
+            p,
+        )
+
+
+        p2 = optax.apply_updates(
+            p,
+            updates,
+        )
+
+
+        return (
+            p2,
+            state2,
+        )
+
+
+    fast_accum_exe.append(
+        _acc
+    )
+
+    fast_dmgd_exe.append(
+        _dmgd
+    )
+
+    fast_adam_exe.append(
+        _adam
+    )
+
+
+@jax.jit
+def fast_clip_exe(
+    grads,
+    state,
+    p,
+):
+
+    return FAST_CLIP_TX.update(
+
+        grads,
+        state,
+        p,
+    )
+
+
+# ==========================================================================================
+# 15. MEDIUM / SLOW / CONSOLIDATE
+# ==========================================================================================
+
+def build_tier_step(
+    tier_name,
+):
+
+    tx = tier_tx[
+        tier_name
+    ]
+
+
+    @jax.jit
+    def step(
+        grads,
+        state,
+        p,
+    ):
+
+        updates, state2 = tx.update(
+
+            grads,
+            state,
+            p,
+        )
+
+
+        p2 = optax.apply_updates(
+
+            p,
+
+            updates,
+        )
+
+
+        return (
+            p2,
+            state2,
+        )
+
+
+    return step
+
+
+medium_step_exe = build_tier_step(
+    "medium"
+)
+
+
+slow_step_exe = build_tier_step(
+    "slow"
+)
+
+
+consolidate_step_exe = build_tier_step(
+    "consolidate"
+)
+
+
+# ==========================================================================================
+# 16. EMA / FINITE / GRAD NORM
+# ==========================================================================================
+
+@jax.jit
+def ema_step(
+    ema,
+    p,
+):
+
+    return jax.tree_util.tree_map(
+
+        lambda e, x:
+
+            reg.EMA_DECAY
+            *
+            e
+
+            +
+
+            (
+                1.0
+                -
+                reg.EMA_DECAY
+            )
+            *
+            x,
+
+        ema,
+        p,
+    )
+
+
+@jax.jit
+def full_finite(
+    tree,
+):
+
+    flags = [
+
+        jnp.all(
+            jnp.isfinite(
+                x
+            )
+        )
+
+        for x
+        in jax.tree_util.tree_leaves(
+            tree
+        )
+    ]
+
+
+    return jnp.all(
+
+        jnp.stack(
+            flags
+        )
+    )
+
+
+@jax.jit
+def gradient_norm(
+    tree,
+):
+
+    return optax.global_norm(
+        tree
+    )
+
+
+# ==========================================================================================
+# 17. EVALUATION — FULL MODEL, EMA, NO MASK
+# ==========================================================================================
+
+@jax.jit
+def eval_forward(
+    p,
+    x,
+):
+
+    o = model.apply(
+
+        {
+            "params":
+                p
+        },
+
+        x,
+
+        training=False,
+    )
+
+
+    return (
+
+        o[
+            "logits"
+        ],
+
+        o[
+            "stream_logits"
+        ],
+
+        o[
+            "fusion_weights"
+        ],
+    )
+
+
+# ==========================================================================================
+# ==========================================================================================
+# 18. ONE TRAINING GRADIENT — split VJP with cross-stream path
+# ==========================================================================================
+
+def compute_gradient(p, batch_x, batch_y, valid, rng):
+    mask_rng, dropout_root = jax.random.split(rng)
+    cross_rng, joint_rng, nonjoint_rng = jax.random.split(dropout_root, 3)
+
+    masked_x = regmask_step(batch_x, mask_rng)
+    joint_xyz, nonjoint_xyz, geometry, stream_tokens = preprocess_step(masked_x)
+
+    p_cross = p["cross_stream_mixer"]
+    p_joint = p["stream_joint"]
+    p_nonjoint = p["stream_nonjoint_bank"]
+    p_fusion = p["stream_fusion_logits"]
+
+    all_hints = cross_train_exe(p_cross, stream_tokens, cross_rng)
+    joint_hints, nonjoint_hints = _split_hints(all_hints)
+
+    joint_active, joint_target = joint_train_exe(
+        p_joint, joint_xyz, geometry, joint_hints, joint_rng
+    )
+    nonjoint_active, nonjoint_target = nonjoint_train_exe(
+        p_nonjoint, nonjoint_xyz, joint_xyz, geometry, nonjoint_hints, nonjoint_rng
+    )
+
+    ((loss, aux), (grad_fusion, cot_joint, cot_nonjoint)) = head_backward_exe(
+        p_fusion,
+        joint_active,
+        nonjoint_active,
+        joint_target,
+        nonjoint_target,
+        batch_y,
+        valid,
+    )
+
+    grad_joint, cot_joint_hints = joint_vjp_exe(
+        p_joint, joint_xyz, geometry, joint_hints, joint_rng, cot_joint
+    )
+    grad_nonjoint, cot_nonjoint_hints = nonjoint_vjp_exe(
+        p_nonjoint,
+        nonjoint_xyz,
+        joint_xyz,
+        geometry,
+        nonjoint_hints,
+        nonjoint_rng,
+        cot_nonjoint,
+    )
+
+    # Reassemble the hint cotangents into [B,T,4,D] at each scale.
+    cot_all_hints = tuple(
+        jnp.concatenate(
+            (
+                cj[:, :, None, :],
+                jnp.transpose(cn, (1, 2, 0, 3)),
+            ),
+            axis=2,
+        )
+        for cj, cn in zip(cot_joint_hints, cot_nonjoint_hints)
+    )
+
+    grad_cross = cross_vjp_exe(
+        p_cross, stream_tokens, cross_rng, cot_all_hints
+    )
+
+    grads = {
+        "cross_stream_mixer": grad_cross,
+        "stream_joint": grad_joint,
+        "stream_nonjoint_bank": grad_nonjoint,
+        "stream_fusion_logits": grad_fusion,
+    }
+
+    if tree_numel(grads) != EXPECTED_PARAMS:
+        raise RuntimeError(
+            f"Gradient parameter count mismatch: {tree_numel(grads):,} != {EXPECTED_PARAMS:,}"
+        )
+    return loss, aux, grads
+
+# 19. OPTIMIZER MICROSTEP
+# ==========================================================================================
+
+def optimizer_microstep(
+    grads,
+    accepted_before,
+):
+
+    global fast_params
+    global medium_params
+    global slow_params
+    global consolidate_params
+
+    global fast_accum_state
+    global fast_dmgd_state
+    global fast_adam_state
+    global fast_clip_state
+
+    global medium_state
+    global slow_state
+    global consolidate_state
+
+
+    next_accepted = (
+        accepted_before
+        +
+        1
+    )
+
+
+    # --------------------------------------------------------------------------------------
+    # Split gradients.
+    # --------------------------------------------------------------------------------------
+
+    g_fast = extract_tier(
+        grads,
+        "fast",
+    )
+
+
+    g_medium = extract_tier(
+        grads,
+        "medium",
+    )
+
+
+    g_slow = extract_tier(
+        grads,
+        "slow",
+    )
+
+
+    g_consolidate = extract_tier(
+        grads,
+        "consolidate",
+    )
+
+
+    g_fast_fragments = [
+
+        extract_paths(
+
+            g_fast,
+
+            fragment_path_sets[i],
+        )
+
+        for i
+        in range(
+            4
+        )
+    ]
+
+
+    # --------------------------------------------------------------------------------------
+    # FAST accumulation.
+    # --------------------------------------------------------------------------------------
+
+    averaged_fast = []
+
+
+    for i in range(
+        4
+    ):
+
+        (
+            avg,
+            state2,
+
+        ) = fast_accum_exe[i](
+
+            g_fast_fragments[i],
+            fast_accum_state[i],
+            fast_params[i],
+        )
+
+
+        fast_accum_state[
+            i
+        ] = state2
+
+
+        averaged_fast.append(
+            avg
+        )
+
+
+    fast_updated = False
+
+
+    if (
+        next_accepted
+        %
+        4
+        ==
+        0
+    ):
+
+        processed = []
+
+
+        for i in range(
+            4
+        ):
+
+            (
+                pg,
+                state2,
+
+            ) = fast_dmgd_exe[i](
+
+                averaged_fast[i],

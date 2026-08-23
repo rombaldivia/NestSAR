@@ -1,0 +1,610 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+HOPE-SAR Nested V1
+==================
+
+Primera reconstrucción limpia:
+
+H0_direct_motion
+    Pose stem + movimiento directo + mean pooling.
+
+H2_predictive_memory
+    Mismo backbone que H0 +
+    memoria asociativa causal +
+    predicción auxiliar del siguiente movimiento.
+
+Propiedades:
+- Sin convolución.
+- Read-before-write.
+- Estado rápido independiente por muestra.
+- Estado reiniciado en cada secuencia.
+- Memoria activa únicamente dentro de los 16 frames.
+- Comparación H0/H2 bajo protocolo idéntico.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import math
+import os
+import pickle
+import random
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
+
+# Debe definirse antes de importar JAX cuando el script se lanza por GPU.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
+try:
+    import jax
+    import jax.numpy as jnp
+    from flax import linen as nn
+    from flax import serialization
+    from flax.training import train_state
+    import optax
+except ImportError as exc:
+    raise RuntimeError(
+        "Faltan JAX/Flax/Optax. En Kaggle suelen estar preinstalados. "
+        "Activa un acelerador GPU y reinicia la sesión."
+    ) from exc
+
+
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+
+@dataclasses.dataclass(frozen=True)
+class Config:
+    frames: int = 16
+    persons: int = 2
+    joints: int = 25
+    coords: int = 3
+    num_classes: int = 120
+
+    model_dim: int = 128
+    memory_dim: int = 64
+    dropout: float = 0.15
+
+    batch_size: int = 64
+    eval_batch_size: int = 128
+    epochs: int = 90
+    patience: int = 30
+
+    learning_rate: float = 2.0e-4
+    weight_decay: float = 3.0e-2
+    warmup_fraction: float = 0.10
+    label_smoothing: float = 0.05
+    grad_clip: float = 1.0
+
+    # Intensidad del residual leído desde la memoria.
+    memory_residual_scale: float = 0.25
+
+    # Regla rápida.
+    initial_eta: float = 0.10
+    initial_alpha: float = 0.95
+
+    # Pérdida de predicción del siguiente movimiento.
+    predictive_loss_weight: float = 0.10
+
+    # Límites para una primera ejecución controlada.
+    # Usa 0 para utilizar todas las muestras disponibles.
+    max_train_samples: int = 0
+    max_val_samples: int = 480
+
+    seed: int = 28
+    log_every_batches: int = 20
+
+
+CFG = Config()
+
+
+# ============================================================
+# UTILIDADES
+# ============================================================
+
+def log(message: str) -> None:
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{stamp}] {message}", flush=True)
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def tree_all_finite(tree: Any) -> bool:
+    leaves = jax.tree_util.tree_leaves(tree)
+    return all(bool(np.asarray(jnp.all(jnp.isfinite(x)))) for x in leaves)
+
+
+def count_parameters(params: Any) -> int:
+    return int(
+        sum(np.prod(np.asarray(x).shape) for x in jax.tree_util.tree_leaves(params))
+    )
+
+
+def find_dataset(explicit_path: Optional[str]) -> Path:
+    candidates: List[Path] = []
+
+    if explicit_path:
+        candidates.append(Path(explicit_path))
+
+    common_names = (
+        "ntu120_3danno.pkl",
+        "ntu120_3danno_clean.pkl",
+        "ntu120.pkl",
+    )
+
+    roots = (
+        Path("/kaggle/input"),
+        Path("/kaggle/working"),
+    )
+
+    for root in roots:
+        if not root.exists():
+            continue
+
+        for name in common_names:
+            candidates.extend(root.rglob(name))
+
+    checked: List[str] = []
+
+    for path in candidates:
+        checked.append(str(path))
+        if path.is_file():
+            return path.resolve()
+
+    raise FileNotFoundError(
+        "No se encontró ntu120_3danno.pkl.\n"
+        "Rutas revisadas:\n- " + "\n- ".join(checked[:100])
+    )
+
+
+def load_pickle(path: Path) -> Any:
+    log(f"Cargando dataset: {path}")
+
+    with path.open("rb") as file:
+        try:
+            return pickle.load(file)
+        except UnicodeDecodeError:
+            file.seek(0)
+            return pickle.load(file, encoding="latin1")
+
+
+# ============================================================
+# LECTURA ROBUSTA DEL PKL NTU
+# ============================================================
+
+def extract_annotations_and_split(data: Any) -> Tuple[List[Mapping[str, Any]], Mapping[str, Any]]:
+    if not isinstance(data, Mapping):
+        raise TypeError(
+            f"Se esperaba un diccionario en el PKL; recibido: {type(data)!r}"
+        )
+
+    annotation_keys = (
+        "annotations",
+        "annotation",
+        "samples",
+        "data_list",
+    )
+
+    split_keys = (
+        "split",
+        "splits",
+    )
+
+    annotations = None
+    split_map = None
+
+    for key in annotation_keys:
+        value = data.get(key)
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            annotations = list(value)
+            break
+
+    for key in split_keys:
+        value = data.get(key)
+        if isinstance(value, Mapping):
+            split_map = value
+            break
+
+    if annotations is None:
+        # Algunos archivos contienen directamente frame_dir -> anotación.
+        possible = []
+        for value in data.values():
+            if isinstance(value, Mapping) and (
+                "keypoint" in value or "skeleton" in value or "data" in value
+            ):
+                possible.append(value)
+
+        if possible:
+            annotations = possible
+
+    if annotations is None:
+        raise KeyError(
+            "No se encontró una lista de anotaciones. "
+            f"Claves disponibles: {list(data.keys())[:50]}"
+        )
+
+    if split_map is None:
+        raise KeyError(
+            "No se encontró el mapa 'split' dentro del PKL. "
+            f"Claves disponibles: {list(data.keys())[:50]}"
+        )
+
+    return annotations, split_map
+
+
+def sample_identifier(annotation: Mapping[str, Any], index: int) -> str:
+    for key in (
+        "frame_dir",
+        "filename",
+        "sample_name",
+        "name",
+        "id",
+        "video_id",
+    ):
+        value = annotation.get(key)
+        if value is not None:
+            return str(value)
+
+    return str(index)
+
+
+def annotation_label(annotation: Mapping[str, Any]) -> int:
+    for key in ("label", "action_label", "class", "target"):
+        if key in annotation:
+            label = int(annotation[key])
+            if not 0 <= label < CFG.num_classes:
+                raise ValueError(f"Etiqueta fuera de rango: {label}")
+            return label
+
+    raise KeyError(
+        f"No se encontró etiqueta en la anotación. Claves: {list(annotation.keys())}"
+    )
+
+
+def annotation_keypoints(annotation: Mapping[str, Any]) -> np.ndarray:
+    for key in (
+        "keypoint",
+        "keypoints",
+        "skeleton",
+        "skeletons",
+        "data",
+    ):
+        if key in annotation:
+            array = np.asarray(annotation[key], dtype=np.float32)
+            return array
+
+    raise KeyError(
+        "No se encontraron keypoints. "
+        f"Claves de la anotación: {list(annotation.keys())}"
+    )
+
+
+def resolve_split_keys(split_map: Mapping[str, Any], protocol: str) -> Tuple[str, str]:
+    keys = list(split_map.keys())
+    lower_to_original = {str(key).lower(): str(key) for key in keys}
+
+    train_candidates = [
+        f"{protocol}_train",
+        f"{protocol}train",
+        f"{protocol}-train",
+        f"train_{protocol}",
+    ]
+
+    val_candidates = [
+        f"{protocol}_val",
+        f"{protocol}_test",
+        f"{protocol}val",
+        f"{protocol}test",
+        f"{protocol}-val",
+        f"{protocol}-test",
+        f"val_{protocol}",
+        f"test_{protocol}",
+    ]
+
+    train_key = next(
+        (
+            lower_to_original[candidate]
+            for candidate in train_candidates
+            if candidate in lower_to_original
+        ),
+        None,
+    )
+
+    val_key = next(
+        (
+            lower_to_original[candidate]
+            for candidate in val_candidates
+            if candidate in lower_to_original
+        ),
+        None,
+    )
+
+    if train_key is None or val_key is None:
+        raise KeyError(
+            f"No pude resolver los splits de {protocol}.\n"
+            f"Claves disponibles: {keys}"
+        )
+
+    return train_key, val_key
+
+
+def normalize_split_members(members: Any) -> List[str]:
+    if isinstance(members, np.ndarray):
+        members = members.tolist()
+
+    if not isinstance(members, Sequence) or isinstance(members, (str, bytes)):
+        raise TypeError(f"Formato de split inesperado: {type(members)!r}")
+
+    return [str(value) for value in members]
+
+
+# ============================================================
+# PREPROCESAMIENTO
+# ============================================================
+
+def to_tmvc(keypoints: np.ndarray) -> np.ndarray:
+    """
+    Convierte formatos comunes a [T, M, V, C].
+
+    Formatos admitidos principalmente:
+    - [M, T, V, C]
+    - [T, M, V, C]
+    - [T, V, C]
+    """
+
+    x = np.asarray(keypoints, dtype=np.float32)
+
+    if x.ndim == 3:
+        # [T, V, C] -> [T, 1, V, C]
+        if x.shape[-1] not in (2, 3):
+            raise ValueError(f"Formato 3D no reconocido: {x.shape}")
+        x = x[:, None, :, :]
+
+    elif x.ndim == 4:
+        if x.shape[-1] not in (2, 3):
+            raise ValueError(f"Última dimensión inválida: {x.shape}")
+
+        # MMACTION usa normalmente [M, T, V, C].
+        if x.shape[0] <= 4 and x.shape[1] > 4:
+            x = np.transpose(x, (1, 0, 2, 3))
+
+        # Si shape[1] parece representar personas, ya es [T, M, V, C].
+        elif x.shape[1] <= 4 and x.shape[0] > 4:
+            pass
+
+        else:
+            # Heurística conservadora.
+            if x.shape[0] < x.shape[1]:
+                x = np.transpose(x, (1, 0, 2, 3))
+    else:
+        raise ValueError(f"Número de dimensiones no admitido: {x.shape}")
+
+    return x
+
+
+def temporal_indices(total_frames: int, target_frames: int) -> np.ndarray:
+    if total_frames <= 0:
+        return np.zeros((target_frames,), dtype=np.int64)
+
+    if total_frames == 1:
+        return np.zeros((target_frames,), dtype=np.int64)
+
+    return np.linspace(
+        0,
+        total_frames - 1,
+        num=target_frames,
+        dtype=np.float32,
+    ).round().astype(np.int64)
+
+
+def preprocess_keypoints(keypoints: np.ndarray) -> np.ndarray:
+    x = to_tmvc(keypoints)
+
+    # Coordenadas 2D -> añade Z=0.
+    if x.shape[-1] == 2:
+        zeros = np.zeros((*x.shape[:-1], 1), dtype=np.float32)
+        x = np.concatenate([x, zeros], axis=-1)
+
+    # Ajusta número de joints.
+    if x.shape[2] < CFG.joints:
+        pad = np.zeros(
+            (
+                x.shape[0],
+                x.shape[1],
+                CFG.joints - x.shape[2],
+                CFG.coords,
+            ),
+            dtype=np.float32,
+        )
+        x = np.concatenate([x, pad], axis=2)
+    else:
+        x = x[:, :, : CFG.joints, : CFG.coords]
+
+    # Ordena personas por energía de movimiento.
+    person_energy = np.sum(np.abs(x), axis=(0, 2, 3))
+    order = np.argsort(-person_energy)
+    x = x[:, order]
+
+    if x.shape[1] < CFG.persons:
+        pad = np.zeros(
+            (
+                x.shape[0],
+                CFG.persons - x.shape[1],
+                CFG.joints,
+                CFG.coords,
+            ),
+            dtype=np.float32,
+        )
+        x = np.concatenate([x, pad], axis=1)
+    else:
+        x = x[:, : CFG.persons]
+
+    # Muestreo uniforme a 16 frames.
+    indices = temporal_indices(x.shape[0], CFG.frames)
+    x = x[indices]
+
+    # Centro corporal: joint 0 de la primera persona.
+    center = x[:, 0:1, 0:1, :]
+    valid_center = np.any(np.abs(center) > 1e-8, axis=-1, keepdims=True)
+    centered = x - center
+    x = np.where(valid_center, centered, x)
+
+    # Preserva joints totalmente ausentes como cero.
+    valid_joint = np.any(np.abs(x) > 1e-8, axis=-1, keepdims=True)
+    x = np.where(valid_joint, x, 0.0)
+
+    # Normalización RMS por secuencia.
+    nonzero = np.abs(x) > 1e-8
+    if np.any(nonzero):
+        rms = float(np.sqrt(np.mean(np.square(x[nonzero]))) + 1e-6)
+        x = x / rms
+
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    return x.reshape(CFG.frames, -1).astype(np.float32)
+
+
+def build_samples(
+    data: Any,
+    protocol: str,
+    max_train: int,
+    max_val: int,
+    seed: int,
+) -> Tuple[List[Mapping[str, Any]], List[Mapping[str, Any]]]:
+    annotations, split_map = extract_annotations_and_split(data)
+    train_key, val_key = resolve_split_keys(split_map, protocol)
+
+    train_ids = set(normalize_split_members(split_map[train_key]))
+    val_ids = set(normalize_split_members(split_map[val_key]))
+
+    indexed: Dict[str, Mapping[str, Any]] = {}
+
+    for index, annotation in enumerate(annotations):
+        if not isinstance(annotation, Mapping):
+            continue
+        indexed[sample_identifier(annotation, index)] = annotation
+
+    train = [indexed[name] for name in train_ids if name in indexed]
+    val = [indexed[name] for name in val_ids if name in indexed]
+
+    missing_train = len(train_ids) - len(train)
+    missing_val = len(val_ids) - len(val)
+
+    if missing_train or missing_val:
+        log(
+            f"Advertencia: omitidos por falta de anotación: "
+            f"train={missing_train}, val={missing_val}"
+        )
+
+    rng = np.random.default_rng(seed)
+    rng.shuffle(train)
+
+    # Validación en orden fijo para comparabilidad.
+    val = sorted(
+        val,
+        key=lambda annotation: sample_identifier(annotation, 0),
+    )
+
+    if max_train > 0:
+        train = train[:max_train]
+
+    if max_val > 0:
+        val = val[:max_val]
+
+    if not train or not val:
+        raise RuntimeError(
+            f"Split vacío. train={len(train)}, val={len(val)}, "
+            f"keys=({train_key}, {val_key})"
+        )
+
+    log(
+        f"{protocol.upper()} | split keys: {train_key} / {val_key} | "
+        f"train={len(train)} | val={len(val)}"
+    )
+
+    return train, val
+
+
+class SkeletonDataset:
+    def __init__(self, samples: Sequence[Mapping[str, Any]]) -> None:
+        self.samples = list(samples)
+        self.cache: Dict[int, Tuple[np.ndarray, np.int32]] = {}
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> Tuple[np.ndarray, np.int32]:
+        cached = self.cache.get(index)
+        if cached is not None:
+            return cached
+
+        annotation = self.samples[index]
+        x = preprocess_keypoints(annotation_keypoints(annotation))
+        y = np.int32(annotation_label(annotation))
+
+        self.cache[index] = (x, y)
+        return x, y
+
+
+def batch_iterator(
+    dataset: SkeletonDataset,
+    batch_size: int,
+    shuffle: bool,
+    seed: int,
+    drop_last: bool,
+) -> Iterable[Tuple[np.ndarray, np.ndarray]]:
+    indices = np.arange(len(dataset))
+
+    if shuffle:
+        rng = np.random.default_rng(seed)
+        rng.shuffle(indices)
+
+    for start in range(0, len(indices), batch_size):
+        subset = indices[start : start + batch_size]
+
+        if drop_last and len(subset) < batch_size:
+            continue
+
+        xs: List[np.ndarray] = []
+        ys: List[np.int32] = []
+
+        for index in subset:
+            x, y = dataset[int(index)]
+            xs.append(x)
+            ys.append(y)
+
+        yield (
+            np.stack(xs).astype(np.float32),
+            np.asarray(ys, dtype=np.int32),
+        )
+
+
+# ============================================================
+# MODELO
+# ============================================================
+
+class HOPEModel(nn.Module):
+    mode: str
+    num_classes: int
+    model_dim: int
+    memory_dim: int
+    dropout: float
+    memory_residual_scale: float
+    initial_eta: float
+    initial_alpha: float
+
+    @nn.compact
+    def __call__(
+        self,
+        x: jnp.
