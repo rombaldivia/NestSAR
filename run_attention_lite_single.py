@@ -1,20 +1,73 @@
 #!/usr/bin/env python3
 """Run one validated Attention-Lite protocol on the full TPU8 slice.
 
-Use this entry point when running XSUB and XSET in two separate Kaggle TPU
-sessions/notebooks at the same time.  Each session gets its own complete TPU8
-runtime, preserving the validated 8-device topology instead of trying to split one
-Kaggle TPU slice into unsupported independent TPU4 jobs.
+This entry point is intentionally exclusive: one protocol owns the complete Kaggle
+TPU v5e-8 runtime. XSUB and XSET must therefore be run in separate TPU sessions or
+sequentially in one session. A short child-process TPU8 probe runs before source
+materialization/training so an occupied or non-TPU runtime fails immediately instead
+of silently falling back to CPU and spending time on model initialization.
 """
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 from experiments.attention_lite_v1.canonical_integrated import ensure_canonical_sources
 from nestsar_run import train
 
-RUNNER_API_VERSION = "attention-lite-single-v1-full-tpu8"
+RUNNER_API_VERSION = "attention-lite-single-v2-full-tpu8-preflight"
+
+
+def _force_tpu_environment() -> None:
+    """Make this TPU-locked production runner refuse JAX CPU fallback."""
+    # JAX_PLATFORM_NAME is a legacy selector and can override/autoinfluence backend
+    # choice. The production experiment is TPU-only, so remove it and explicitly
+    # request the TPU backend for every descendant process.
+    os.environ.pop("JAX_PLATFORM_NAME", None)
+    os.environ["JAX_PLATFORMS"] = "tpu"
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
+
+def _assert_full_tpu8_available() -> None:
+    """Probe the same Python/JAX environment used by the trainer in a child process."""
+    probe = r'''
+import jax
+backend = jax.default_backend()
+devices = list(jax.devices())
+print("TPU PREFLIGHT JAX:", jax.__version__, flush=True)
+print("TPU PREFLIGHT BACKEND:", backend, flush=True)
+print("TPU PREFLIGHT DEVICES:", len(devices), devices, flush=True)
+if backend != "tpu":
+    raise RuntimeError(f"Expected TPU backend, got {backend!r}")
+if len(devices) != 8:
+    raise RuntimeError(f"Expected 8 TPU devices, found {len(devices)}")
+print("FULL TPU8 PREFLIGHT: PASS", flush=True)
+'''
+    completed = subprocess.run(
+        [sys.executable, "-u", "-c", probe],
+        env=os.environ.copy(),
+        cwd=str(Path(__file__).resolve().parent),
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "FULL TPU8 PREFLIGHT FAILED. Training was NOT started.\n"
+            "If another NestSAR protocol is still training in this Kaggle session, "
+            "wait for it to finish before launching this one. If a previous run was "
+            "interrupted and no training should be active, restart the Kaggle session "
+            "to release stale TPU child processes, then run again."
+        )
+
+    # The probe owns libtpu only for a moment. Give its process a short release window
+    # before the real trainer initializes the same eight devices.
+    time.sleep(2.0)
 
 
 def main() -> int:
@@ -43,8 +96,12 @@ def main() -> int:
 
     print("=" * 108, flush=True)
     print(f"RUNNER API: {RUNNER_API_VERSION}", flush=True)
-    print(f"Protocol: {args.protocol.upper()} | full TPU8 | seed={args.seed}", flush=True)
+    print(f"Protocol: {args.protocol.upper()} | exclusive full TPU8 | seed={args.seed}", flush=True)
+    print("XSUB/XSET cannot share this TPU8 concurrently in one Kaggle session.", flush=True)
     print("=" * 108, flush=True)
+
+    _force_tpu_environment()
+    _assert_full_tpu8_available()
 
     sources = ensure_canonical_sources(verbose=True)
     source = Path(sources[args.protocol]).resolve()
