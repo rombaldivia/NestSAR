@@ -1,0 +1,75 @@
+name: Attention payload diagnostic
+
+on:
+  push:
+    branches:
+      - experiment/native-reframe-v1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Diagnose v3 XSUB chunks
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import base64, gzip, itertools, hashlib
+
+          root = Path('experiments/attention_lite_v1/canonical_payloads/v3')
+          parts = sorted(root.glob('xsub_*.b64'))
+          print('parts:', [(p.name, p.stat().st_size) for p in parts])
+          data = {p.name: p.read_text(encoding='ascii').strip() for p in parts}
+          for name, text in data.items():
+              print(name, 'start=', text[:16], 'end=', text[-16:], 'len=', len(text))
+
+          starters = [n for n,t in data.items() if t.startswith('H4sI')]
+          print('starters:', starters)
+          if not starters:
+              raise SystemExit('NO GZIP BASE64 STARTER')
+
+          def valid_source(text: str) -> bool:
+              markers = [
+                  'NESTSAR-HOPE-ATTENTION-LITE',
+                  'EXPECTED_PARAMS = 2_381_028',
+                  'EXPECTED_LEAVES = 705',
+                  'ATTENTION_DIM = 64',
+                  'ATTENTION_HEADS = 4',
+                  'REAL NTU120 XSUB',
+                  'TRAIN_EXPECTED = 63_026',
+                  'VAL_EXPECTED = 50_919',
+              ]
+              return all(m in text for m in markers)
+
+          # Try complete-set permutations with a fixed gzip-starting first chunk.
+          for first in starters:
+              rest = [n for n in data if n != first]
+              attempts = 0
+              for perm in itertools.permutations(rest):
+                  attempts += 1
+                  order = (first,) + perm
+                  encoded = ''.join(data[n] for n in order)
+                  try:
+                      raw = base64.b64decode(encoded, validate=True)
+                      text = gzip.decompress(raw).decode('utf-8')
+                  except Exception:
+                      continue
+                  print('DECODED ORDER:', order)
+                  print('source bytes:', len(text.encode('utf-8')))
+                  print('source sha256:', hashlib.sha256(text.encode()).hexdigest())
+                  print('valid markers:', valid_source(text))
+                  if valid_source(text):
+                      Path('/tmp/recovered_xsub.py').write_text(text, encoding='utf-8')
+                      print('VALID XSUB PAYLOAD ORDER FOUND')
+                      raise SystemExit(0)
+              print('attempts for', first, attempts)
+
+          raise SystemExit('NO VALID COMPLETE-SET PERMUTATION')
+          PY
