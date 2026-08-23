@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Fresh-process Kaggle entry point for Attention-Lite XSUB + XSET.
 
-Canonical sources are materialized from the repository-bundled artifact by
-`experiments.attention_lite_v1.source_resolver`, so Kaggle needs no separate
-Attention-Lite source input.  XSUB and XSET are then trained sequentially as two
-independent fresh models with the same requested seed/configuration.
+Canonical sources are reconstructed and SHA-verified entirely from files committed
+in this repository. Kaggle needs no separate Attention-Lite source input. XSUB and
+XSET are trained sequentially as two independent fresh models with the same
+requested seed/configuration.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import argparse
 from experiments.attention_lite_v1.source_resolver import resolve_both_sources
 from nestsar_run import train_both
 
-RUNNER_API_VERSION = "attention-lite-both-v3-repo-canonical"
+RUNNER_API_VERSION = "attention-lite-both-v4-sha-canonical"
 
 
 def main() -> int:
@@ -44,8 +44,7 @@ def main() -> int:
 
     print(f"RUNNER API: {RUNNER_API_VERSION}", flush=True)
 
-    # Resolve/materialize both sources before consuming TPU time. Explicit sources
-    # remain available for audit/debugging, but are not required for the normal run.
+    # Resolve BOTH exact canonical sources before consuming TPU time.
     sources = resolve_both_sources(
         xsub=args.xsub_source,
         xset=args.xset_source,
