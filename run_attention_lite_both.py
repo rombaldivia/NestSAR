@@ -74,7 +74,7 @@ def main() -> int:
     print("=" * 108, flush=True)
 
     if args.preflight_only:
-        print("PRELIGHT-ONLY REQUESTED — no TPU training started.", flush=True)
+        print("PREFLIGHT-ONLY REQUESTED — no TPU training started.", flush=True)
         return 0
 
     patience = None if args.patience == 0 else args.patience
