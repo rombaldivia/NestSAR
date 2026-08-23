@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """Fresh-process Kaggle entry point for Attention-Lite XSUB + XSET.
 
-Canonical sources are reconstructed and SHA-verified entirely from files committed
-in this repository. Kaggle needs no separate Attention-Lite source input. XSUB and
-XSET are trained sequentially as two independent fresh models with the same
-requested seed/configuration.
+The default path reconstructs the exact validated XSUB/XSET all-in-one trainers
+entirely from GitHub-committed payload data and verifies their SHA256 hashes before
+TPU training begins.  No separate Kaggle Attention-Lite source input is required.
 """
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
-from experiments.attention_lite_v1.source_resolver import resolve_both_sources
+from experiments.attention_lite_v1.canonical_integrated import ensure_canonical_sources
 from nestsar_run import train_both
 
-RUNNER_API_VERSION = "attention-lite-both-v4-sha-canonical"
+RUNNER_API_VERSION = "attention-lite-both-v5-exact-integrated"
 
 
 def main() -> int:
@@ -44,12 +44,20 @@ def main() -> int:
 
     print(f"RUNNER API: {RUNNER_API_VERSION}", flush=True)
 
-    # Resolve BOTH exact canonical sources before consuming TPU time.
-    sources = resolve_both_sources(
-        xsub=args.xsub_source,
-        xset=args.xset_source,
-        verbose=True,
-    )
+    if bool(args.xsub_source) != bool(args.xset_source):
+        raise ValueError("Pass both --xsub-source and --xset-source, or neither")
+
+    if args.xsub_source and args.xset_source:
+        sources = {
+            "xsub": Path(args.xsub_source).expanduser().resolve(),
+            "xset": Path(args.xset_source).expanduser().resolve(),
+        }
+        for protocol, path in sources.items():
+            if not path.is_file():
+                raise FileNotFoundError(f"Explicit {protocol.upper()} source does not exist: {path}")
+    else:
+        # Default/official path: exact GitHub-integrated canonical sources.
+        sources = ensure_canonical_sources(verbose=True)
 
     patience = None if args.patience == 0 else args.patience
     train_both(
