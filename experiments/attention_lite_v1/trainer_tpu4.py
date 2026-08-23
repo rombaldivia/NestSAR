@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Process-isolated TPU4 wrapper for the validated Attention-Lite trainer.
 
-This module intentionally does NOT import JAX.  It is launched in a process whose
-TPU visibility has already been restricted to exactly four chips.  The normal
+This module intentionally does NOT import JAX. It is launched in a process whose
+TPU visibility has already been restricted to exactly four chips. The normal
 Attention-Lite trainer then generates the same validated model/training source,
 with only runtime-topology guards changed from TPU8 to the four devices visible
 inside this process.
@@ -22,7 +22,7 @@ from .paths import make_run_paths, validate_protocol, validate_seed
 
 EXPECTED_ACTIVE_TPUS = 4
 
-# The wrapper process itself must never initialize JAX.  Changing this constant is
+# The wrapper process itself must never initialize JAX. Changing this constant is
 # enough for the launcher's batch-divisibility and manifest guards; the generated
 # trainer performs the actual JAX/TPU initialization in its child process.
 tr.EXPECTED_TPU_DEVICES = EXPECTED_ACTIVE_TPUS
@@ -41,8 +41,19 @@ def _replace_once(source: str, old: str, new: str, label: str) -> str:
 
 
 def _patch_tpu4_runtime(source: str) -> tuple[str, dict[str, int]]:
-    """Patch only runtime topology/metadata after the standard trainer patches."""
+    """Patch only runtime topology/storage metadata after standard trainer patches."""
     counts: dict[str, int] = {}
+    protocol = validate_protocol(os.environ.get("NESTSAR_PROTOCOL", "xsub"))
+
+    # The canonical all-in-one extracts embedded modules under one shared directory.
+    # Two concurrent OS processes must not write that directory at the same time.
+    old_root = 'ROOT = Path("/kaggle/working/NestSAR_HOPE_FIDELITY_UNIVERSAL")'
+    new_root = (
+        f'ROOT = Path("/kaggle/working/'
+        f'NestSAR_HOPE_FIDELITY_UNIVERSAL_{protocol.upper()}_PROC4")'
+    )
+    source = _replace_once(source, old_root, new_root, "protocol bundle extraction ROOT")
+    counts["protocol_root"] = 1
 
     # In this process jax.devices() MUST already expose exactly four devices because
     # the parent launcher restricted TPU visibility before Python/JAX startup.
@@ -68,9 +79,9 @@ def _patch_tpu4_runtime(source: str) -> tuple[str, dict[str, int]]:
         raise RuntimeError("Could not patch canonical TPU8 device guard to isolated TPU4")
     counts["device_guard"] = n
 
-    # Record the actual process-visible topology in result.json.  No physical/global
+    # Record the actual process-visible topology in result.json. No physical/global
     # TPU IDs are selected inside the generated source; it simply uses all devices
-    # visible to this isolated process, avoiding the global-id 4..7 collective bug.
+    # visible to this isolated process, avoiding the in-process global-id 4..7 bug.
     old_local_batch = '''    "local_batch":
         GLOBAL_BATCH
         //
@@ -105,10 +116,10 @@ def _patch_tpu4_runtime(source: str) -> tuple[str, dict[str, int]]:
         DEVICES
     )
 )'''
-    banner = marker + '''
+    banner = marker + f'''
 
 print(
-    "ISOLATED TPU4 PROCESS | visible device ids=",
+    "ISOLATED TPU4 PROCESS | protocol={protocol.upper()} | visible device ids=",
     [int(device.id) for device in DEVICES],
 )'''
     source = _replace_once(source, marker, banner, "TPU4 runtime banner")
@@ -121,7 +132,7 @@ print(
 def _patch_output_and_runtime(source: str, output: Path) -> tuple[str, int]:
     patched, output_count = _ORIGINAL_PATCH_OUTPUT(source, output)
     patched, runtime_counts = _patch_tpu4_runtime(patched)
-    # _patch_output's public contract returns an integer count.  Keep that contract;
+    # _patch_output's public contract returns an integer count. Keep that contract;
     # the generated source itself and final result guards prove the runtime patch.
     if any(value != 1 for value in runtime_counts.values()):
         raise RuntimeError(f"Unexpected TPU4 runtime patch counts: {runtime_counts}")
@@ -154,20 +165,27 @@ tr._patch_output = _patch_output_and_runtime
 tr._verify_result = _verify_result_tpu4
 
 
+def _paper_mode() -> bool:
+    return os.environ.get("NESTSAR_PAPER_MODE", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
+
+
 def main() -> int:
     protocol = validate_protocol(os.environ.get("NESTSAR_PROTOCOL", "xsub"))
+    paper_mode = _paper_mode()
     seed = validate_seed(
         int(os.environ.get("NESTSAR_SEED", "128")),
-        paper_mode=os.environ.get("NESTSAR_PAPER_MODE", "1").strip().lower()
-        not in {"0", "false", "no"},
+        paper_mode=paper_mode,
     )
     tag = os.environ.get("NESTSAR_RUN_TAG", "").strip() or None
     root = make_run_paths(
         protocol,
         seed,
         base_dir=os.environ.get("NESTSAR_RUNS_ROOT", "/kaggle/working"),
-        paper_mode=os.environ.get("NESTSAR_PAPER_MODE", "1").strip().lower()
-        not in {"0", "false", "no"},
+        paper_mode=paper_mode,
         tag=tag,
         create=True,
     ).root
@@ -179,7 +197,7 @@ def main() -> int:
     print(f"Output: {root}", flush=True)
     print("=" * 108, flush=True)
 
-    # tr.main() generates the source and spawns the actual JAX process.  This wrapper
+    # tr.main() generates the source and spawns the actual JAX process. This wrapper
     # has not imported JAX, so it does not acquire any TPU device itself.
     return int(tr.main())
 
