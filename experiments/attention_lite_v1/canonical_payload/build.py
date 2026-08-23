@@ -3,9 +3,9 @@
 
 The repository stores one compressed canonical XSUB source in small base64 chunks.
 XSUB is reconstructed byte-for-byte and SHA256-verified. XSET is then derived from
-that exact source using the protocol-only replacements recovered from the validated
-notebook, and is independently SHA256-verified. Both files are syntax-compiled before
-being exposed to the trainer.
+that exact source using only the protocol-specific replacements recovered from the
+validated trainers, and is independently SHA256-verified. Both files are syntax-
+compiled before being exposed to the trainer.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import lzma
 from pathlib import Path
 
 XSUB_SHA256 = "e1080c4e02af96cf9dd0562415e73374d9d582ffa5e74c389ca3e47a05549aa6"
-XSET_SHA256 = "8a446753a85bb8edba9c4c033cb49e7a9ebbbb317832c533d0f514b90720af0b"
+XSET_SHA256 = "8b6bffc91840055c84b0415bfd2c28cefc815d4a087c712c9e2d369c89541c07"
 NUM_XSUB_PARTS = 8
 
 HERE = Path(__file__).resolve().parent
@@ -94,8 +94,6 @@ XSET_REPLACEMENTS = (
     ),
 )
 
-XSUB_TRAILING_ONLY = '\nprint("=" * 132)'
-
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -139,12 +137,8 @@ def _derive_xset(xsub_text: str) -> str:
             )
         text = text.replace(old, new, 1)
 
-    if not text.endswith(XSUB_TRAILING_ONLY):
-        raise RuntimeError(
-            "Attention-Lite XSET trailing-line derivation guard failed: "
-            "validated XSUB source does not end with the expected separator print"
-        )
-    text = text[:-len(XSUB_TRAILING_ONLY)]
+    # IMPORTANT: the validated XSET all-in-one file retains the same trailing
+    # separator print as XSUB. Do not truncate it; doing so changes the exact SHA.
     return text
 
 
@@ -198,7 +192,7 @@ def ensure_canonical_sources(*, verbose: bool = False) -> dict[str, Path]:
     )
 
     xset_text = _derive_xset(xsub_text)
-    _validate_source(
+    xset_bytes = _validate_source(
         xset_text,
         protocol="xset",
         expected_sha256=XSET_SHA256,
@@ -211,9 +205,14 @@ def ensure_canonical_sources(*, verbose: bool = False) -> dict[str, Path]:
     if not xsub_path.is_file() or xsub_path.read_bytes() != xsub_bytes:
         xsub_path.write_bytes(xsub_bytes)
 
-    xset_bytes = xset_text.encode("utf-8")
     if not xset_path.is_file() or xset_path.read_bytes() != xset_bytes:
         xset_path.write_bytes(xset_bytes)
+
+    # Read back and re-check exact bytes so partial writes cannot pass preflight.
+    if _sha256(xsub_path.read_bytes()) != XSUB_SHA256:
+        raise RuntimeError("Written XSUB canonical source failed SHA256 read-back")
+    if _sha256(xset_path.read_bytes()) != XSET_SHA256:
+        raise RuntimeError("Written XSET canonical source failed SHA256 read-back")
 
     if verbose:
         print("=" * 108, flush=True)
