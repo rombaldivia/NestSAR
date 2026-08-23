@@ -1,0 +1,49 @@
+name: attention-lite-canonical
+
+on:
+  push:
+    branches: [experiment/native-reframe-v1]
+  workflow_dispatch:
+
+jobs:
+  canonical-selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Diagnose repository payload
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import base64, gzip
+          d = Path('experiments/attention_lite_v1/canonical_payloads/v2')
+          names = [f'xset_{i:02d}.b64' for i in range(1,5)]
+          parts = [d.joinpath(n).read_text(encoding='ascii').strip() for n in names]
+          print('part_lengths=', [len(x) for x in parts])
+          encoded = ''.join(parts)
+          print('total_length=', len(encoded))
+          print('prefix=', encoded[:16])
+          print('suffix=', encoded[-16:])
+          try:
+              raw = base64.b64decode(encoded, validate=True)
+              print('base64=PASS bytes=', len(raw), 'gzip_magic=', raw[:2])
+          except Exception as exc:
+              print('base64=FAIL', type(exc).__name__, repr(exc))
+              raise
+          try:
+              text = gzip.decompress(raw).decode('utf-8')
+              print('gzip=PASS chars=', len(text))
+              print('has_bundle=', 'BUNDLE_B64' in text)
+          except Exception as exc:
+              print('gzip=FAIL', type(exc).__name__, repr(exc))
+              raise
+          PY
+
+      - name: Run canonical selftest
+        run: python -m experiments.attention_lite_v1.canonical_selftest
