@@ -4,22 +4,32 @@
 Resolution order:
 1. explicit path / environment override;
 2. repository-bundled canonical payload (zero extra Kaggle input required);
-3. external Kaggle/repository source discovery as a compatibility fallback.
+3. external Kaggle source discovery as a compatibility fallback.
 
-The repository payload stores the exact validated XSET all-in-one source as a
-split gzip+base64 artifact.  XSUB is materialized deterministically from that
+The repository payload stores the validated XSET all-in-one source as a split
+base64-encoded gzip artifact. XSUB is materialized deterministically from that
 source by changing only protocol-specific text/constants *outside* the embedded
-BUNDLE_B64 v4.1 model bundle.  The embedded bundle is kept byte-for-byte
-identical.  Both materialized sources must pass the architecture fingerprint,
-protocol-specific schedule guards, and Python compilation before use.
+BUNDLE_B64 v4.1 model bundle. The embedded bundle is kept byte-for-byte
+identical.
+
+Important safety properties:
+- the embedded v4.1 bundle must match its known SHA-256;
+- the generated source must contain the locked architecture/schedule guards;
+- the generated source must compile as Python;
+- fallback discovery is forbidden from selecting this resolver/package itself;
+- if the repository gzip wrapper has a damaged CRC/footer, a raw-DEFLATE
+  recovery path is allowed only when the recovered Python source and embedded
+  model bundle pass all validation guards.
 """
 from __future__ import annotations
 
 import base64
 import gzip
+import hashlib
 import json
 import os
 import re
+import zlib
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -72,8 +82,12 @@ TEXT_SUFFIXES = {".py", ".txt"}
 NOTEBOOK_SUFFIXES = {".ipynb"}
 MAX_GENERIC_FILE_BYTES = 12 * 1024 * 1024
 
-# Repository-bundled canonical artifact.  These four chunks together contain
-# gzip(base64(exact validated XSET all-in-one source)).
+EXPECTED_EMBEDDED_BUNDLE_SHA256 = (
+    "c720c2afd9c32648ece4ac4b23e916f325039ba41684ebe4127ae285c6e216dd"
+)
+
+# Repository-bundled canonical artifact. These four chunks together contain
+# base64(gzip(validated XSET all-in-one source)).
 BUNDLED_PAYLOAD_DIR = Path(__file__).resolve().parent / "canonical_payloads" / "v2"
 BUNDLED_XSET_PARTS = tuple(f"xset_{i:02d}.b64" for i in range(1, 5))
 BUNDLED_XSET_B64_LENGTH = 50_020
@@ -101,6 +115,22 @@ def _extract_embedded_bundle(text: str) -> str:
     return text[match.end():end]
 
 
+def _validate_embedded_bundle(text: str, *, origin: str) -> None:
+    bundle_b64 = _extract_embedded_bundle(text)
+    compact = "".join(bundle_b64.split())
+    try:
+        raw = base64.b64decode(compact, validate=True)
+    except Exception as exc:
+        raise RuntimeError(f"{origin}: embedded BUNDLE_B64 is not valid base64") from exc
+
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != EXPECTED_EMBEDDED_BUNDLE_SHA256:
+        raise RuntimeError(
+            f"{origin}: embedded v4.1 bundle SHA-256 mismatch: "
+            f"{digest} != {EXPECTED_EMBEDDED_BUNDLE_SHA256}"
+        )
+
+
 def validate_canonical_source_text(text: str, protocol: str, *, origin: str = "source") -> None:
     p = _protocol(protocol)
     missing = [marker for marker in _source_markers(p) if marker not in text]
@@ -109,7 +139,83 @@ def validate_canonical_source_text(text: str, protocol: str, *, origin: str = "s
             f"{origin} is not the validated Attention-Lite {p.upper()} all-in-one source. "
             f"Missing markers: {', '.join(missing)}"
         )
+    _validate_embedded_bundle(text, origin=origin)
     compile(text, origin, "exec")
+
+
+def _raw_deflate_from_gzip(blob: bytes) -> bytes:
+    """Return the raw DEFLATE payload from a gzip member without checking CRC.
+
+    This is used only as a recovery path if Python's strict gzip decoder rejects
+    the wrapper/footer. The recovered source still has to pass source compilation,
+    protocol guards and the exact embedded-bundle SHA-256 check.
+    """
+    if len(blob) < 18 or blob[:2] != b"\x1f\x8b" or blob[2] != 8:
+        raise RuntimeError("repository payload is not a supported gzip member")
+
+    flags = blob[3]
+    pos = 10
+
+    if flags & 0x04:  # FEXTRA
+        if pos + 2 > len(blob) - 8:
+            raise RuntimeError("truncated gzip FEXTRA length")
+        xlen = int.from_bytes(blob[pos:pos + 2], "little")
+        pos += 2 + xlen
+
+    if flags & 0x08:  # FNAME
+        end = blob.find(b"\x00", pos, len(blob) - 8)
+        if end < 0:
+            raise RuntimeError("truncated gzip FNAME")
+        pos = end + 1
+
+    if flags & 0x10:  # FCOMMENT
+        end = blob.find(b"\x00", pos, len(blob) - 8)
+        if end < 0:
+            raise RuntimeError("truncated gzip FCOMMENT")
+        pos = end + 1
+
+    if flags & 0x02:  # FHCRC
+        pos += 2
+
+    if pos >= len(blob) - 8:
+        raise RuntimeError("gzip member has no DEFLATE body")
+
+    return blob[pos:-8]
+
+
+def _decode_repository_payload(encoded: str) -> str:
+    try:
+        compressed = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise RuntimeError(f"repository XSET payload base64 decode failed: {exc}") from exc
+
+    if compressed[:2] != b"\x1f\x8b":
+        raise RuntimeError("repository XSET payload decoded, but gzip magic is missing")
+
+    strict_error: Exception | None = None
+    try:
+        return gzip.decompress(compressed).decode("utf-8")
+    except Exception as exc:
+        strict_error = exc
+
+    # Recovery for a damaged gzip wrapper/footer. We never trust recovery by
+    # itself: validate_canonical_source_text() performs the strong source and
+    # embedded-bundle checks immediately after this function returns.
+    try:
+        body = _raw_deflate_from_gzip(compressed)
+        recovered = zlib.decompress(body, -zlib.MAX_WBITS).decode("utf-8")
+    except Exception as recovery_exc:
+        raise RuntimeError(
+            "repository XSET payload could not be decoded. "
+            f"strict gzip error={strict_error!r}; raw-deflate recovery error={recovery_exc!r}"
+        ) from recovery_exc
+
+    print(
+        "ATTENTION-LITE PAYLOAD: strict gzip wrapper check failed, but raw-DEFLATE "
+        "recovery succeeded; validating exact embedded bundle and source guards...",
+        flush=True,
+    )
+    return recovered
 
 
 def _read_bundled_xset_text() -> str:
@@ -119,23 +225,21 @@ def _read_bundled_xset_text() -> str:
             "Repository canonical XSET payload is incomplete. Missing: " + ", ".join(missing)
         )
 
-    encoded = "".join(
+    parts = [
         (BUNDLED_PAYLOAD_DIR / name).read_text(encoding="ascii").strip()
         for name in BUNDLED_XSET_PARTS
-    )
+    ]
+    encoded = "".join(parts)
+
     if len(encoded) != BUNDLED_XSET_B64_LENGTH:
         raise RuntimeError(
-            f"Repository XSET payload length mismatch: {len(encoded)} != {BUNDLED_XSET_B64_LENGTH}"
+            f"Repository XSET payload length mismatch: {len(encoded)} != {BUNDLED_XSET_B64_LENGTH}; "
+            f"part lengths={[len(x) for x in parts]}"
         )
     if not encoded.startswith("H4sI"):
         raise RuntimeError("Repository XSET payload does not look like gzip+base64")
 
-    try:
-        compressed = base64.b64decode(encoded, validate=True)
-        text = gzip.decompress(compressed).decode("utf-8")
-    except Exception as exc:
-        raise RuntimeError("Could not decode repository XSET canonical payload") from exc
-
+    text = _decode_repository_payload(encoded)
     validate_canonical_source_text(text, "xset", origin="repo-bundled XSET")
     return text
 
@@ -180,8 +284,7 @@ def _xset_to_xsub_outside_bundle(xset_text: str) -> str:
     for old, new, label in exact_changes:
         outside = _replace_exact_once(outside, old, new, label)
 
-    # Human-readable comments/prints; these do not affect the computation but keep
-    # provenance self-consistent.  Their presence/count is not used as a hard guard.
+    # Human-readable comments/prints only.
     outside = outside.replace("54,468", "63,026")
     outside = outside.replace("59,477", "50,919")
     outside = outside.replace("68,120", "78,800")
@@ -190,7 +293,6 @@ def _xset_to_xsub_outside_bundle(xset_text: str) -> str:
     prefix, suffix = outside.split("\0BUNDLE\0", 1)
     xsub_text = prefix + bundle_section + suffix
 
-    # Strong safety property: protocol materialization must never alter the model bundle.
     if _extract_embedded_bundle(xsub_text) != _extract_embedded_bundle(xset_text):
         raise RuntimeError("XSUB materialization changed BUNDLE_B64; refusing to continue")
 
@@ -203,7 +305,7 @@ def materialize_repo_canonical_sources(
     *,
     verbose: bool = True,
 ) -> dict[str, Path]:
-    """Decode the repository artifact and emit validated executable XSUB/XSET files."""
+    """Decode repository artifact and emit validated executable XSUB/XSET files."""
     cache = Path(cache_dir).expanduser()
     cache.mkdir(parents=True, exist_ok=True)
 
@@ -215,7 +317,6 @@ def materialize_repo_canonical_sources(
     for p, text in texts.items():
         target = cache / CANONICAL_FILENAMES[p]
         target.write_text(text, encoding="utf-8")
-        # Read back and validate so a filesystem/write issue cannot pass preflight.
         written = target.read_text(encoding="utf-8")
         validate_canonical_source_text(written, p, origin=str(target))
         result[p] = target.resolve()
@@ -290,9 +391,19 @@ def _walk_exact(roots: Iterable[Path], filename: str) -> list[Path]:
     return found
 
 
-def _generic_candidates(roots: Iterable[Path]) -> list[Path]:
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _generic_candidates(roots: Iterable[Path], *, excluded_repo_root: Path | None = None) -> list[Path]:
     found: list[Path] = []
     seen: set[str] = set()
+    canonical_dir = Path(__file__).resolve().parent / "canonical"
+
     for root in roots:
         if not root.exists():
             continue
@@ -300,6 +411,14 @@ def _generic_candidates(roots: Iterable[Path]) -> list[Path]:
             for path in root.rglob("*"):
                 if not path.is_file() or path.suffix.lower() not in (TEXT_SUFFIXES | NOTEBOOK_SUFFIXES):
                     continue
+
+                # Never let a marker-rich implementation/helper file masquerade as
+                # the canonical trainer. Repo-local generic discovery is allowed only
+                # in the dedicated canonical/ directory.
+                if excluded_repo_root is not None and _is_within(path, excluded_repo_root):
+                    if not _is_within(path, canonical_dir):
+                        continue
+
                 try:
                     if path.stat().st_size > MAX_GENERIC_FILE_BYTES:
                         continue
@@ -339,6 +458,7 @@ def _try_generic_candidate(path: Path, protocol: str, cache: Path) -> Optional[P
 def _resolve_external_source(protocol: str, cache: Path, *, verbose: bool) -> Path:
     p = _protocol(protocol)
     repo_dir = Path(__file__).resolve().parent
+    repo_root = repo_dir.parents[1]
     roots = (
         repo_dir / "canonical",
         Path("/kaggle/input"),
@@ -349,6 +469,10 @@ def _resolve_external_source(protocol: str, cache: Path, *, verbose: bool) -> Pa
     rejected: list[str] = []
 
     for candidate in _walk_exact(roots, exact):
+        # Same exclusion for exact-name files: a repo implementation file may not
+        # substitute for the canonical source unless it is under canonical/.
+        if _is_within(candidate, repo_root) and not _is_within(candidate, repo_dir / "canonical"):
+            continue
         try:
             result = _read_text_source(candidate, p, cache)
         except Exception as exc:
@@ -360,6 +484,8 @@ def _resolve_external_source(protocol: str, cache: Path, *, verbose: bool) -> Pa
 
     for notebook_name in NOTEBOOK_HINTS[p]:
         for candidate in _walk_exact(roots, notebook_name):
+            if _is_within(candidate, repo_root) and not _is_within(candidate, repo_dir / "canonical"):
+                continue
             result = _extract_notebook(candidate, p, cache)
             if result is not None:
                 if verbose:
@@ -367,7 +493,7 @@ def _resolve_external_source(protocol: str, cache: Path, *, verbose: bool) -> Pa
                 return result
 
     scanned = 0
-    for candidate in _generic_candidates(roots):
+    for candidate in _generic_candidates(roots, excluded_repo_root=repo_root):
         scanned += 1
         result = _try_generic_candidate(candidate, p, cache)
         if result is not None:
@@ -394,7 +520,6 @@ def resolve_canonical_source(
     p = _protocol(protocol)
     cache = Path(cache_dir).expanduser()
 
-    # Explicit source always wins.
     if explicit is not None:
         path = Path(explicit).expanduser()
         if not path.is_file():
@@ -417,7 +542,6 @@ def resolve_canonical_source(
     if env_value:
         return resolve_canonical_source(p, env_value, cache_dir=cache, verbose=verbose)
 
-    # Zero-input default: build both sources from the repository artifact.
     try:
         bundled = materialize_repo_canonical_sources(cache, verbose=verbose)
         return bundled[p]
@@ -441,7 +565,6 @@ def resolve_both_sources(
     xset: str | Path | None = None,
     verbose: bool = True,
 ) -> dict[str, Path]:
-    # If neither is explicit, materialize once so the bundle is decoded only once.
     if xsub is None and xset is None:
         try:
             return materialize_repo_canonical_sources(verbose=verbose)
