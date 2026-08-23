@@ -4,8 +4,6 @@ Versioned **NestSAR-HOPE-Attention-Lite D128** TPU v5e-8 experiment for NTU120 r
 
 ## Golden architecture — frozen
 
-The architecture remains fixed:
-
 - 16 frames
 - D128
 - Attention D64 / H4 / Dh16
@@ -39,145 +37,56 @@ eval_batch                 32
 
 Paper seeds: `28, 42, 128, 2026`. Use the same seed set and training recipe for XSUB and XSET when computing final mean ± std.
 
-## Exact-source safety rule
+## Canonical sources are embedded in GitHub
 
-The validated XSUB/XSET all-in-one sources remain the mathematical source of truth. The repository wrapper does **not** approximate or silently rebuild them from another architecture.
+Kaggle no longer needs a separate Attention-Lite source input.
 
-Expected Python source filenames:
-
-```text
-NestSAR_HOPE_Attention_Lite_TPUv5e8_XSUB_E40_ALL_IN_ONE.py
-NestSAR_HOPE_Attention_Lite_TPUv5e8_XSET_E40_ALL_IN_ONE.py
-```
-
-The launcher now runs `source_resolver.py` **before** starting a child process. It searches `/kaggle/input`, `/kaggle/working`, the current directory, and the repository canonical folder. It also supports extracting a complete all-in-one code cell from known one-cell notebook inputs, including:
+The repository contains the exact validated XSUB source as an LZMA/base64 payload under:
 
 ```text
-NestSAR_HOPE_Attention_Lite_TPUv5e8_XSET_E40_ONE_CELL.ipynb
+experiments/attention_lite_v1/canonical_payload/xsub/
 ```
 
-A source must contain the protocol-specific Attention-Lite golden markers (including the embedded source bundle and parameter guards) or it is rejected. If neither exact source is attached, the run stops immediately with an explicit `FileNotFoundError` instead of a generic `CalledProcessError`.
+`canonical_payload/build.py` reconstructs the source byte-for-byte and verifies:
 
-Preflight both sources from Kaggle:
-
-```python
-from experiments.attention_lite_v1.source_resolver import resolve_both_sources
-sources = resolve_both_sources()
-print(sources)
+```text
+XSUB SHA256 e1080c4e02af96cf9dd0562415e73374d9d582ffa5e74c389ca3e47a05549aa6
+XSET SHA256 8a446753a85bb8edba9c4c033cb49e7a9ebbbb317832c533d0f514b90720af0b
 ```
+
+The validated XSET source is derived from the exact XSUB source using guarded protocol-only replacements recovered from the validated notebook. Both sources are independently SHA256-checked, checked for the 2,381,028-parameter / 705-leaf / D64-H4 architecture markers, and Python-compiled before training.
+
+The fresh-process runner automatically materializes both sources:
+
+```bash
+python -u run_attention_lite_both.py --seed 28 --epochs 40 --patience 12
+```
+
+No `--xsub-source` or `--xset-source` is required for normal Kaggle use.
 
 ## Independent XSUB + XSET models
 
-`train_both()` runs **two independent models sequentially** on the full TPU8. XSUB finishes first; XSET then starts in a fresh Python subprocess from a fresh initialization with the same requested seed. XSET never inherits XSUB weights.
+`run_attention_lite_both.py` and `train_both()` run **two independent models sequentially** on the full TPU8. XSUB finishes first; XSET then starts in a fresh Python subprocess from a fresh initialization with the same requested seed. XSET never inherits XSUB weights.
 
-```python
-from nestsar_run import train_both
+Editable training parameters include patience, dropout, learning rate, weight decay, warmup fraction, label smoothing, gradient clipping, predictive-loss weight, initial eta/alpha, batch size, gradient accumulation, and evaluation batch size. Architecture-defining values remain frozen.
 
-train_both(
-    "attention_lite",
-    seed=28,
-    epochs=40,
-    patience=12,
-    dropout=0.22,
-    learning_rate=1e-3,
-    weight_decay=0.05,
-    warmup_fraction=0.10,
-    label_smoothing=0.05,
-    grad_clip=1.0,
-    predictive_loss_weight=0.10,
-    initial_eta=0.02,
-    initial_alpha=0.95,
-    batch_size=32,
-    grad_accum_steps=4,
-    eval_batch_size=32,
-    run_tag="p12",
-    dataset="auto",
-)
-```
-
-If auto-discovery cannot find the sources, pass them explicitly:
-
-```python
-train_both(
-    "attention_lite",
-    xsub_source="/kaggle/input/<dataset>/NestSAR_HOPE_Attention_Lite_TPUv5e8_XSUB_E40_ALL_IN_ONE.py",
-    xset_source="/kaggle/input/<dataset>/NestSAR_HOPE_Attention_Lite_TPUv5e8_XSET_E40_ALL_IN_ONE.py",
-    seed=28,
-    epochs=40,
-)
-```
-
-## One-protocol API
-
-```python
-from nestsar_run import train
-
-train(
-    "attention_lite",
-    protocol="xsub",
-    seed=28,
-    epochs=40,
-    patience=12,
-    dropout=0.22,
-    learning_rate=1e-3,
-    weight_decay=0.05,
-    warmup_fraction=0.10,
-    label_smoothing=0.05,
-    grad_clip=1.0,
-    predictive_loss_weight=0.10,
-    initial_eta=0.02,
-    initial_alpha=0.95,
-    batch_size=32,
-    grad_accum_steps=4,
-    eval_batch_size=32,
-    run_tag="p12",
-    dataset="auto",
-)
-```
-
-`patience=None` or `patience=0` disables early stopping. Architecture-defining values (frames, model width, attention width/heads, parameter tree) are intentionally not exposed.
-
-CLI supports `--protocol xsub`, `--protocol xset`, or `--protocol both`, plus the same training hyperparameter overrides.
-
-## Output structure
-
-Golden run example:
+Example output folders:
 
 ```text
-/kaggle/working/NestSAR_HOPE_Attention_Lite_D128_XSUB_SEED_28/
+/kaggle/working/NestSAR_HOPE_Attention_Lite_D128_XSUB_SEED_28_paper_p12/
+/kaggle/working/NestSAR_HOPE_Attention_Lite_D128_XSET_SEED_28_paper_p12/
 ```
-
-Tagged custom run example:
-
-```text
-/kaggle/working/NestSAR_HOPE_Attention_Lite_D128_XSUB_SEED_28_p12/
-```
-
-Each run contains the canonical checkpoint/result files plus:
-
-```text
-generated_source/
-logs/train.log
-metadata/paths.json
-metadata/run_manifest.json
-```
-
-A custom training configuration without `run_tag=` receives a stable `CUSTOM_<hash>` suffix to prevent accidental overwrite of a golden result.
 
 ## Four-seed summary
 
-Golden, untagged runs can be aggregated with:
+For a tagged reproducibility recipe:
 
 ```bash
-python -m experiments.attention_lite_v1.multiseed_summary
+python -m experiments.attention_lite_v1.multiseed_summary --run-tag paper_p12
 ```
 
-which writes:
-
-```text
-/kaggle/working/NestSAR_HOPE_Attention_Lite_D128_4SEED_SUMMARY.json
-```
+Do not mix runs trained with different stopping or optimization recipes in the same mean ± std table.
 
 ## Merge gate
 
-Do not merge this experiment runner to `main` until an actual TPU smoke/probe verifies that the generated source reproduces the golden Attention-Lite architecture and expected learning behavior. Static source validation and Python compilation are necessary but not substitutes for TPU parity.
+Do not merge this experiment runner to `main` until an actual TPU smoke/probe verifies the generated source and expected learning behavior. Static SHA256, marker, and Python compilation checks are strong source-integrity guards but are not substitutes for TPU runtime parity.
