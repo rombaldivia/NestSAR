@@ -2,7 +2,7 @@
 """Static preflight for the dual-T4 Attention-Lite runtime adapter.
 
 No JAX runtime is created here. The test reconstructs both canonical protocol
-sources, applies the single-T4 hardware-only patch, verifies that each patched
+sources, applies the single-T4 hardware/output patch, verifies that each patched
 source compiles, and checks the runtime markers needed by the dual-GPU launcher.
 """
 from __future__ import annotations
@@ -40,14 +40,15 @@ def main() -> int:
 
         compile(patched, f"<t4-{protocol}-selftest>", "exec")
 
-        required = {
-            "protocol_root",
-            "backend_guard",
-            "device_guard",
-            "result_runtime_metadata",
-            "runtime_banner",
+        expected_counts = {
+            "protocol_root": 1,
+            "backend_guard": 1,
+            "device_guard": 1,
+            "result_runtime_metadata": 1,
+            "runtime_banner": 1,
+            "tqdm_quiet": 2,
         }
-        if set(counts) != required or any(counts[key] != 1 for key in required):
+        if counts != expected_counts:
             raise RuntimeError(
                 f"{protocol.upper()} T4 patch-count guard failed: {counts}"
             )
@@ -57,6 +58,8 @@ def main() -> int:
             "Expected exactly 1 process-visible GPU",
             '"runtime_topology":\n        "isolated_single_t4"',
             f"NestSAR_HOPE_FIDELITY_UNIVERSAL_{protocol.upper()}_T4",
+            "NOTEBOOK OUTPUT MODE: QUIET",
+            "disable=True",
         )
         missing = [marker for marker in markers if marker not in patched]
         if missing:
@@ -72,6 +75,8 @@ def main() -> int:
 
     print("=" * 108, flush=True)
     print("NESTSAR ATTENTION-LITE DUAL-T4 STATIC SELFTEST: PASS", flush=True)
+    print("Per-batch tqdm output: DISABLED", flush=True)
+    print("Epoch train/validation summaries: RETAINED", flush=True)
     print("No JAX/CUDA runtime was initialized by this test.", flush=True)
     print("=" * 108, flush=True)
     return 0
