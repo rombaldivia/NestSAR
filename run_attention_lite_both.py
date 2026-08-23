@@ -3,7 +3,7 @@
 
 The default path reconstructs the exact validated XSUB/XSET all-in-one trainers
 entirely from GitHub-committed payload data and verifies their SHA256 hashes before
-TPU training begins.  No separate Kaggle Attention-Lite source input is required.
+TPU training begins. No separate Kaggle Attention-Lite source input is required.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pathlib import Path
 from experiments.attention_lite_v1.canonical_integrated import ensure_canonical_sources
 from nestsar_run import train_both
 
-RUNNER_API_VERSION = "attention-lite-both-v5-exact-integrated"
+RUNNER_API_VERSION = "attention-lite-both-v6-exact-integrated"
 
 
 def main() -> int:
@@ -26,6 +26,11 @@ def main() -> int:
     parser.add_argument("--run-tag", default=None)
     parser.add_argument("--xsub-source", default=None)
     parser.add_argument("--xset-source", default=None)
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Reconstruct and SHA-verify both GitHub canonical sources, then exit without training.",
+    )
 
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
@@ -57,7 +62,20 @@ def main() -> int:
                 raise FileNotFoundError(f"Explicit {protocol.upper()} source does not exist: {path}")
     else:
         # Default/official path: exact GitHub-integrated canonical sources.
+        # The builder reconstructs exact XSUB from committed LZMA+base64 chunks,
+        # derives exact XSET with guarded protocol-only edits, verifies BOTH complete
+        # source SHA256 hashes, and syntax-compiles both trainers before returning.
         sources = ensure_canonical_sources(verbose=True)
+
+    print("=" * 108, flush=True)
+    print("ATTENTION-LITE BOTH-PROTOCOL CANONICAL PREFLIGHT: PASS", flush=True)
+    print(f"XSUB source: {sources['xsub']}", flush=True)
+    print(f"XSET source: {sources['xset']}", flush=True)
+    print("=" * 108, flush=True)
+
+    if args.preflight_only:
+        print("PRELIGHT-ONLY REQUESTED — no TPU training started.", flush=True)
+        return 0
 
     patience = None if args.patience == 0 else args.patience
     train_both(
