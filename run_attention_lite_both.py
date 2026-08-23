@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """Fresh-process Kaggle entry point for Attention-Lite XSUB + XSET runs.
 
-Use this script from a notebook shell/subprocess instead of importing ``nestsar_run``
-into a long-lived Jupyter kernel. That avoids stale-module problems after ``git reset``
-or ``git pull``.
+The exact validated XSUB source is embedded in this repository as a compressed,
+SHA256-guarded payload. XSET is deterministically derived from the validated XSUB
+source with protocol-only replacements and independently SHA256-guarded.
+
+This entry point materializes and validates both canonical sources before training,
+so Kaggle does not need separate Attention-Lite source inputs.
 """
 from __future__ import annotations
 
 import argparse
 
+from experiments.attention_lite_v1.canonical_payload import ensure_canonical_sources
 from nestsar_run import train_both
 
-RUNNER_API_VERSION = "attention-lite-both-v1"
+RUNNER_API_VERSION = "attention-lite-both-v2-embedded-canonical"
 
 
 def main() -> int:
@@ -42,11 +46,17 @@ def main() -> int:
 
     print(f"RUNNER API: {RUNNER_API_VERSION}", flush=True)
 
+    # Default path: build the exact canonical sources from the committed payload.
+    # Explicit --xsub-source/--xset-source remain available for audit/debugging.
+    embedded = ensure_canonical_sources(verbose=True)
+    xsub_source = args.xsub_source or embedded["xsub"]
+    xset_source = args.xset_source or embedded["xset"]
+
     patience = None if args.patience == 0 else args.patience
     train_both(
         "attention_lite",
-        xsub_source=args.xsub_source,
-        xset_source=args.xset_source,
+        xsub_source=xsub_source,
+        xset_source=xset_source,
         seed=args.seed,
         epochs=args.epochs,
         patience=patience,
