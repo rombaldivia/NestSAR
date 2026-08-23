@@ -2,12 +2,14 @@
 """Single-GPU T4 runtime adapter for validated Attention-Lite.
 
 The canonical XSUB/XSET source remains the mathematical source of truth. This
-adapter changes only the hardware runtime assumptions that are TPU-specific:
+adapter changes only hardware/runtime assumptions that are TPU-specific:
 
 - require one visible GPU instead of eight TPU devices;
 - use that one visible GPU as a one-device JAX mesh;
 - isolate each protocol's embedded bundle extraction directory;
-- record the GPU runtime topology in result.json.
+- record the GPU runtime topology in result.json;
+- disable per-batch tqdm rendering in notebook output while preserving epoch
+  summaries, validation metrics, checkpoints, and full training behavior.
 
 All model math, optimizer tiers, seed patching, RegMask, EMA, validation, early
 stopping, split counts, and paper architecture guards remain owned by trainer.py.
@@ -46,8 +48,28 @@ def _replace_once(source: str, old: str, new: str, label: str) -> str:
     return source.replace(old, new, 1)
 
 
+def _patch_tqdm_quiet(source: str) -> tuple[str, int]:
+    """Disable only tqdm rendering; do not change the underlying train/eval loops."""
+    # Both the training and validation loops construct `pbar = tqdm(...)`.
+    # Inject disable=True so iteration semantics and set_postfix calls remain valid,
+    # but no per-microstep carriage-return stream is produced. This is important in
+    # Kaggle/Jupyter because captured tqdm output can accumulate in notebook memory.
+    pattern = r"(?m)^(\s*)pbar\s*=\s*tqdm\(\s*\n"
+
+    def repl(match: re.Match[str]) -> str:
+        indent = match.group(1)
+        return f"{indent}pbar = tqdm(\n{indent}    disable=True,\n"
+
+    patched, count = re.subn(pattern, repl, source)
+    if count != 2:
+        raise RuntimeError(
+            f"Expected exactly 2 tqdm progress bars (train+val); found {count}"
+        )
+    return patched, count
+
+
 def _patch_t4_runtime(source: str) -> tuple[str, dict[str, int]]:
-    """Patch only canonical runtime topology/storage metadata for one T4."""
+    """Patch only canonical runtime topology/storage/output for one T4."""
     counts: dict[str, int] = {}
     protocol = validate_protocol(os.environ.get("NESTSAR_PROTOCOL", "xsub"))
     physical_gpu = os.environ.get("NESTSAR_PHYSICAL_GPU", "unknown")
@@ -162,6 +184,10 @@ print(
     "DUAL-T4 RUNTIME | protocol={protocol.upper()} | "
     "physical GPU={physical_gpu} | process-visible device ids=",
     [int(device.id) for device in DEVICES],
+)
+
+print(
+    "NOTEBOOK OUTPUT MODE: QUIET (tqdm per-batch rendering disabled; epoch summaries retained)"
 )'''
     source = _replace_once(
         source,
@@ -171,6 +197,9 @@ print(
     )
     counts["runtime_banner"] = 1
 
+    source, tqdm_count = _patch_tqdm_quiet(source)
+    counts["tqdm_quiet"] = tqdm_count
+
     compile(source, "<Attention-Lite-single-T4>", "exec")
     return source, counts
 
@@ -178,7 +207,15 @@ print(
 def _patch_output_and_runtime(source: str, output: Path) -> tuple[str, int]:
     patched, output_count = _ORIGINAL_PATCH_OUTPUT(source, output)
     patched, runtime_counts = _patch_t4_runtime(patched)
-    if any(value != 1 for value in runtime_counts.values()):
+    expected_counts = {
+        "protocol_root": 1,
+        "backend_guard": 1,
+        "device_guard": 1,
+        "result_runtime_metadata": 1,
+        "runtime_banner": 1,
+        "tqdm_quiet": 2,
+    }
+    if runtime_counts != expected_counts:
         raise RuntimeError(f"Unexpected T4 runtime patch counts: {runtime_counts}")
     return patched, output_count
 
@@ -223,6 +260,11 @@ def main() -> int:
     print(
         "30-GB-RAM mode: dataset remains lazy at sample preprocessing; "
         "no parent-process dataset copy is created.",
+        flush=True,
+    )
+    print(
+        "Quiet console: per-batch tqdm output disabled; epoch train/validation "
+        "summaries are preserved.",
         flush=True,
     )
     print("=" * 108, flush=True)
