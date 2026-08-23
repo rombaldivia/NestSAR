@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
-"""Fresh-process Kaggle entry point for Attention-Lite XSUB + XSET runs.
+"""Fresh-process Kaggle entry point for Attention-Lite XSUB + XSET.
 
-The exact validated XSUB source is embedded in this repository as a compressed,
-SHA256-guarded payload. XSET is deterministically derived from the validated XSUB
-source with protocol-only replacements and independently SHA256-guarded.
-
-This entry point materializes and validates both canonical sources before training,
-so Kaggle does not need separate Attention-Lite source inputs.
+Canonical sources are materialized from the repository-bundled artifact by
+`experiments.attention_lite_v1.source_resolver`, so Kaggle needs no separate
+Attention-Lite source input.  XSUB and XSET are then trained sequentially as two
+independent fresh models with the same requested seed/configuration.
 """
 from __future__ import annotations
 
 import argparse
 
-from experiments.attention_lite_v1.canonical_payload import ensure_canonical_sources
+from experiments.attention_lite_v1.source_resolver import resolve_both_sources
 from nestsar_run import train_both
 
-RUNNER_API_VERSION = "attention-lite-both-v2-embedded-canonical"
+RUNNER_API_VERSION = "attention-lite-both-v3-repo-canonical"
 
 
 def main() -> int:
@@ -46,17 +44,19 @@ def main() -> int:
 
     print(f"RUNNER API: {RUNNER_API_VERSION}", flush=True)
 
-    # Default path: build the exact canonical sources from the committed payload.
-    # Explicit --xsub-source/--xset-source remain available for audit/debugging.
-    embedded = ensure_canonical_sources(verbose=True)
-    xsub_source = args.xsub_source or embedded["xsub"]
-    xset_source = args.xset_source or embedded["xset"]
+    # Resolve/materialize both sources before consuming TPU time. Explicit sources
+    # remain available for audit/debugging, but are not required for the normal run.
+    sources = resolve_both_sources(
+        xsub=args.xsub_source,
+        xset=args.xset_source,
+        verbose=True,
+    )
 
     patience = None if args.patience == 0 else args.patience
     train_both(
         "attention_lite",
-        xsub_source=xsub_source,
-        xset_source=xset_source,
+        xsub_source=sources["xsub"],
+        xset_source=sources["xset"],
         seed=args.seed,
         epochs=args.epochs,
         patience=patience,
