@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Short process-isolated TPU4 collective probe.
 
-The parent launcher sets TPU visibility before this process starts.  A PASS here
+The parent launcher sets TPU visibility before this process starts. A PASS here
 proves more than ``len(jax.devices()) == 4``: it forces an actual four-device psum
 collective, which catches invalid physical/global device numbering before a long
 Attention-Lite compilation/training run is started.
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import sys
@@ -61,7 +62,7 @@ def main() -> int:
 
     # Explicit pmap+psum forces the same class of all-reduce collective that failed
     # in the one-runtime TPU[4:8] experiment.
-    @jax.pmap(axis_name="probe", devices=devices)
+    @functools.partial(jax.pmap, axis_name="probe", devices=devices)
     def collective(x):
         return jax.lax.psum(x, "probe")
 
