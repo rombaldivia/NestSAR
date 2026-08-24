@@ -26,39 +26,7 @@ def parse_args():
     return p.parse_args()
 
 def env_for(gpu):
-    e=os.environ.copy()
-    e['CUDA_VISIBLE_DEVICES']=str(gpu)
-    e['XLA_PYTHON_CLIENT_PREALLOCATE']='false'
-    e['XLA_PYTHON_CLIENT_MEM_FRACTION']='0.92'
-    e['MALLOC_ARENA_MAX']='2'
-    e['PYTHONUNBUFFERED']='1'
-    return e
-
-def global_fraction(s,epochs):
-    if s.get('done'): return 1.0
-    epoch=max(1,int(s.get('epoch',1)))
-    phase=s.get('phase','init')
-    step=max(0,int(s.get('step',0)))
-    total=max(1,int(s.get('total',1)))
-    if phase=='init': within=0.0
-    elif phase=='train': within=0.85*min(1.0,step/total)
-    elif phase=='val': within=0.85+0.15*min(1.0,step/total)
-    else: within=0.0
-    return min(1.0,max(0.0,((epoch-1)+within)/max(1,epochs)))
-
-def compact_status(name,s):
-    if s.get('done'):
-        return f"{name}:DONE best={100*s.get('best',0.0):.2f}%"
-    meta=s.get('meta',{})
-    if s.get('phase')=='init':
-        p=meta.get('params'); g=meta.get('xla_forward_gflops')
-        if p is not None and g is not None: return f"{name}:INIT P={p/1e6:.3f}M G={g:.5f}"
-        return f"{name}:INIT"
-    phase=s.get('phase','?').upper()
-    epoch=int(s.get('epoch',0)); step=int(s.get('step',0)); total=max(1,int(s.get('total',1))); pct=100*step/total
-    if s.get('phase')=='train':
-        return f"{name}:{phase} E{epoch:03d} {pct:4.1f}% acc={100*s.get('acc',0.0):.2f}% loss={s.get('loss',0.0):.3f}"
-    return f"{name}:{phase} E{epoch:03d} {pct:4.1f}% acc={100*s.get('acc',0.0):.2f}% best={100*s.get('best',0.0):.2f}%"
+    e=os.environ.copy(); e['CUDA_VISIBLE_DEVICES']=str(gpu); e['XLA_PYTHON_CLIENT_PREALLOCATE']='false'; e['XLA_PYTHON_CLIENT_MEM_FRACTION']='0.92'; e['MALLOC_ARENA_MAX']='2'; e['PYTHONUNBUFFERED']='1'; return e
 
 def main():
     a=parse_args(); trainer=Path(a.trainer)
@@ -71,46 +39,55 @@ def main():
     for name,gpu,proto in [('XSUB',0,'xsub'),('XSET',1,'xset')]:
         handles[name]=open(logs[name],'w',buffering=1)
         procs[name]=subprocess.Popen(common+['--protocol',proto],stdout=handles[name],stderr=subprocess.STDOUT,env=env_for(gpu))
-    state={k:{'epoch':1,'phase':'init','step':0,'total':1,'meta':{},'done':False,'best':0.0} for k in logs}
-    offsets={k:0 for k in logs}
-    bar=tqdm(total=1000,desc='NESTSAR REL-MEM | XSUB GPU0 + XSET GPU1',unit='‰',dynamic_ncols=True,mininterval=max(0.25,a.refresh_seconds),leave=True)
-    last_render=0.0
+    bars={'XSUB':tqdm(total=1,desc='XSUB GPU0 | INIT',position=0,leave=True,dynamic_ncols=True,mininterval=a.refresh_seconds),'XSET':tqdm(total=1,desc='XSET GPU1 | INIT',position=1,leave=True,dynamic_ncols=True,mininterval=a.refresh_seconds)}
+    offsets={k:0 for k in logs}; state={k:{'epoch':0,'phase':'init','step':0,'total':1,'best':0.0,'last_render':0.0} for k in logs}
     try:
         while True:
-            alive=False; changed=False
+            alive=False
             for name in ('XSUB','XSET'):
                 if procs[name].poll() is None: alive=True
                 path=logs[name]
                 if not path.exists(): continue
                 with open(path,'r',errors='ignore') as f:
                     f.seek(offsets[name]); chunk=f.read(); offsets[name]=f.tell()
-                latest=None
+                events=[]
                 for line in chunk.splitlines():
                     if not line.startswith(MARK): continue
-                    try: latest=json.loads(line[len(MARK):])
-                    except Exception: continue
-                    kind=latest.get('kind'); s=state[name]
-                    if kind=='meta': s['meta']=latest; changed=True
-                    elif kind=='progress':
-                        s.update({'phase':latest.get('phase','train'),'epoch':int(latest.get('epoch',s['epoch'])),'step':int(latest.get('step',s['step'])),'total':int(latest.get('total',s['total'])),'loss':float(latest.get('loss',s.get('loss',0.0))),'acc':float(latest.get('acc',s.get('acc',0.0))),'gate':float(latest.get('gate',s.get('gate',0.0))),'grad':float(latest.get('grad',s.get('grad',0.0))),'best':float(latest.get('best',s.get('best',0.0))),'rms':float(latest.get('rms',s.get('rms',0.0)))})
-                        changed=True
-                    elif kind=='done': s.update({'done':True,'best':float(latest.get('best',s.get('best',0.0)))}) ; changed=True
-            now=time.monotonic()
-            if changed and (now-last_render>=a.refresh_seconds or not alive):
-                frac=0.5*(global_fraction(state['XSUB'],a.epochs)+global_fraction(state['XSET'],a.epochs))
-                bar.n=int(round(1000*frac))
-                bar.set_postfix_str(compact_status('XSUB',state['XSUB'])+' | '+compact_status('XSET',state['XSET']),refresh=False)
-                bar.refresh(); last_render=now
+                    try: events.append(json.loads(line[len(MARK):]))
+                    except Exception: pass
+                if not events: continue
+                s=state[name]; bar=bars[name]
+                meta_events=[e for e in events if e.get('kind')=='meta']
+                if meta_events:
+                    ev=meta_events[-1]; p=ev.get('params'); g=ev.get('xla_forward_gflops'); post=[]
+                    if p is not None: post.append(f"P={p/1e6:.3f}M")
+                    if g is not None: post.append(f"G={g:.5f}")
+                    bar.set_description_str(f"{name} GPU{0 if name=='XSUB' else 1} | INIT",refresh=False); bar.set_postfix_str(' '.join(post),refresh=False)
+                progress=[e for e in events if e.get('kind')=='progress']
+                if progress:
+                    ev=progress[-1]; phase=str(ev.get('phase','train')); epoch=int(ev.get('epoch',1)); step=int(ev.get('step',0)); total=max(1,int(ev.get('total',1)))
+                    changed_phase=(phase!=s['phase'] or epoch!=s['epoch'] or total!=s['total'])
+                    if changed_phase:
+                        bar.reset(total=total); s.update({'phase':phase,'epoch':epoch,'step':0,'total':total})
+                    bar.n=min(step,total); s['step']=step; s['best']=float(ev.get('best',s.get('best',0.0)))
+                    bar.set_description_str(f"{name} GPU{0 if name=='XSUB' else 1} | {phase.upper():5s} E{epoch:03d}",refresh=False)
+                    if phase=='train': bar.set_postfix_str(f"loss={float(ev.get('loss',0.0)):.3f} acc={100*float(ev.get('acc',0.0)):.2f}% gate={float(ev.get('gate',0.0)):.3f} grad={float(ev.get('grad',0.0)):.2f}",refresh=False)
+                    else: bar.set_postfix_str(f"acc={100*float(ev.get('acc',0.0)):.2f}% best={100*float(ev.get('best',s['best'])):.2f}% gate={float(ev.get('gate',0.0)):.3f} rms={float(ev.get('rms',0.0)):.4f}",refresh=False)
+                done=[e for e in events if e.get('kind')=='done']
+                if done:
+                    ev=done[-1]; s['best']=float(ev.get('best',s.get('best',0.0))); bar.n=bar.total; bar.set_description_str(f"{name} GPU{0 if name=='XSUB' else 1} | DONE",refresh=False); bar.set_postfix_str(f"best={100*s['best']:.2f}%",refresh=False)
+                now=time.monotonic()
+                if now-s['last_render']>=a.refresh_seconds or done:
+                    bar.refresh(); s['last_render']=now
             if not alive: break
             time.sleep(0.20)
     finally:
         for h in handles.values(): h.close()
-        bar.close()
+        for b in bars.values(): b.close()
     failed=[name for name,p in procs.items() if p.returncode!=0]
     if failed:
         for name in failed:
-            tail=logs[name].read_text(errors='ignore').splitlines()[-30:]
-            print(f"\n{name} FAILED\n"+'\n'.join(tail))
+            tail=logs[name].read_text(errors='ignore').splitlines()[-30:]; print(f"\n{name} FAILED\n"+'\n'.join(tail))
         raise SystemExit(1)
 
 if __name__=='__main__': main()
