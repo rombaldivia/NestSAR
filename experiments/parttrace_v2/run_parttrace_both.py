@@ -11,8 +11,7 @@ Mirrors the proven multi-GPU protocol strategy in nestsar.py:
 - parallel workers when protocols map to different GPUs
 - sequential fallback when only one GPU is available
 
-The model/training implementation stays in:
-    nestsar_hope_attention_lite_parttrace_v2.py
+The launcher uses the patience-enabled trainer by default.
 """
 
 from __future__ import annotations
@@ -26,7 +25,7 @@ from typing import Dict, List, Mapping, Sequence
 
 
 HERE = Path(__file__).resolve().parent
-TRAINER = HERE / "nestsar_hope_attention_lite_parttrace_v2.py"
+TRAINER = HERE / "nestsar_hope_attention_lite_parttrace_v2_patience.py"
 
 
 def detect_nvidia_gpus(max_gpus: int = 0) -> List[Dict[str, object]]:
@@ -172,7 +171,6 @@ def main() -> int:
     forwarded = trainer_args_from_cli(sys.argv[1:])
 
     def command(protocol: str) -> List[str]:
-        # Give each protocol its own output root automatically.
         return [
             sys.executable,
             "-u",
@@ -190,7 +188,6 @@ def main() -> int:
         env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
         env.setdefault("MALLOC_ARENA_MAX", "2")
         env["NESTSAR_PROTOCOL"] = protocol.upper()
-        # Reserved for tqdm positioning in the trainer.
         env["NESTSAR_TQDM_POSITION"] = "0" if protocol == "xsub" else "1"
         return env
 
@@ -204,8 +201,6 @@ def main() -> int:
         return 0
 
     if parallel:
-        # Inherit stdout/stderr directly so terminal control sequences and tqdm
-        # can render in place instead of being destroyed by line-prefix piping.
         processes = {
             protocol: subprocess.Popen(command(protocol), env=environment(protocol))
             for protocol in ("xsub", "xset")
