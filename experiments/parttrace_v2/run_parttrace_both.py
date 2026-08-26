@@ -3,13 +3,16 @@
 """
 Parallel launcher for NestSAR-HOPE Attention-Lite v2 PartTrace.
 
-Mirrors the proven multi-GPU protocol strategy in nestsar.py:
+Kaggle/Jupyter-safe behavior:
 - --protocol both
 - auto-detect NVIDIA GPUs
 - XSUB -> first visible GPU
 - XSET -> second visible GPU when available
 - parallel workers when protocols map to different GPUs
 - sequential fallback when only one GPU is available
+- worker stdout/stderr goes to log files
+- parent renders ONLY TWO persistent status lines (XSUB + XSET)
+  instead of letting two tqdm instances spam the notebook output
 
 The launcher uses the patience-enabled trainer by default.
 """
@@ -18,14 +21,17 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import Dict, List, Mapping, Sequence
+from typing import Dict, List, Mapping, Sequence, TextIO
 
 
 HERE = Path(__file__).resolve().parent
 TRAINER = HERE / "nestsar_hope_attention_lite_parttrace_v2_patience.py"
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
 def detect_nvidia_gpus(max_gpus: int = 0) -> List[Dict[str, object]]:
@@ -108,7 +114,7 @@ def parse_gpu_map(value: str, gpus: Sequence[Mapping[str, object]]) -> Dict[str,
 
 def trainer_args_from_cli(argv: Sequence[str]) -> List[str]:
     """Remove launcher-only arguments before forwarding to the trainer."""
-    launcher_with_value = {"--gpu-map", "--max-gpus", "--protocol"}
+    launcher_with_value = {"--gpu-map", "--max-gpus", "--protocol", "--refresh-seconds"}
     launcher_flags = {"--allow-cpu", "--dry-run"}
     result: List[str] = []
     i = 0
@@ -128,6 +134,74 @@ def trainer_args_from_cli(argv: Sequence[str]) -> List[str]:
     return result
 
 
+def _clean_text(text: str) -> str:
+    text = ANSI_RE.sub("", text)
+    text = text.replace("\x00", "")
+    return text.strip()
+
+
+def _latest_worker_status(log_path: Path, protocol: str, returncode) -> str:
+    label = protocol.upper()
+    if not log_path.exists():
+        return f"{label} STARTING..."
+
+    try:
+        # Logs are small enough to read during training; tqdm refreshes are separated
+        # by carriage returns, while ordinary prints use newlines.
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return f"{label} STARTING..."
+
+    chunks = re.split(r"[\r\n]+", text)
+    cleaned = [_clean_text(c) for c in chunks if _clean_text(c)]
+
+    # Prefer the newest tqdm phase line.
+    for line in reversed(cleaned):
+        if (f"{label} TRAIN" in line) or (f"{label} VAL" in line):
+            # Keep each dashboard row narrow enough that Kaggle does not wrap it.
+            return line[:150]
+
+    # Then prefer completion/error information.
+    for line in reversed(cleaned):
+        if "COMPLETE" in line or "Traceback" in line or "Error" in line or "Exception" in line:
+            return f"{label} {line}"[:150]
+
+    if returncode is None:
+        return f"{label} INITIALIZING..."
+    if returncode == 0:
+        return f"{label} COMPLETE"
+    return f"{label} FAILED (exit={returncode})"
+
+
+class TwoLineDashboard:
+    """Render exactly two mutable terminal rows without accumulating tqdm lines."""
+
+    def __init__(self) -> None:
+        self.started = False
+
+    def render(self, xsub: str, xset: str) -> None:
+        xsub = xsub[:150]
+        xset = xset[:150]
+        if not self.started:
+            sys.stdout.write("\033[2K\r" + xsub + "\n")
+            sys.stdout.write("\033[2K\r" + xset)
+            sys.stdout.flush()
+            self.started = True
+            return
+
+        # Cursor is at the end of the XSET row. Clear XSET, move to XSUB,
+        # overwrite XSUB, then overwrite XSET. No new persistent lines.
+        sys.stdout.write("\r\033[2K")
+        sys.stdout.write("\033[1A\r\033[2K" + xsub)
+        sys.stdout.write("\n\033[2K\r" + xset)
+        sys.stdout.flush()
+
+    def finish(self) -> None:
+        if self.started:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run PartTrace v2 XSUB and XSET on separate GPUs when available.",
@@ -138,7 +212,11 @@ def main() -> int:
     parser.add_argument("--max-gpus", type=int, default=0)
     parser.add_argument("--allow-cpu", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--refresh-seconds", type=float, default=0.35)
     args, _ = parser.parse_known_args()
+
+    if args.refresh_seconds <= 0:
+        raise ValueError("--refresh-seconds must be > 0")
 
     if args.protocol in ("xsub", "xset"):
         forwarded = trainer_args_from_cli(sys.argv[1:])
@@ -188,7 +266,8 @@ def main() -> int:
         env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
         env.setdefault("MALLOC_ARENA_MAX", "2")
         env["NESTSAR_PROTOCOL"] = protocol.upper()
-        env["NESTSAR_TQDM_POSITION"] = "0" if protocol == "xsub" else "1"
+        # Worker tqdm may write as much as it wants, but only into its private log.
+        env["NESTSAR_TQDM_POSITION"] = "0"
         return env
 
     if args.dry_run:
@@ -200,22 +279,94 @@ def main() -> int:
             )
         return 0
 
-    if parallel:
-        processes = {
-            protocol: subprocess.Popen(command(protocol), env=environment(protocol))
-            for protocol in ("xsub", "xset")
-        }
-        codes = {protocol: process.wait() for protocol, process in processes.items()}
-    else:
-        codes = {}
-        for protocol in ("xsub", "xset"):
-            codes[protocol] = subprocess.call(command(protocol), env=environment(protocol))
+    log_root = Path(os.environ.get("NESTSAR_PARALLEL_LOGDIR", "/kaggle/working/parttrace_parallel_logs"))
+    log_root.mkdir(parents=True, exist_ok=True)
+    log_paths = {p: log_root / f"{p}.log" for p in ("xsub", "xset")}
+    for path in log_paths.values():
+        path.write_text("", encoding="utf-8")
+
+    handles: Dict[str, TextIO] = {}
+    processes: Dict[str, subprocess.Popen] = {}
+    dashboard = TwoLineDashboard()
+
+    try:
+        if parallel:
+            for protocol in ("xsub", "xset"):
+                handle = log_paths[protocol].open("w", encoding="utf-8", buffering=1)
+                handles[protocol] = handle
+                processes[protocol] = subprocess.Popen(
+                    command(protocol),
+                    env=environment(protocol),
+                    stdout=handle,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+
+            while any(process.poll() is None for process in processes.values()):
+                dashboard.render(
+                    _latest_worker_status(log_paths["xsub"], "xsub", processes["xsub"].poll()),
+                    _latest_worker_status(log_paths["xset"], "xset", processes["xset"].poll()),
+                )
+                time.sleep(args.refresh_seconds)
+
+            codes = {protocol: process.wait() for protocol, process in processes.items()}
+            dashboard.render(
+                _latest_worker_status(log_paths["xsub"], "xsub", codes["xsub"]),
+                _latest_worker_status(log_paths["xset"], "xset", codes["xset"]),
+            )
+            dashboard.finish()
+
+        else:
+            # One GPU: run each protocol sequentially. Keep the same clean dashboard.
+            codes = {}
+            for protocol in ("xsub", "xset"):
+                handle = log_paths[protocol].open("w", encoding="utf-8", buffering=1)
+                handles[protocol] = handle
+                process = subprocess.Popen(
+                    command(protocol),
+                    env=environment(protocol),
+                    stdout=handle,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                processes[protocol] = process
+                while process.poll() is None:
+                    other = "xset" if protocol == "xsub" else "xsub"
+                    other_status = f"{other.upper()} WAITING..."
+                    current_status = _latest_worker_status(log_paths[protocol], protocol, None)
+                    dashboard.render(
+                        current_status if protocol == "xsub" else other_status,
+                        current_status if protocol == "xset" else other_status,
+                    )
+                    time.sleep(args.refresh_seconds)
+                codes[protocol] = process.wait()
+            dashboard.finish()
+
+    except KeyboardInterrupt:
+        for process in processes.values():
+            if process.poll() is None:
+                process.terminate()
+        for process in processes.values():
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        dashboard.finish()
+        print("Interrupted. Worker logs kept in:", log_root, flush=True)
+        raise
+    finally:
+        for handle in handles.values():
+            try:
+                handle.close()
+            except Exception:
+                pass
 
     failures = {p: code for p, code in codes.items() if code != 0}
     if failures:
+        print(f"Worker logs: {log_root}", flush=True)
         raise RuntimeError(f"PartTrace workers failed: {failures}")
 
-    print("XSUB and XSET completed successfully.", flush=True)
+    print(f"XSUB and XSET completed successfully. Logs: {log_root}", flush=True)
     return 0
 
 
