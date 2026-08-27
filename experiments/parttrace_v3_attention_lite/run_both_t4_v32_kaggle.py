@@ -6,8 +6,12 @@ IMPORTANT: run with `%run`, not `!python`.
 
 Child workers write stdout/stderr to private log files and atomic progress JSON.
 The notebook parent owns exactly two tqdm widgets (XSUB/XSET), each reused for
-TRAIN -> VAL -> next epoch. This avoids the captured-carriage-return line spam
-that Kaggle produces when multiple subprocesses write tqdm directly.
+TRAIN -> VAL -> next epoch. This avoids captured-carriage-return line spam.
+
+Frame support:
+- canonical chunk_size=4 / clip_size=8 => --frames must be divisible by 8
+- T16 remains the reference configuration
+- T32/T64/etc. are real runtime sequence lengths, not aliases/resampling flags
 """
 from __future__ import annotations
 
@@ -20,8 +24,8 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TRAINER = HERE / "train_v32.py"
-CANONICAL_FRAMES = 16
+TRAINER = HERE / "train_v32_frames.py"
+DEFAULT_FRAMES = 16
 
 try:
     from tqdm.notebook import tqdm
@@ -34,15 +38,16 @@ def parse_args():
     p.add_argument("--gpu-xsub", type=int, default=0)
     p.add_argument("--gpu-xset", type=int, default=1)
     p.add_argument("--dataset", default="auto")
-    p.add_argument("--frames", type=int, default=CANONICAL_FRAMES,
-                   help="Input frames. Current canonical Attention-Lite v3.2 is validated at T16.")
+    p.add_argument(
+        "--frames", type=int, default=DEFAULT_FRAMES,
+        help="Real input sequence length. Must be divisible by 8 (e.g. 16, 32, 64).",
+    )
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--seed", type=int, default=128)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--eval-batch-size", type=int, default=64)
 
-    # Configurable residual widths.
     p.add_argument("--part-dim", type=int, default=64)
     p.add_argument("--part-heads", type=int, default=4)
     p.add_argument("--global-dim", type=int, default=128)
@@ -93,8 +98,7 @@ def _set_bar(bar, state, previous_phase):
     proto = str(state.get("protocol", "?")).upper()
 
     if phase in ("train", "val"):
-        phase_text = "TRAIN" if phase == "train" else "VAL"
-        desc = f"{proto} {phase_text} E{epoch:03d}/{epochs}"
+        desc = f"{proto} {'TRAIN' if phase == 'train' else 'VAL'} E{epoch:03d}/{epochs}"
     elif phase == "initializing":
         desc = f"{proto} INITIALIZING"
     elif phase == "epoch_done":
@@ -115,10 +119,7 @@ def _set_bar(bar, state, previous_phase):
 
     best = float(state.get("best", -1.0))
     be = int(state.get("best_epoch", 0))
-    if best >= 0.0 and be > 0:
-        postfix["BEST"] = f"{100.0*best:.2f}%@E{be:03d}"
-    else:
-        postfix["BEST"] = "--"
+    postfix["BEST"] = f"{100.0*best:.2f}%@E{be:03d}" if best >= 0.0 and be > 0 else "--"
 
     if "loss" in state:
         postfix["loss"] = f"{float(state['loss']):.3f}"
@@ -133,10 +134,9 @@ def main() -> int:
     a = parse_args()
     if a.gpu_xsub == a.gpu_xset:
         raise ValueError("XSUB and XSET must use different physical GPUs")
-    if a.frames != CANONICAL_FRAMES:
+    if a.frames < 8 or a.frames % 8:
         raise ValueError(
-            f"--frames={a.frames} is not supported by the current canonical Attention-Lite payload. "
-            f"This v3.2 branch is validated at T{CANONICAL_FRAMES}; use --frames {CANONICAL_FRAMES}."
+            f"--frames must be >=8 and divisible by 8 for chunk_size=4 / clip_size=8; got {a.frames}"
         )
 
     probe = subprocess.run(
@@ -157,6 +157,7 @@ def main() -> int:
     common = [
         sys.executable, "-u", str(TRAINER),
         "--dataset", a.dataset,
+        "--frames", str(a.frames),
         "--epochs", str(a.epochs),
         "--patience", str(a.patience),
         "--seed", str(a.seed),
