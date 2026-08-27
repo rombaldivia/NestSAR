@@ -1,0 +1,62 @@
+{
+  "model": "AttentionLitePartTraceV32",
+  "status": "candidate",
+  "frames": 16,
+  "canonical_attention_lite_base": {
+    "params": 2381028,
+    "leaves": 705,
+    "outer_dim": 128,
+    "attention_dim": 64,
+    "attention_heads": 4
+  },
+  "parttrace": {
+    "part_dim": 64,
+    "part_heads": 4,
+    "global_dim": 192,
+    "dense_dim": 192,
+    "branch_dropout": 0.12
+  },
+  "training": {
+    "epochs": 60,
+    "patience": 10,
+    "seed": 128,
+    "batch_size": 32,
+    "eval_batch_size": 64,
+    "base_lr": 0.0004,
+    "branch_lr": 0.0006,
+    "controller_lr": 0.00015,
+    "base_min_lr": 0.00001,
+    "branch_min_lr": 0.00002,
+    "controller_min_lr": 0.000005,
+    "warmup_fraction": 0.08,
+    "base_weight_decay": 0.03,
+    "branch_weight_decay": 0.04,
+    "label_smoothing": 0.05,
+    "grad_clip": 1.0,
+    "ema_decay": 0.995,
+    "predictive_loss_weight": 0.10,
+    "parttrace_aux_weight": 0.10,
+    "controller_kl_weight": 0.02,
+    "freeze_branch_epochs": 2,
+    "branch_ramp_epochs": 4
+  },
+  "live_snapshot_2026_08_27": {
+    "note": "Intermediate live training snapshot, not final results.",
+    "xsub": {
+      "phase": "train",
+      "epoch": 5,
+      "train_accuracy_partial": 0.6638,
+      "best_completed_val_accuracy": 0.5990,
+      "best_val_epoch": 4,
+      "loss_partial": 1.839
+    },
+    "xset": {
+      "phase": "train",
+      "epoch": 6,
+      "train_accuracy_partial": 0.7236,
+      "best_completed_val_accuracy": 0.6265,
+      "best_val_epoch": 5,
+      "loss_partial": 1.632
+    }
+  }
+}
