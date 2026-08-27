@@ -15,6 +15,7 @@ CANDIDATE_DEFAULTS = [
     "--gpu-xsub", "0",
     "--gpu-xset", "1",
     "--dataset", "auto",
+    "--frames", "16",
     "--epochs", "60",
     "--patience", "10",
     "--seed", "128",
