@@ -89,6 +89,15 @@ def _read_json(path: Path):
         return None
 
 
+def _tail(path: Path, lines: int = 60) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"<could not read {path}: {exc}>"
+    rows = text.splitlines()
+    return "\n".join(rows[-lines:]) if rows else "<empty log>"
+
+
 def _set_bar(bar, state, previous_phase):
     phase = str(state.get("phase", "initializing"))
     epoch = int(state.get("epoch", 0))
@@ -197,6 +206,7 @@ def main() -> int:
 
     workers = {}
     logs = {}
+    log_paths = {}
     progress_paths = {}
     for protocol, gpu in (("xsub", a.gpu_xsub), ("xset", a.gpu_xset)):
         progress = monitor / f"{protocol}.json"
@@ -216,6 +226,7 @@ def main() -> int:
             cmd, env=env, stdout=log_handle, stderr=subprocess.STDOUT, text=True
         )
         logs[protocol] = log_handle
+        log_paths[protocol] = log_path
         progress_paths[protocol] = progress
 
     bars = {
@@ -258,6 +269,9 @@ def main() -> int:
     if bad:
         print(f"Worker failure: {bad}")
         print(f"Logs: {monitor}")
+        for protocol in bad:
+            print("\n" + "=" * 40 + f" {protocol.upper()} LOG TAIL " + "=" * 40)
+            print(_tail(log_paths[protocol], lines=80))
         raise RuntimeError(f"PartTrace v3.2 workers failed: {bad}")
 
     print(f"XSUB + XSET V3.2 COMPLETE | T={a.frames} | results: {root}")
