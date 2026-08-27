@@ -166,3 +166,71 @@ Use `%run`, not `!python`, so XSUB and XSET each reuse one persistent notebook t
     --branch-dropout 0.12 \
     --audit-first
 ```
+
+---
+
+# v3.4 TokenPreserve — pretrained / anti-collapse experiment
+
+v3.4 keeps the T16/320-token inference design but fixes the main v3.3 training
+mismatch: v3.3 preserved the Attention-Lite architecture but trained it from
+scratch. v3.4 starts from a compatible trained Attention-Lite EMA checkpoint and
+validates that base at epoch 0 before TokenPreserve training begins.
+
+## Changes from v3.3
+
+1. load a compatible canonical Attention-Lite EMA (`2,381,028` params / `705` leaves)
+2. run a full epoch-0 base validation before optimization
+3. freeze base gradients for 3 epochs, then ramp them over 3 epochs
+4. reduce pretrained-base LR to `1e-4`
+5. stronger branch auxiliary CE: `0.50 -> 0.20` as residual influence ramps in
+6. residual gate starts at `0.10` full scale, bounded to at most `0.20`
+7. lower preservation-branch masking: frame/joint/part = `0.03/0.04/0.01`
+8. add learned query-specific part, person, and time score biases
+9. add an anti-collapse diversity loss over the K readout attention maps
+10. log query overlap, standalone TokenPreserve validation accuracy, base-gradient scale, and effective gate
+
+The diversity loss is training-only and adds **zero inference GFLOPs**. Query
+identity priors are tiny lookup tables, so the v3.4 inference cost should remain
+very close to v3.3. Exact cost still comes from `--audit-first`.
+
+## Recommended v3.4 run
+
+```python
+%run experiments/parttrace_v3_attention_lite/run_both_t4_v34_kaggle.py \
+    --gpu-xsub 0 \
+    --gpu-xset 1 \
+    --dataset auto \
+    --frames 16 \
+    --base-checkpoint auto \
+    --readout-tokens 8 \
+    --epochs 60 \
+    --patience 10 \
+    --seed 128 \
+    --batch-size 32 \
+    --eval-batch-size 64 \
+    --part-dim 64 \
+    --part-heads 4 \
+    --global-dim 128 \
+    --dense-dim 192 \
+    --branch-dropout 0.10 \
+    --frame-mask-rate 0.03 \
+    --joint-mask-rate 0.04 \
+    --part-mask-rate 0.01 \
+    --base-lr 1e-4 \
+    --branch-lr 5e-4 \
+    --gate-lr 1e-4 \
+    --branch-aux-warmup-weight 0.50 \
+    --branch-aux-final-weight 0.20 \
+    --diversity-loss-weight 0.05 \
+    --freeze-base-epochs 3 \
+    --base-unfreeze-ramp-epochs 3 \
+    --freeze-branch-epochs 2 \
+    --branch-ramp-epochs 4 \
+    --audit-first
+```
+
+`--base-checkpoint auto` searches Kaggle working/input storage for compatible
+`best_ema.msgpack` files and prefers Attention-Lite/protocol-matching paths. The
+worker refuses to silently fall back to scratch unless `--allow-scratch` is
+explicitly supplied. Always inspect `PRETRAINED BASELINE VAL` before trusting a
+v3.4 run.
