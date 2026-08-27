@@ -21,6 +21,15 @@ PARENTS = jnp.asarray([
 
 HAND_LEFT = 3
 HAND_RIGHT = 5
+
+# Fine hand geometry joints (zero-based NTU-25).
+LEFT_HAND = 7
+LEFT_HAND_TIP = 21
+LEFT_THUMB = 22
+RIGHT_HAND = 11
+RIGHT_HAND_TIP = 23
+RIGHT_THUMB = 24
+
 MAX_RESIDUAL_GATE = 0.15
 CONTROLLER_STRENGTH = 0.20
 
@@ -32,6 +41,32 @@ def _safe_scale(xyz: jnp.ndarray, present: jnp.ndarray) -> jnp.ndarray:
     scale = 0.5 * (shoulder + hip)
     scale = jnp.where((present & (scale > 1e-4)), scale, 1.0)
     return scale[..., None, None]
+
+
+def _hand_geometry(
+    centered_n: jnp.ndarray,
+    hand_idx: int,
+    tip_idx: int,
+    thumb_idx: int,
+) -> jnp.ndarray:
+    """Explicit local hand geometry: 3 relative vectors + their three lengths."""
+    hand = centered_n[:, :, :, hand_idx, :]
+    tip = centered_n[:, :, :, tip_idx, :]
+    thumb = centered_n[:, :, :, thumb_idx, :]
+
+    tip_hand = tip - hand
+    thumb_hand = thumb - hand
+    tip_thumb = tip - thumb
+
+    distances = jnp.stack(
+        [
+            jnp.linalg.norm(tip_hand, axis=-1),
+            jnp.linalg.norm(thumb_hand, axis=-1),
+            jnp.linalg.norm(tip_thumb, axis=-1),
+        ],
+        axis=-1,
+    )
+    return jnp.concatenate([tip_hand, thumb_hand, tip_thumb, distances], axis=-1)
 
 
 class PartTraceV31Branch(nn.Module):
@@ -69,7 +104,7 @@ class PartTraceV31Branch(nn.Module):
         torso = centered_n[:, :, :, 20:21, :]
         torso_dist = jnp.linalg.norm(centered_n - torso, axis=-1, keepdims=True)
 
-        # 13 channels: xyz(3) + vel(3) + acc(3) + bone(3) + torso distance(1)
+        # 13 channels: xyz(3) + vel(3) + acc(3) + bone(3) + torso distance(1).
         features = jnp.concatenate([
             centered_n, velocity, acceleration, bone, torso_dist
         ], axis=-1)
@@ -85,6 +120,12 @@ class PartTraceV31Branch(nn.Module):
         )
         h = jax.nn.gelu(nn.LayerNorm(name="joint_norm")(h + joint_emb + person_emb))
 
+        # Keep an explicit mask for learned joint->part pooling so a RegMask-dropped
+        # joint cannot receive softmax mass merely because its feature vector is zero.
+        joint_valid = jnp.broadcast_to(
+            person_present[..., None], (b, t, PERSONS, JOINTS)
+        )
+
         if training:
             kf = self.make_rng("dropout")
             kj = self.make_rng("dropout")
@@ -95,14 +136,39 @@ class PartTraceV31Branch(nn.Module):
                 kj, 1.0 - self.joint_mask_rate, (b, t, PERSONS, JOINTS, 1)
             ).astype(h.dtype)
             h = h * frame_keep * joint_keep
+            joint_valid = joint_valid & (joint_keep[..., 0] > 0.5)
+            joint_valid = joint_valid & jnp.broadcast_to(
+                frame_keep[..., 0, 0] > 0.5, joint_valid.shape
+            )
 
         h = nn.Dropout(rate=self.dropout, name="joint_dropout")(h, deterministic=not training)
         h = h * present_joint
 
-        mask = PART_MASK.astype(h.dtype)
-        numerator = jnp.einsum("btmjd,pj->btmpd", h, mask)
-        counts = jnp.sum(mask, axis=1)[None, None, None, :, None]
-        parts = numerator / jnp.maximum(counts, 1.0)
+        # ---------------------------------------------------------------------
+        # Learned joint -> semantic-part pooling.
+        # Previous v3.1 used a uniform mean and could wash out thumb/hand-tip
+        # motion with larger wrist/arm motion. A learned query per anatomical
+        # part preserves joint identity while adding only 10*D parameters.
+        # ---------------------------------------------------------------------
+        part_queries = self.param(
+            "joint_to_part_queries",
+            nn.initializers.normal(0.02),
+            (10, self.dim),
+        )
+        joint_part_logits = jnp.einsum(
+            "btmjd,pd->btmpj", h, part_queries
+        ) / math.sqrt(self.dim)
+
+        anatomical_mask = PART_MASK.astype(bool)[None, None, None, :, :]
+        valid_mask = anatomical_mask & joint_valid[..., None, :]
+        joint_part_logits = jnp.where(valid_mask, joint_part_logits, -1e9)
+        joint_part_w = jax.nn.softmax(joint_part_logits, axis=-1)
+
+        # If an entire part is masked for a frame, force its contribution to zero
+        # instead of accepting the uniform softmax produced by all -1e9 logits.
+        part_has_joint = jnp.any(valid_mask, axis=-1, keepdims=True)
+        joint_part_w = jnp.where(part_has_joint, joint_part_w, 0.0)
+        parts = jnp.einsum("btmpj,btmjd->btmpd", joint_part_w, h)
 
         part_emb = self.param(
             "part_embedding", nn.initializers.normal(0.02),
@@ -135,6 +201,23 @@ class PartTraceV31Branch(nn.Module):
         left = jnp.sum(left * pw, axis=2) / denom
         right = jnp.sum(right * pw, axis=2) / denom
 
+        # ---------------------------------------------------------------------
+        # Explicit fine hand geometry.
+        # NTU has no full finger skeleton, so use the available hand, hand-tip
+        # and thumb joints directly rather than asking a tiny residual branch to
+        # rediscover these relative relations from root-relative coordinates.
+        # ---------------------------------------------------------------------
+        left_geom = _hand_geometry(centered_n, LEFT_HAND, LEFT_HAND_TIP, LEFT_THUMB)
+        right_geom = _hand_geometry(centered_n, RIGHT_HAND, RIGHT_HAND_TIP, RIGHT_THUMB)
+        geom_denom = jnp.maximum(jnp.sum(pw, axis=2), 1.0)
+        left_geom = jnp.sum(left_geom * pw, axis=2) / geom_denom
+        right_geom = jnp.sum(right_geom * pw, axis=2) / geom_denom
+
+        left_geom = nn.Dense(self.dim, name="left_hand_geometry_projection")(left_geom)
+        right_geom = nn.Dense(self.dim, name="right_hand_geometry_projection")(right_geom)
+        left = nn.LayerNorm(name="left_hand_geometry_norm")(left + left_geom)
+        right = nn.LayerNorm(name="right_hand_geometry_norm")(right + right_geom)
+
         gate_logits = nn.Dense(1, name="part_pool_gate")(parts)[..., 0]
         gate_logits = jnp.where(person_present[..., None], gate_logits, -1e9)
         part_w = jax.nn.softmax(gate_logits, axis=3)
@@ -149,15 +232,32 @@ class PartTraceV31Branch(nn.Module):
 
         global_trace = nn.Dense(128, name="global_projection")(pair)
         any_person = jnp.any(person_present, axis=2)
-        global_trace = global_trace * any_person[..., None].astype(global_trace.dtype)
+        valid_time = any_person[..., None]
+        global_trace = global_trace * valid_time.astype(global_trace.dtype)
+        left = left * valid_time.astype(left.dtype)
+        right = right * valid_time.astype(right.dtype)
 
-        temporal_scores = nn.Dense(1, name="temporal_gate")(global_trace)[..., 0]
-        temporal_scores = jnp.where(any_person, temporal_scores, -1e9)
-        tw = jax.nn.softmax(temporal_scores, axis=1)
+        # ---------------------------------------------------------------------
+        # Independent temporal saliency.
+        # Global-body, left-hand and right-hand traces no longer share one gate.
+        # A subtle hand action can therefore select a discriminative frame even
+        # when the torso/global descriptor is nearly static.
+        # ---------------------------------------------------------------------
+        global_scores = nn.Dense(1, name="temporal_gate_global")(global_trace)[..., 0]
+        left_scores = nn.Dense(1, name="temporal_gate_left")(left)[..., 0]
+        right_scores = nn.Dense(1, name="temporal_gate_right")(right)[..., 0]
 
-        global_pooled = jnp.sum(tw[..., None] * global_trace, axis=1)
-        left_pooled = jnp.sum(tw[..., None] * left, axis=1)
-        right_pooled = jnp.sum(tw[..., None] * right, axis=1)
+        global_scores = jnp.where(any_person, global_scores, -1e9)
+        left_scores = jnp.where(any_person, left_scores, -1e9)
+        right_scores = jnp.where(any_person, right_scores, -1e9)
+
+        wg = jax.nn.softmax(global_scores, axis=1)
+        wl = jax.nn.softmax(left_scores, axis=1)
+        wr = jax.nn.softmax(right_scores, axis=1)
+
+        global_pooled = jnp.sum(wg[..., None] * global_trace, axis=1)
+        left_pooled = jnp.sum(wl[..., None] * left, axis=1)
+        right_pooled = jnp.sum(wr[..., None] * right, axis=1)
 
         fused = jnp.concatenate([global_pooled, left_pooled, right_pooled], axis=-1)
         fused = jax.nn.gelu(nn.Dense(192, name="fusion_hidden")(fused))
@@ -182,6 +282,15 @@ class PartTraceV31Branch(nn.Module):
             "branch_logits": branch_logits,
             "controller_delta": controller_delta,
             "feature": fused,
+            "joint_to_part_entropy": -jnp.mean(
+                jnp.sum(
+                    jnp.where(joint_part_w > 0, joint_part_w * jnp.log(joint_part_w + 1e-8), 0.0),
+                    axis=-1,
+                )
+            ),
+            "temporal_entropy_global": -jnp.mean(jnp.sum(wg * jnp.log(wg + 1e-8), axis=-1)),
+            "temporal_entropy_left": -jnp.mean(jnp.sum(wl * jnp.log(wl + 1e-8), axis=-1)),
+            "temporal_entropy_right": -jnp.mean(jnp.sum(wr * jnp.log(wr + 1e-8), axis=-1)),
         }
 
 
@@ -226,6 +335,10 @@ def make_wrapper_v31(base_model: nn.Module):
                 "dynamic_fusion_weights": dynamic_w,
                 "parttrace_gate": gate,
                 "effective_parttrace_gate": effective_gate,
+                "joint_to_part_entropy": branch["joint_to_part_entropy"],
+                "temporal_entropy_global": branch["temporal_entropy_global"],
+                "temporal_entropy_left": branch["temporal_entropy_left"],
+                "temporal_entropy_right": branch["temporal_entropy_right"],
                 "logits": logits,
             })
             return result
