@@ -21,6 +21,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 TRAINER = HERE / "train_v32.py"
+CANONICAL_FRAMES = 16
 
 try:
     from tqdm.notebook import tqdm
@@ -33,6 +34,8 @@ def parse_args():
     p.add_argument("--gpu-xsub", type=int, default=0)
     p.add_argument("--gpu-xset", type=int, default=1)
     p.add_argument("--dataset", default="auto")
+    p.add_argument("--frames", type=int, default=CANONICAL_FRAMES,
+                   help="Input frames. Current canonical Attention-Lite v3.2 is validated at T16.")
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--seed", type=int, default=128)
@@ -110,9 +113,6 @@ def _set_bar(bar, state, previous_phase):
     if "accuracy" in state:
         postfix["acc"] = f"{100.0*float(state['accuracy']):.2f}%"
 
-    # Keep BEST visible at all times. Before the first completed validation it
-    # shows --; afterwards it remains the best *completed* validation result,
-    # never a misleading partial-validation maximum.
     best = float(state.get("best", -1.0))
     be = int(state.get("best_epoch", 0))
     if best >= 0.0 and be > 0:
@@ -133,6 +133,11 @@ def main() -> int:
     a = parse_args()
     if a.gpu_xsub == a.gpu_xset:
         raise ValueError("XSUB and XSET must use different physical GPUs")
+    if a.frames != CANONICAL_FRAMES:
+        raise ValueError(
+            f"--frames={a.frames} is not supported by the current canonical Attention-Lite payload. "
+            f"This v3.2 branch is validated at T{CANONICAL_FRAMES}; use --frames {CANONICAL_FRAMES}."
+        )
 
     probe = subprocess.run(
         ["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader,nounits"],
@@ -142,7 +147,7 @@ def main() -> int:
     print(probe.stdout.strip())
     print(
         f"Plan: XSUB->GPU{a.gpu_xsub} | XSET->GPU{a.gpu_xset} | "
-        f"Dpart={a.part_dim} Dglobal={a.global_dim} Ddense={a.dense_dim}"
+        f"T={a.frames} Dpart={a.part_dim} Dglobal={a.global_dim} Ddense={a.dense_dim}"
     )
 
     root = Path(a.outdir)
@@ -201,6 +206,7 @@ def main() -> int:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
         env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
         env["MALLOC_ARENA_MAX"] = "2"
+        env["NESTSAR_FRAMES"] = str(a.frames)
         cmd = common + [
             "--protocol", protocol,
             "--progress-json", str(progress),
@@ -253,7 +259,7 @@ def main() -> int:
         print(f"Logs: {monitor}")
         raise RuntimeError(f"PartTrace v3.2 workers failed: {bad}")
 
-    print(f"XSUB + XSET V3.2 COMPLETE | results: {root}")
+    print(f"XSUB + XSET V3.2 COMPLETE | T={a.frames} | results: {root}")
     return 0
 
 
