@@ -109,16 +109,22 @@ def _set_bar(bar, state, previous_phase):
     postfix = {}
     if "accuracy" in state:
         postfix["acc"] = f"{100.0*float(state['accuracy']):.2f}%"
+
+    # Keep BEST visible at all times. Before the first completed validation it
+    # shows --; afterwards it remains the best *completed* validation result,
+    # never a misleading partial-validation maximum.
     best = float(state.get("best", -1.0))
-    if best >= 0:
-        be = int(state.get("best_epoch", 0))
-        postfix["best"] = f"{100.0*best:.2f}%@{be}"
+    be = int(state.get("best_epoch", 0))
+    if best >= 0.0 and be > 0:
+        postfix["BEST"] = f"{100.0*best:.2f}%@E{be:03d}"
+    else:
+        postfix["BEST"] = "--"
+
     if "loss" in state:
         postfix["loss"] = f"{float(state['loss']):.3f}"
     if "stale" in state:
         postfix["stale"] = f"{int(state['stale'])}/{int(state.get('patience', 0))}"
-    if postfix:
-        bar.set_postfix(postfix, refresh=False)
+    bar.set_postfix(postfix, refresh=False)
     bar.refresh()
     return phase
 
