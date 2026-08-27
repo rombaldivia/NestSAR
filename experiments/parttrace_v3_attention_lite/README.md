@@ -97,3 +97,72 @@ Use the v3.2 Kaggle launcher with `%run` to keep exactly two persistent progress
 The progress bars display live accuracy, loss, and the best completed validation
 accuracy/epoch for each protocol. Do not make a paper claim until the audit and
 both full protocol runs are complete.
+
+---
+
+# v3.3 TokenPreserve — T16 Pareto experiment
+
+v3.3 returns to the strongest efficiency setting: **T16** and the exact
+2,381,028-parameter Attention-Lite backbone. It removes the second PartTrace
+temporal-attention backbone and instead preserves fine anatomical evidence until
+a cheap learned readout.
+
+## Architecture
+
+1. raw T16 skeleton input
+2. root-relative position + velocity + acceleration + bone + torso-distance features
+3. learned joint-to-part pooling over 10 semantic parts
+4. explicit left/right hand geometry injection
+5. retain all `16 x 2 x 10 = 320` part-time-person tokens at D64
+6. add learned time/person/part identity embeddings
+7. `K=8` learned evidence queries cross-attend to all 320 tokens
+8. tiny K-token self-mixer (K=8, so only an 8x8 attention map)
+9. keep all K token identities until `K*D -> Dense192 -> 120`
+10. add branch logits to the untouched Attention-Lite logits through a bounded residual gate
+
+There is **no 320x320 self-attention** and no second full temporal backbone.
+The v3.3 objective is to preserve more evidence while keeping the full model near
+the original Attention-Lite Pareto point.
+
+`global_dim` remains in the CLI for controlled width sweeps, but in v3.3 it is
+the tiny readout-mixer FFN hidden width rather than a second global temporal trace.
+
+## Recommended v3.3 configuration
+
+- frames: `16`
+- token/part dim: `64`
+- heads: `4`
+- preserved fine tokens: `320`
+- learned readout tokens: `8`
+- mixer hidden dim (`global_dim` CLI): `128`
+- final dense dim: `192`
+- dropout: `0.12`
+- exact canonical Attention-Lite base unchanged
+- no dynamic stream-controller correction in the v3.3 forward path
+
+The exact parameter and GFLOP cost must be taken from `--audit-first`; the design
+target is roughly 2.5M total parameters and <0.085 GFLOPs/clip.
+
+## Kaggle dual-T4 run
+
+Use `%run`, not `!python`, so XSUB and XSET each reuse one persistent notebook tqdm bar:
+
+```python
+%run experiments/parttrace_v3_attention_lite/run_both_t4_v33_kaggle.py \
+    --gpu-xsub 0 \
+    --gpu-xset 1 \
+    --dataset auto \
+    --frames 16 \
+    --readout-tokens 8 \
+    --epochs 60 \
+    --patience 10 \
+    --seed 128 \
+    --batch-size 32 \
+    --eval-batch-size 64 \
+    --part-dim 64 \
+    --part-heads 4 \
+    --global-dim 128 \
+    --dense-dim 192 \
+    --branch-dropout 0.12 \
+    --audit-first
+```
