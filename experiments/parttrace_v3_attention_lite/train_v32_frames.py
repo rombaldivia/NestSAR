@@ -5,12 +5,12 @@
 The canonical Attention-Lite source was originally authored/configured at T16,
 but its actual top-level model is sequence-length agnostic apart from requiring
 T to be divisible by chunk_size=4 and clip_size=8. This wrapper changes the
-runtime frame count *after* loading the exact canonical source and *before*
+runtime frame count after loading the exact canonical source and before
 model/dataset construction, preserving the canonical architecture/parameter
 code while allowing real T32/T64/etc. runs.
 
-It also updates the PartTrace SharedPartTemporal relative-bias horizon by
-changing audit_model.FRAMES before model initialization.
+It also updates the PartTrace relative-time-bias horizon before model
+initialization.
 """
 from __future__ import annotations
 
@@ -18,6 +18,15 @@ import argparse
 import dataclasses
 import os
 import sys
+from pathlib import Path
+
+# IMPORTANT: this file is launched directly as a subprocess by the Kaggle
+# notebook runner. In that mode Python puts this file's directory on sys.path,
+# not the repository root. Add the root before importing the experiments
+# package, otherwise both XSUB/XSET workers fail immediately.
+REPO = Path(__file__).resolve().parents[2]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 
 from experiments.parttrace_v3_attention_lite import audit_model as audit
 from experiments.parttrace_v3_attention_lite import train_v32 as base
@@ -46,10 +55,8 @@ def main() -> int:
 
     os.environ["NESTSAR_FRAMES"] = str(frames)
 
-    # train_v32 imported FRAMES by value from audit_model, while
-    # SharedPartTemporal resolves audit_model.FRAMES from its defining module at
-    # apply/init time. Update both so dummy inputs and relative-bias buckets use
-    # the requested sequence length.
+    # train_v32 imported FRAMES by value from audit_model. Update both so the
+    # audit dummy and PartTrace relative-time-bias horizon use the requested T.
     audit.FRAMES = frames
     base.FRAMES = frames
 
