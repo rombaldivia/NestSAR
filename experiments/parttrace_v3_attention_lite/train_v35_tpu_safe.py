@@ -2,8 +2,9 @@
 # -*- coding: utf-8 -*-
 """Safety wrapper for the v3.5 TPU trainer.
 
-Adds two guards without duplicating the main trainer:
+Adds experiment-integrity guards without duplicating the main trainer:
 - checkpoint payload protocol must match the requested NTU120 protocol when declared;
+- derivative PartTrace/TokenPreserve/CrossStream checkpoints are not auto-used as the base;
 - saved checkpoints record the exact branch/base ramp scales of their best epoch.
 """
 from __future__ import annotations
@@ -21,10 +22,12 @@ import jax.numpy as jnp
 from experiments.parttrace_v3_attention_lite import train_v35_tpu as tr
 
 _ORIGINAL_TO_BYTES = tr.serialization.to_bytes
+_DERIVATIVE_MARKERS = ("parttrace", "tokenpreserve", "crossstream", "cross-stream")
 
 
 def _safe_load_compatible_base(spec: str, protocol: str, template):
     errors = []
+    explicit = spec.lower() not in ("auto", "none", "scratch")
     for path in tr._checkpoint_candidates(spec, protocol):
         try:
             payload = tr.serialization.msgpack_restore(path.read_bytes())
@@ -37,6 +40,19 @@ def _safe_load_compatible_base(spec: str, protocol: str, template):
                     if declared and declared != protocol:
                         errors.append(
                             f"{path}: declared protocol={declared!r}, requested={protocol!r}"
+                        )
+                        continue
+
+                # In AUTO mode, insist on a clean Attention-Lite lineage. An explicit
+                # path is allowed to override this for intentional continuation runs.
+                model_name = payload.get("model")
+                if model_name is not None and not explicit:
+                    if isinstance(model_name, bytes):
+                        model_name = model_name.decode("utf-8", errors="replace")
+                    model_text = str(model_name).lower()
+                    if any(marker in model_text for marker in _DERIVATIVE_MARKERS):
+                        errors.append(
+                            f"{path}: derivative checkpoint model={model_name!r}; skipped in auto mode"
                         )
                         continue
 
