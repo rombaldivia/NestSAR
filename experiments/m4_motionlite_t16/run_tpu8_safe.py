@@ -1,198 +1,103 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-"""Safe first-run launcher for one Kaggle TPU v5e-8.
+"""Process-isolated launcher for one Kaggle TPU v5e-8.
 
-One Kaggle TPU accelerator should expose 8 local JAX TPU devices. This launcher
-uses exactly one Python process and all 8 local devices with pmap. Before any
-long preprocessing/training it performs:
-  1) backend/device-count validation,
-  2) model init on T16,
-  3) real pmap forward + backward + cross-device gradient reduction,
-  4) finite-value/shape validation,
-  5) NTU120 dataset discovery, split validation, and one-sample preprocessing.
-
-Only after every preflight passes does it enter the normal XSUB -> XSET trainer.
+Pattern intentionally mirrors the older validated NestSAR TPU launchers:
+- this parent process NEVER imports JAX;
+- an isolated child first proves backend=tpu and local_device_count=8;
+- a second isolated child runs the real M4 MotionLite forward/backward/pmean smoke test;
+- only after both pass is the full trainer started in a fresh TPU child process.
 """
 
-import importlib.util
+import os
+import re
+import subprocess
 import sys
-from functools import partial
-from pathlib import Path
 
-import numpy as np
-
-HERE = Path(__file__).resolve().parent
-TRAINER_PATH = HERE / "train_m4_motionlite_t16_tpu.py"
-
-spec = importlib.util.spec_from_file_location("m4_motionlite_t16_trainer", TRAINER_PATH)
-if spec is None or spec.loader is None:
-    raise RuntimeError(f"Could not import trainer: {TRAINER_PATH}")
-tr = importlib.util.module_from_spec(spec)
-# Python 3.12 + Flax dataclass processing requires dynamically imported modules
-# to be registered before exec_module(). Without this, Flax's @nn.Module
-# dataclass transform sees sys.modules[cls.__module__] == None.
-sys.modules[spec.name] = tr
-spec.loader.exec_module(tr)
-
-jax = tr.jax
-jnp = tr.jnp
-
-EXPECTED_LOCAL_DEVICES = 8
-SPATIAL_DIM = 24
-MODEL_DIM = 112
-DROPOUT = 0.10
-SEED = 128
+EXPECTED_DEVICES = 8
 
 
-def banner(title: str) -> None:
+def forced_tpu_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["JAX_PLATFORMS"] = "tpu"
+    env["PYTHONUNBUFFERED"] = "1"
+    env.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+    env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    env.setdefault("MALLOC_ARENA_MAX", "2")
+    return env
+
+
+def probe_tpu() -> None:
+    code = r'''
+import jax
+print("JAX_VERSION=" + str(jax.__version__))
+print("BACKEND=" + str(jax.default_backend()))
+print("LOCAL_DEVICE_COUNT=" + str(jax.local_device_count()))
+print("DEVICES=" + repr(jax.local_devices()))
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=forced_tpu_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    combined = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+
     print("=" * 112, flush=True)
-    print(title, flush=True)
+    print("M4-MOTIONLITE-T16 | ISOLATED TPU RUNTIME PROBE", flush=True)
     print("=" * 112, flush=True)
+    print(combined.strip(), flush=True)
 
+    if result.returncode != 0:
+        low = combined.lower()
+        if "libtpu.so" in low and (
+            "cannot open shared object file" in low or "failed to open" in low
+        ):
+            raise RuntimeError(
+                "TPU JAX runtime is missing libtpu.so. Keep the TPU accelerator selected and "
+                "repair the TPU-enabled JAX runtime before training."
+            )
+        raise RuntimeError("Isolated JAX TPU probe failed before model initialization")
 
-def strict_tpu_preflight() -> None:
-    banner("NESTSAR M4-MOTIONLITE-T16 — SINGLE TPU / 8-CORE STRICT PREFLIGHT")
-
-    backend = jax.default_backend()
-    devices = jax.local_devices()
-    ndev = len(devices)
-
-    print(f"JAX_VERSION={jax.__version__}", flush=True)
-    print(f"BACKEND={backend}", flush=True)
-    print(f"LOCAL_DEVICE_COUNT={ndev}", flush=True)
-    print(f"DEVICES={devices}", flush=True)
+    backend_m = re.search(r"^BACKEND=(.+)$", combined, flags=re.MULTILINE)
+    count_m = re.search(r"^LOCAL_DEVICE_COUNT=(\d+)$", combined, flags=re.MULTILINE)
+    backend = backend_m.group(1).strip() if backend_m else "unknown"
+    count = int(count_m.group(1)) if count_m else -1
 
     if backend != "tpu":
+        raise RuntimeError(f"Expected backend='tpu', got {backend!r}")
+    if count != EXPECTED_DEVICES:
         raise RuntimeError(
-            "TPU backend is not active. In Kaggle select Accelerator -> TPU VM / TPU v5e-8 "
-            "and restart the notebook session before running this cell."
+            f"Expected one Kaggle v5e-8 exposing {EXPECTED_DEVICES} local TPU devices; got {count}"
         )
-    if ndev != EXPECTED_LOCAL_DEVICES:
-        raise RuntimeError(
-            f"This safe launcher expects one Kaggle v5e-8 exposing exactly "
-            f"{EXPECTED_LOCAL_DEVICES} local TPU devices; JAX reports {ndev}."
-        )
-    if any(getattr(d, "platform", "") != "tpu" for d in devices):
-        raise RuntimeError(f"Non-TPU device found in local device list: {devices}")
-
-    model = tr.M4MotionLiteT16(
-        spatial_dim=SPATIAL_DIM,
-        model_dim=MODEL_DIM,
-        dropout=DROPOUT,
-    )
-
-    key = jax.random.PRNGKey(SEED)
-    key, init_key = jax.random.split(key)
-    dummy = jnp.zeros((1, tr.FRAMES, tr.FEATURES), jnp.float32)
-    params = model.init(
-        {"params": init_key, "dropout": init_key},
-        dummy,
-        training=False,
-    )["params"]
-    nparams = tr.count_params(params)
-    print(f"MODEL_INIT=PASS | PARAMS={nparams:,} | INPUT=(B,{tr.FRAMES},{tr.FEATURES})", flush=True)
-
-    per_device_batch = 2
-    xb = np.zeros(
-        (ndev, per_device_batch, tr.FRAMES, tr.FEATURES),
-        dtype=np.float32,
-    )
-    yb = np.zeros((ndev, per_device_batch), dtype=np.int32)
-    rngs = jax.random.split(key, ndev)
-    params_repl = jax.device_put_replicated(params, devices)
-
-    @partial(jax.pmap, axis_name="d")
-    def smoke_step(p, rng, x, y):
-        rng, drop = jax.random.split(rng)
-
-        def loss_fn(pp):
-            out = model.apply(
-                {"params": pp},
-                x,
-                training=True,
-                rngs={"dropout": drop},
-            )
-            main = jnp.mean(tr.smooth_ce(out["logits"], y, 0.05))
-            stream_logits = out["stream_logits"]
-            aux = jnp.mean(
-                tr.smooth_ce(
-                    stream_logits.reshape(-1, tr.NUM_CLASSES),
-                    jnp.repeat(y, tr.NUM_STREAMS),
-                    0.05,
-                )
-            )
-            loss = main + 0.15 * aux
-            return loss, out["logits"]
-
-        (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(p)
-        grads = jax.lax.pmean(grads, "d")
-        loss = jax.lax.pmean(loss, "d")
-        grad_sq = sum(
-            jnp.sum(jnp.square(g)).astype(jnp.float32)
-            for g in jax.tree_util.tree_leaves(grads)
-        )
-        grad_norm = jnp.sqrt(grad_sq)
-        return rng, loss, grad_norm, logits
-
-    rngs, loss, grad_norm, logits = smoke_step(params_repl, rngs, xb, yb)
-    loss_np = np.asarray(jax.device_get(loss))
-    grad_np = np.asarray(jax.device_get(grad_norm))
-    logits_np = np.asarray(jax.device_get(logits))
-
-    if logits_np.shape != (ndev, per_device_batch, tr.NUM_CLASSES):
-        raise RuntimeError(f"Unexpected pmap logits shape: {logits_np.shape}")
-    if not np.all(np.isfinite(loss_np)):
-        raise RuntimeError(f"Non-finite synthetic loss: {loss_np}")
-    if not np.all(np.isfinite(grad_np)):
-        raise RuntimeError(f"Non-finite synthetic gradient norm: {grad_np}")
-    if not np.all(np.isfinite(logits_np)):
-        raise RuntimeError("Non-finite synthetic logits")
 
     print(
-        f"PMAP_FORWARD_BACKWARD=PASS | {ndev}/{ndev} cores | "
-        f"loss={float(loss_np[0]):.6f} | grad_norm={float(grad_np[0]):.6f}",
+        f"TPU_RUNTIME_PROBE=PASS | backend=tpu | local_devices={count}",
         flush=True,
     )
-
-    dataset = tr.find_dataset(None)
-    print(f"DATASET_FOUND={dataset}", flush=True)
-    annotations, split = tr.load_ntu(dataset)
-    if not annotations:
-        raise RuntimeError("NTU120 annotation list is empty")
-
-    for protocol in ("xsub", "xset"):
-        tk, vk = tr.resolve_split(split, protocol)
-        if len(split[tk]) == 0 or len(split[vk]) == 0:
-            raise RuntimeError(f"Empty {protocol} split: train={tk}, val={vk}")
-        print(
-            f"{protocol.upper()}_SPLIT=PASS | train={len(split[tk]):,} | val={len(split[vk]):,}",
-            flush=True,
-        )
-
-    sample = next((a for a in annotations if isinstance(a, tr.Mapping)), None)
-    if sample is None:
-        raise RuntimeError("Could not find a mapping-style NTU annotation")
-    sample_x = tr.preprocess_keypoints(tr.annotation_keypoints(sample), "motion")
-    sample_y = tr.annotation_label(sample)
-    if sample_x.shape != (tr.FRAMES, tr.FEATURES):
-        raise RuntimeError(f"Unexpected preprocessed sample shape: {sample_x.shape}")
-    if not np.all(np.isfinite(sample_x)):
-        raise RuntimeError("Preprocessed sample contains NaN/Inf")
-    if not 0 <= int(sample_y) < tr.NUM_CLASSES:
-        raise RuntimeError(f"Sample label out of range: {sample_y}")
-
-    print(
-        f"REAL_SAMPLE_PREPROCESS=PASS | shape={sample_x.shape} | label={int(sample_y)}",
-        flush=True,
-    )
-    print("STRICT_PREFLIGHT=PASS — entering full training", flush=True)
     print("=" * 112, flush=True)
 
 
-def run_full_training() -> None:
-    sys.argv = [
-        str(TRAINER_PATH),
+def run_child(module: str, *args: str) -> None:
+    cmd = [sys.executable, "-u", "-m", module, *args]
+    print("RUN:", " ".join(cmd), flush=True)
+    subprocess.run(cmd, env=forced_tpu_env(), check=True)
+
+
+def main() -> int:
+    # 1) Runtime/topology only. Fresh process; parent has never imported JAX.
+    probe_tpu()
+
+    # 2) Full model smoke test: init + pmap + forward + backward + pmean + real NTU sample.
+    run_child("experiments.m4_motionlite_t16.preflight_tpu8")
+
+    # 3) Fresh TPU process for the actual long run. XSUB and XSET are sequential.
+    print("PREFLIGHTS PASSED — STARTING FULL TRAINING", flush=True)
+    run_child(
+        "experiments.m4_motionlite_t16.train_m4_motionlite_t16_tpu",
         "--protocol", "both",
         "--selector", "motion",
         "--epochs", "60",
@@ -207,17 +112,16 @@ def run_full_training() -> None:
         "--grad-clip", "1.0",
         "--ema-decay", "0.995",
         "--stream-aux-weight", "0.15",
-        "--spatial-dim", str(SPATIAL_DIM),
-        "--model-dim", str(MODEL_DIM),
-        "--dropout", str(DROPOUT),
-        "--seed", str(SEED),
+        "--spatial-dim", "24",
+        "--model-dim", "112",
+        "--dropout", "0.10",
+        "--seed", "128",
         "--progress-every", "5",
         "--audit-first",
         "--outdir", "/kaggle/working/NestSAR_M4_MotionLite_T16_TPU",
-    ]
-    tr.main()
+    )
+    return 0
 
 
 if __name__ == "__main__":
-    strict_tpu_preflight()
-    run_full_training()
+    raise SystemExit(main())
