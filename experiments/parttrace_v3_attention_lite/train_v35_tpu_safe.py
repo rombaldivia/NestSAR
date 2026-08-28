@@ -8,7 +8,13 @@ Adds two guards without duplicating the main trainer:
 """
 from __future__ import annotations
 
+import sys
 from collections.abc import Mapping
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 
 import jax.numpy as jnp
 
