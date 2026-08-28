@@ -1,0 +1,75 @@
+{
+  "model": "AttentionLiteCrossStreamMultiResolutionMemoryV35",
+  "protocols": ["xsub", "xset"],
+  "frames": 16,
+  "canonical_attention_lite": {
+    "params": 2381028,
+    "leaves": 705,
+    "known_base_gflops": 0.0604169,
+    "pretrained_ema_required": true
+  },
+  "architecture": {
+    "bridge_dim": 32,
+    "local_stream_dim": 16,
+    "memory_dim": 32,
+    "fine_dim": 24,
+    "coarse_tokens": 320,
+    "fine_tokens": 320,
+    "readout_tokens": 8,
+    "readout_heads": 4,
+    "dense_dim": 128,
+    "dropout": 0.08,
+    "stream_reweight_strength": 0.08,
+    "max_class_gate": 0.20
+  },
+  "training": {
+    "epochs": 60,
+    "patience": 12,
+    "seed": 128,
+    "global_batch": 256,
+    "eval_global_batch": 512,
+    "base_lr": 0.000075,
+    "new_lr": 0.0005,
+    "base_min_lr": 0.000003,
+    "new_min_lr": 0.00002,
+    "warmup_fraction": 0.06,
+    "base_weight_decay": 0.015,
+    "new_weight_decay": 0.03,
+    "label_smoothing": 0.05,
+    "grad_clip": 1.0,
+    "ema_decay": 0.997,
+    "predictive_loss_weight": 0.03,
+    "memory_aux_warmup_weight": 0.45,
+    "memory_aux_final_weight": 0.15,
+    "diversity_loss_weight": 0.03,
+    "stream_kl_weight": 0.01,
+    "freeze_base_epochs": 3,
+    "base_unfreeze_ramp_epochs": 3,
+    "freeze_branch_epochs": 2,
+    "branch_ramp_epochs": 4
+  },
+  "tpu": {
+    "expected_devices": 8,
+    "protocol_execution": "sequential_all_8_cores",
+    "train_local_batch_per_core": 32,
+    "eval_local_batch_per_core": 64
+  },
+  "targets": {
+    "primary": "maximize NTU120 validation accuracy above pretrained Attention-Lite",
+    "gflops_full_upper_target": 0.08,
+    "params_full_upper_target": 2700000
+  },
+  "required_metrics": [
+    "val_accuracy",
+    "macro_val_accuracy",
+    "memory_val_accuracy",
+    "dynamic_fusion_weights",
+    "class_gate_mean",
+    "class_gate_max",
+    "class_gate_min",
+    "query_overlap_mean",
+    "query_overlap_max",
+    "confusion_matrix",
+    "per_class_accuracy"
+  ]
+}
