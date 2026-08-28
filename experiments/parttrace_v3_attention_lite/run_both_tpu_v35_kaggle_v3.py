@@ -9,7 +9,8 @@ visible (or simply be running a GPU accelerator session), causing JAX to choose
 The wrapper therefore:
 1. runs an isolated child-process TPU probe before training;
 2. forces JAX_PLATFORMS=tpu and hides CUDA from every v3.5 worker;
-3. keeps the protocol-safe checkpoint worker and the persistent two-row tqdm UI.
+3. distinguishes a missing libtpu runtime from a wrong Kaggle accelerator;
+4. keeps the protocol-safe checkpoint worker and persistent two-row tqdm UI.
 
 The parent process itself never imports JAX, so it cannot acquire TPU devices.
 """
@@ -35,9 +36,7 @@ _ORIGINAL_POPEN = subprocess.Popen
 
 def _forced_tpu_env(env=None):
     out = dict(os.environ if env is None else env)
-    # Do not allow an installed CUDA backend to win platform selection.
     out["CUDA_VISIBLE_DEVICES"] = ""
-    # No fallback: if TPU is unavailable, fail loudly instead of training on GPU/CPU.
     out["JAX_PLATFORMS"] = "tpu"
     out["PYTHONUNBUFFERED"] = "1"
     out.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
@@ -46,11 +45,12 @@ def _forced_tpu_env(env=None):
 
 
 def _expected_devices_from_argv(default=8):
-    for i, arg in enumerate(sys.argv[1:]):
-        if arg == "--expected-devices" and i + 2 <= len(sys.argv[1:]):
+    args = sys.argv[1:]
+    for i, arg in enumerate(args):
+        if arg == "--expected-devices" and i + 1 < len(args):
             try:
-                return int(sys.argv[1:][i + 1])
-            except (ValueError, IndexError):
+                return int(args[i + 1])
+            except ValueError:
                 pass
         if arg.startswith("--expected-devices="):
             try:
@@ -82,11 +82,18 @@ print("DEVICES=" + repr(jax.local_devices()))
     print(combined.strip(), flush=True)
 
     if probe.returncode != 0:
+        low = combined.lower()
+        if "libtpu.so" in low and ("cannot open shared object file" in low or "failed to open" in low):
+            raise RuntimeError(
+                "TPU preflight found JAX but the TPU runtime library libtpu.so is missing.\n"
+                "Install the TPU-enabled JAX runtime in a fresh Kaggle TPU session before training, e.g.\n"
+                "    %pip install -q --upgrade 'jax[tpu]==0.7.2'\n"
+                "then rerun the isolated TPU probe. Do not start training until it reports backend=tpu."
+            )
         raise RuntimeError(
             "TPU preflight failed before training. JAX could not initialize the TPU platform.\n"
-            "This normally means the current Kaggle session is still a GPU/CPU session, "
-            "or the TPU runtime was not initialized. Select a TPU accelerator in Kaggle "
-            "and restart the session, then rerun the notebook from the clone cell."
+            "Verify the Kaggle notebook accelerator is TPU, restart the session if you changed it, "
+            "and rerun the TPU bootstrap/probe before starting v3.5."
         )
 
     backend_match = re.search(r"^BACKEND=(.+)$", combined, flags=re.MULTILINE)
@@ -116,9 +123,6 @@ def main() -> int:
     expected = _expected_devices_from_argv(default=8)
     _probe_tpu(expected)
 
-    # base.main() owns the persistent tqdm bars/progress JSON. Only replace its
-    # worker process constructor so every child starts with TPU forced before JAX
-    # is imported by train_v35_tpu_safe.py.
     original = base.subprocess.Popen
     base.subprocess.Popen = _forced_popen
     try:
