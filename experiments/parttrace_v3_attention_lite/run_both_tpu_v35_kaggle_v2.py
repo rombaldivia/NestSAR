@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Protocol-safe notebook launcher for v3.5 TPU.
+"""Compatibility entry point for the hardened v3.5 TPU launcher.
 
-Reuses the persistent two-row tqdm UI from run_both_tpu_v35_kaggle.py and points
-workers at train_v35_tpu_safe.py.
+Kept so existing Kaggle cells that call ``run_both_tpu_v35_kaggle_v2.py``
+automatically receive the TPU preflight/forcing fix implemented in v3.
 """
 from __future__ import annotations
 
@@ -14,10 +14,8 @@ REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from experiments.parttrace_v3_attention_lite import run_both_tpu_v35_kaggle as base
-
-base.TRAINER = Path(__file__).resolve().parent / "train_v35_tpu_safe.py"
+from experiments.parttrace_v3_attention_lite import run_both_tpu_v35_kaggle_v3 as hardened
 
 
 if __name__ == "__main__":
-    raise SystemExit(base.main())
+    raise SystemExit(hardened.main())
