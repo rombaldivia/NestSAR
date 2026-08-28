@@ -3,8 +3,8 @@ from __future__ import annotations
 
 """Safe first-run launcher for one Kaggle TPU v5e-8.
 
-One Kaggle TPU accelerator should expose 8 local JAX TPU devices.  This launcher
-uses exactly one Python process and all 8 local devices with pmap.  Before any
+One Kaggle TPU accelerator should expose 8 local JAX TPU devices. This launcher
+uses exactly one Python process and all 8 local devices with pmap. Before any
 long preprocessing/training it performs:
   1) backend/device-count validation,
   2) model init on T16,
@@ -29,6 +29,10 @@ spec = importlib.util.spec_from_file_location("m4_motionlite_t16_trainer", TRAIN
 if spec is None or spec.loader is None:
     raise RuntimeError(f"Could not import trainer: {TRAINER_PATH}")
 tr = importlib.util.module_from_spec(spec)
+# Python 3.12 + Flax dataclass processing requires dynamically imported modules
+# to be registered before exec_module(). Without this, Flax's @nn.Module
+# dataclass transform sees sys.modules[cls.__module__] == None.
+sys.modules[spec.name] = tr
 spec.loader.exec_module(tr)
 
 jax = tr.jax
@@ -89,8 +93,6 @@ def strict_tpu_preflight() -> None:
     nparams = tr.count_params(params)
     print(f"MODEL_INIT=PASS | PARAMS={nparams:,} | INPUT=(B,{tr.FRAMES},{tr.FEATURES})", flush=True)
 
-    # Two samples per TPU device.  This compiles the same classes of operations
-    # used by the real trainer: dropout, loss, autodiff, pmean and pmap.
     per_device_batch = 2
     xb = np.zeros(
         (ndev, per_device_batch, tr.FRAMES, tr.FEATURES),
@@ -148,12 +150,11 @@ def strict_tpu_preflight() -> None:
         raise RuntimeError("Non-finite synthetic logits")
 
     print(
-        f"PMAP_FORWARD_BACKWARD=PASS | 8/8 cores | "
+        f"PMAP_FORWARD_BACKWARD=PASS | {ndev}/{ndev} cores | "
         f"loss={float(loss_np[0]):.6f} | grad_norm={float(grad_np[0]):.6f}",
         flush=True,
     )
 
-    # Validate the real dataset and both protocols before the expensive materialization.
     dataset = tr.find_dataset(None)
     print(f"DATASET_FOUND={dataset}", flush=True)
     annotations, split = tr.load_ntu(dataset)
@@ -190,8 +191,6 @@ def strict_tpu_preflight() -> None:
 
 
 def run_full_training() -> None:
-    # One TPU accelerator, all 8 local cores. XSUB and XSET run sequentially,
-    # never concurrently, so they cannot compete for the same TPU.
     sys.argv = [
         str(TRAINER_PATH),
         "--protocol", "both",
