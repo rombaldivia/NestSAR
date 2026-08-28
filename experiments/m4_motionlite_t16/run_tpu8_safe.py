@@ -7,7 +7,8 @@ Pattern intentionally mirrors the older validated NestSAR TPU launchers:
 - this parent process NEVER imports JAX;
 - an isolated child first proves backend=tpu and local_device_count=8;
 - a second isolated child runs the real M4 MotionLite forward/backward/pmean smoke test;
-- only after both pass is the full trainer started in a fresh TPU child process.
+- only after both pass is the full trainer started in a fresh TPU child process;
+- JAX >=0.10 workers install the documented device replication compatibility shim.
 """
 
 import os
@@ -88,16 +89,13 @@ def run_child(module: str, *args: str) -> None:
 
 
 def main() -> int:
-    # 1) Runtime/topology only. Fresh process; parent has never imported JAX.
     probe_tpu()
 
-    # 2) Full model smoke test: init + pmap + forward + backward + pmean + real NTU sample.
-    run_child("experiments.m4_motionlite_t16.preflight_tpu8")
+    run_child("experiments.m4_motionlite_t16.preflight_tpu8_jax10")
 
-    # 3) Fresh TPU process for the actual long run. XSUB and XSET are sequential.
     print("PREFLIGHTS PASSED — STARTING FULL TRAINING", flush=True)
     run_child(
-        "experiments.m4_motionlite_t16.train_m4_motionlite_t16_tpu",
+        "experiments.m4_motionlite_t16.train_tpu8_jax10",
         "--protocol", "both",
         "--selector", "motion",
         "--epochs", "60",
