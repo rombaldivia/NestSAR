@@ -1,0 +1,52 @@
+{
+  "experiment": "NestSAR_v36_T64_FROM_ZERO_DualT4",
+  "protocols": ["xsub", "xset"],
+  "hardware": {
+    "xsub": "T4-0",
+    "xset": "T4-1"
+  },
+  "frames": 64,
+  "memory_frames": 16,
+  "memory_tokens": 640,
+  "temporal_reduction": "motion-aware 4x",
+  "scratch": true,
+  "architecture": {
+    "bridge_dim": 32,
+    "local_stream_dim": 16,
+    "memory_dim": 32,
+    "fine_dim": 24,
+    "readout_tokens": 8,
+    "readout_heads": 4,
+    "dense_dim": 128,
+    "stream_reweight_strength": 0.08,
+    "gate_scale_vs_v35": 0.50,
+    "uncertainty_floor": 0.35
+  },
+  "training": {
+    "epochs": 40,
+    "patience": 10,
+    "seed": 128,
+    "batch_size": 32,
+    "eval_batch_size": 64,
+    "dropout": 0.10,
+    "base_lr": 0.0004,
+    "new_lr": 0.0006,
+    "base_min_lr": 0.00001,
+    "new_min_lr": 0.00002,
+    "warmup_fraction": 0.08,
+    "base_weight_decay": 0.03,
+    "new_weight_decay": 0.04,
+    "label_smoothing": 0.05,
+    "grad_clip": 1.0,
+    "ema_decay": 0.995,
+    "predictive_loss_weight": 0.05,
+    "memory_aux_warmup_weight": 0.50,
+    "memory_aux_final_weight": 0.20,
+    "diversity_loss_weight": 0.03,
+    "stream_kl_weight": 0.01,
+    "freeze_base_epochs": 0,
+    "base_unfreeze_ramp_epochs": 0,
+    "freeze_branch_epochs": 5,
+    "branch_ramp_epochs": 5
+  }
+}
