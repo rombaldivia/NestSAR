@@ -4,11 +4,11 @@ from __future__ import annotations
 """T64 teacher matched to the current T16 Phase+Jitter+Consistency champion.
 
 Same learnable architecture/parameter shapes as T16, but 64 temporal phase tokens
-and 16 chunks of 4 tokens each.  Training keeps the proven dual canonical/jitter
-consistency objective.  Validation/inference uses canonical segmentation only.
+and 16 chunks of 4 tokens each. Training keeps the proven dual canonical/jitter
+consistency objective. Validation/inference uses canonical segmentation only.
 
 Host-memory control: canonical/jitter/validation token caches are stored as float16
-and cast back to float32 batch-wise before TPU transfer.  This keeps one protocol's
+and cast back to float32 batch-wise before TPU transfer. This keeps one protocol's
 cache around ~16-18 GB rather than ~32-36 GB.
 """
 
@@ -31,11 +31,11 @@ FRAMES = 64
 PERSONS = 2
 JOINTS = 25
 TOKEN_CHANNELS = 15
-FEATURES = PERSONS * JOINTS * TOKEN_CHANNELS  # 750
+FEATURES = PERSONS * JOINTS * TOKEN_CHANNELS
 NUM_CLASSES = 120
 NUM_STREAMS = 4
 CHUNK_SIZE = 4
-CHUNKS = FRAMES // CHUNK_SIZE  # 16
+CHUNKS = FRAMES // CHUNK_SIZE
 EXPECTED_PARAMS = 1_816_130
 CACHE_DTYPE = np.float16
 
@@ -129,7 +129,14 @@ def build_protocol_views64(
         Xva[i] = segment_phase_tokens64(base.annotation_keypoints(a)).astype(CACHE_DTYPE)
         yva[i] = base.annotation_label(a)
 
-    changed = float(np.mean(np.any(np.abs(Xcan.astype(np.float32) - Xjit.astype(np.float32)) > 1e-5, axis=(1, 2))))
+    # Audit jitter difference in small blocks to avoid creating a >10 GiB float32 temporary.
+    changed_count = 0
+    audit_block = 256
+    for s in range(0, len(Xcan), audit_block):
+        e = min(s + audit_block, len(Xcan))
+        changed_count += int(np.sum(np.any(Xcan[s:e] != Xjit[s:e], axis=(1, 2))))
+    changed = changed_count / max(len(Xcan), 1)
+
     gib = (Xcan.nbytes + Xjit.nbytes + Xva.nbytes) / (1024 ** 3)
     cons.log(
         f"{protocol.upper()} T64 jitter differs for {100*changed:.2f}% | "
@@ -172,9 +179,13 @@ class DescriptorHeadT64(nn.Module):
 
     @nn.compact
     def __call__(self, frame_h: jnp.ndarray, training: bool):
-        chunks = frame_h.reshape(frame_h.shape[0], CHUNKS, CHUNK_SIZE, self.dim).mean(axis=2)
+        chunks = frame_h.reshape(
+            frame_h.shape[0], CHUNKS, CHUNK_SIZE, self.dim
+        ).mean(axis=2)
         chunks = base.BiMemory(self.dim, name="chunk_memory")(chunks)
-        pooled = jnp.concatenate([frame_h.mean(axis=1), chunks.mean(axis=1)], axis=-1)
+        pooled = jnp.concatenate(
+            [frame_h.mean(axis=1), chunks.mean(axis=1)], axis=-1
+        )
         pooled = nn.Dense(self.dim, name="hier_fuse")(pooled)
         pooled = nn.LayerNorm(name="hier_norm")(nn.gelu(pooled))
         pooled = nn.Dropout(self.dropout)(pooled, deterministic=not training)
@@ -188,7 +199,9 @@ class M4PhaseUniformT64Teacher(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = False) -> Mapping[str, jnp.ndarray]:
-        tok = x.reshape(x.shape[0], FRAMES, PERSONS, JOINTS, TOKEN_CHANNELS)
+        tok = x.reshape(
+            x.shape[0], FRAMES, PERSONS, JOINTS, TOKEN_CHANNELS
+        )
         pose = tok[..., 0:3]
         full_disp = tok[..., 3:6]
         phase_a = tok[..., 6:9]
@@ -199,7 +212,9 @@ class M4PhaseUniformT64Teacher(nn.Module):
         parents = jnp.asarray(base.PARENTS)
         bone = joint - jnp.take(joint, parents, axis=3)
 
-        joint_motion = jnp.concatenate([full_disp, phase_a, phase_b, path], axis=-1)
+        joint_motion = jnp.concatenate(
+            [full_disp, phase_a, phase_b, path], axis=-1
+        )
         parent_full = jnp.take(full_disp, parents, axis=3)
         parent_a = jnp.take(phase_a, parents, axis=3)
         parent_b = jnp.take(phase_b, parents, axis=3)
@@ -245,11 +260,17 @@ class M4PhaseUniformT64Teacher(nn.Module):
             )(mixed[:, :, i], training)
             descriptors.append(desc)
             chunk_states.append(chunks)
-            stream_logits.append(nn.Dense(NUM_CLASSES, name=f"classifier_{i}")(desc))
+            stream_logits.append(
+                nn.Dense(NUM_CLASSES, name=f"classifier_{i}")(desc)
+            )
 
         descs = jnp.stack(descriptors, axis=1)
         sl = jnp.stack(stream_logits, axis=1)
-        fusion = jnp.full((x.shape[0], NUM_STREAMS), 1.0 / NUM_STREAMS, dtype=sl.dtype)
+        fusion = jnp.full(
+            (x.shape[0], NUM_STREAMS),
+            1.0 / NUM_STREAMS,
+            dtype=sl.dtype,
+        )
         logits = jnp.mean(sl, axis=1)
 
         return {
@@ -266,7 +287,6 @@ class M4PhaseUniformT64Teacher(nn.Module):
 
 
 def install_overrides() -> None:
-    # Uniform infrastructure used dynamically by consistency trainer.
     ju.FRAMES = FRAMES
     ju.TOKEN_CHANNELS = TOKEN_CHANNELS
     ju.FEATURES = FEATURES
@@ -275,7 +295,6 @@ def install_overrides() -> None:
     ju.build_protocol_views = build_protocol_views64
     ju.iter_eval = iter_eval64
 
-    # Consistency trainer local globals.
     cons.FRAMES = FRAMES
     cons.FEATURES = FEATURES
     cons.EXPECTED_PARAMS = EXPECTED_PARAMS
@@ -288,7 +307,9 @@ def rewrite_checkpoint_metadata(outdir: str, protocol: str) -> None:
         return
     payload = serialization.msgpack_restore(ckpt.read_bytes())
     payload["model"] = "M4PhaseJitterConsistencyT64Teacher"
-    payload["teacher_role"] = "T64 feature/logit teacher candidate for T16 distillation"
+    payload["teacher_role"] = (
+        "T64 feature/logit teacher candidate for T16 distillation"
+    )
     payload["representation"] = {
         "frames": FRAMES,
         "token_channels": TOKEN_CHANNELS,
@@ -302,10 +323,14 @@ def rewrite_checkpoint_metadata(outdir: str, protocol: str) -> None:
         ],
         "chunk_size": CHUNK_SIZE,
         "chunks": CHUNKS,
-        "jitter_max_shift": payload.get("config", {}).get("jitter_max_shift", 1),
+        "jitter_max_shift": payload.get("config", {}).get(
+            "jitter_max_shift", 1
+        ),
         "final_fusion": "uniform_mean",
         "consistency": "symmetric_kl",
-        "consistency_weight": payload.get("config", {}).get("consistency_weight", 0.08),
+        "consistency_weight": payload.get("config", {}).get(
+            "consistency_weight", 0.08
+        ),
         "cache_storage_dtype": "float16_precompute_float32_model_input",
     }
     ckpt.write_bytes(serialization.to_bytes(payload))
@@ -315,7 +340,10 @@ def main() -> None:
     install_overrides()
     args = cons.parse_args()
 
-    cons.log(f"JAX={jax.__version__} backend={jax.default_backend()} devices={jax.devices()}")
+    cons.log(
+        f"JAX={jax.__version__} backend={jax.default_backend()} "
+        f"devices={jax.devices()}"
+    )
     if jax.default_backend() != "tpu" or jax.local_device_count() != 8:
         raise RuntimeError(
             f"Expected one TPU v5e-8; backend={jax.default_backend()} "
@@ -326,18 +354,25 @@ def main() -> None:
     if args.consistency_temperature <= 0.0:
         raise ValueError("--consistency-temperature must be > 0")
 
-    cons.log("Experiment: matched T64 teacher | Phase + Jitter + Consistency + Uniform Fusion")
+    cons.log(
+        "Experiment: matched T64 teacher | "
+        "Phase + Jitter + Consistency + Uniform Fusion"
+    )
     cons.log(
         f"T64 | chunks={CHUNKS}x{CHUNK_SIZE} | features/token={FEATURES} | "
         f"jitter=+/-{args.jitter_max_shift} raw frame | "
         f"symKL_weight={args.consistency_weight:.3f}"
     )
-    cons.log("Same parameter shapes as T16 champion; extra cost is temporal compute only")
+    cons.log(
+        "Same parameter shapes as T16 champion; extra cost is temporal compute only"
+    )
 
     dataset = ju.base.find_dataset(args.dataset)
     cons.log(f"Dataset={dataset}")
     anns, split = ju.base.load_ntu(dataset)
-    protocols = ["xsub", "xset"] if args.protocol == "both" else [args.protocol]
+    protocols = (
+        ["xsub", "xset"] if args.protocol == "both" else [args.protocol]
+    )
 
     summary = {}
     for pr in protocols:
@@ -353,7 +388,9 @@ def main() -> None:
         }
 
     Path(args.outdir).mkdir(parents=True, exist_ok=True)
-    (Path(args.outdir) / "summary.json").write_text(json.dumps(summary, indent=2))
+    (Path(args.outdir) / "summary.json").write_text(
+        json.dumps(summary, indent=2)
+    )
     cons.log(f"DONE {summary}")
 
 
