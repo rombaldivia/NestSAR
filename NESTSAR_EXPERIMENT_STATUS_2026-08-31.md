@@ -18,8 +18,8 @@ This is the current cross-branch research ledger for the recent M4-derived T16 l
 | Phase-T16 | 16 | **74.0372% @ E26** | **75.1702% @ E36** | **1,817,930** | **0.020194216 GFLOPs** | Verified/consolidated | Added first/second-half signed displacement. Small XSUB gain and stronger XSET gain; phase channels are used, but their controlled benefit is modest. |
 | Phase + Jitter + Uniform Fusion | 16 | **74.607% @ E38 checkpoint** | **75.338% @ E33 checkpoint** | **1,816,130** | **0.020181636 GFLOPs** | Verified/consolidated | Training-only ±1-frame segment-boundary jitter plus fixed uniform final fusion improved generalization while removing the nearly-uniform learned fusion controller. |
 | **Phase + Jitter + Consistency** | 16 | **74.8483% @ E42** | **75.5721% @ E31** | **1,816,130** | **0.020181636 GFLOPs** | **Verified/consolidated — current T16 champion** | Symmetric-KL canonical/jitter consistency (`lambda=0.08`) adds another +0.241 pp XSUB / +0.234 pp XSET over Jitter+Uniform with no inference-cost increase. |
-| PhasePath + Jitter + Uniform | 16 | **74.5046% @ E24** | **75.3098% @ E37** | **1,816,274** | **0.020388036 GFLOPs** | Verified ablation — rejected | Replacing total path with separate path-A/path-B did not help: -0.102 pp XSUB / -0.028 pp XSET vs Jitter+Uniform, with slightly more compute. Preserve explicit total-path magnitude. |
-| TotalPath + PathAsym + Jitter + Uniform | 16 | pending | pending | **1,816,274 expected** | XLA audit pending | Pending | Keeps the successful total-path statistic and adds normalized early-vs-late path asymmetry. This is the last cheap representation ablation before prioritizing T64→T16 KD. |
+| PhasePath + Jitter + Uniform | 16 | **74.5046% @ E24** | **75.3098% @ E37** | **1,816,274** | **0.020388036 GFLOPs** | Verified ablation — rejected | Replacing total path with separate path-A/path-B did not help. Preserve explicit total-path magnitude. |
+| TotalPath + PathAsym + Jitter + Uniform | 16 | **72.7666% @ E33** | **72.9105% @ E30** | **1,816,274** | **0.020385636 GFLOPs** | **Verified ablation — rejected** | Normalized early-vs-late path asymmetry was strongly harmful: -1.84 pp XSUB / -2.43 pp XSET vs Jitter+Uniform. The dimensionless ratio amplifies low-motion differences and did not generalize. |
 
 ### Exact comparison of the recent progression
 
@@ -29,8 +29,8 @@ MotionPreserve             XSUB 73.976   XSET 74.521
 Phase-T16                  XSUB 74.037   XSET 75.170
 Jitter + Uniform           XSUB 74.607   XSET 75.338
 Jitter + Consistency       XSUB 74.848   XSET 75.572   <-- current champion
-PhasePath + Jitter         XSUB 74.505   XSET 75.310   <-- rejected ablation
-PathAsym + Jitter          pending
+PhasePath + Jitter         XSUB 74.505   XSET 75.310   <-- rejected
+PathAsym + Jitter          XSUB 72.767   XSET 72.911   <-- rejected strongly
 ```
 
 ## Current champion audit
@@ -48,23 +48,28 @@ Checkpoint family: **M4PhaseJitterConsistencyT16**.
 - Removing both phase-displacement channels costs **-7.347 pp XSUB**, **-4.566 pp XSET** on the trained checkpoint. These are ablation sensitivities, not independent causal gains.
 - Persistent hard/fine-grained classes include the 70–73 group and recurring classes such as 10/11, 28/29, 81/83 and related confusions.
 
-## Active M4 experiment branches — verified 2026-08-31
+## Representation conclusions
 
-| Branch | Head before ledger sync | Role / status |
-|---|---|---|
-| `experiment/m4-motionlite-t16-tpu` | `4c5e5d3556be6f266766f230e82bd52d28de25aa` | MotionLite baseline + representation audit |
-| `experiment/m4-motionpreserve-t16-tpu` | `9f7871c0e7276d98ffebfa8cce08c105311cee70` | MotionPreserve + weight/activation audits |
-| `experiment/m4-motionpreserve-phase-t16-tpu` | `c2455264baa7b091362717fc7f683b86f86b317b` | Phase-T16 + activation audit |
-| `experiment/m4-phase-jitter-uniform-t16-tpu` | `4ac95090efac24f77afb4b4a73cc9d9ad67879b8` | Jitter + fixed uniform fusion + robustness audit |
-| `experiment/m4-phase-jitter-consistency-t16-tpu` | `5bba3a6510d3b2e243b08e45a48467166bcb0a6f` | Current champion + consistency audit |
-| `experiment/m4-phasepath-jitter-uniform-t16-tpu` | `03556dac0a4fd37c30be7f18a4819906b51c82a3` | Completed negative PhasePath ablation |
-| `experiment/m4-pathasym-jitter-uniform-t16-tpu` | `c247993ee2450f39ee8872a5274e009bd3cd9aa7` | Pending TotalPath + PathAsym controlled ablation |
+1. The large representation gain already occurred at **MotionPreserve** by summarizing full-sequence motion into 16 temporal tokens.
+2. Signed phase-A/B displacement is useful, but additional handcrafted path-phase decompositions have now failed twice.
+3. **PhasePath** was slightly worse than the matched Jitter+Uniform control.
+4. **PathAsym** was materially worse on both protocols and increased neural compute slightly.
+5. Stop adding handcrafted temporal channels by default. The next high-value path is **T64→T16 teacher distillation**, beginning with recovery/re-audit of the exact historical M4G-H4 T64 teacher.
 
-The SHAs above are the experiment heads **before this ledger file is synchronized onto the branches**. The ledger-sync commits will move each branch head without changing experiment code.
+## Active M4 experiment branches — status 2026-08-31
+
+| Branch | Role / status |
+|---|---|
+| `experiment/m4-motionlite-t16-tpu` | MotionLite baseline + representation audit |
+| `experiment/m4-motionpreserve-t16-tpu` | MotionPreserve + weight/activation audits |
+| `experiment/m4-motionpreserve-phase-t16-tpu` | Phase-T16 + activation audit |
+| `experiment/m4-phase-jitter-uniform-t16-tpu` | Jitter + fixed uniform fusion + robustness audit |
+| `experiment/m4-phase-jitter-consistency-t16-tpu` | **Current T16 champion** + consistency audit |
+| `experiment/m4-phasepath-jitter-uniform-t16-tpu` | Completed negative PhasePath ablation |
+| `experiment/m4-pathasym-jitter-uniform-t16-tpu` | Completed negative PathAsym ablation |
+| `research/jointfirst-wide128-2026-08-10` | Historical M4G-H4 JointFirst-Wide128 source line; teacher candidate, but branch is not self-contained and needs recovery/re-audit before KD |
 
 ## Historical references retained
-
-These remain useful context but are separate from the current audited ~20-MFLOP T16 line:
 
 | Variant | XSUB | XSET | Status |
 |---|---:|---:|---|
@@ -76,12 +81,12 @@ These remain useful context but are separate from the current audited ~20-MFLOP 
 ## Current research decision
 
 1. Preserve **Phase + Jitter + Consistency** as the current T16 champion checkpoint family.
-2. Do not increase consistency strength by default; training agreement approached 100%, while validation canonical↔jitter agreement remained ~90%.
-3. Do not return to raw PhasePath; the controlled experiment was slightly worse while increasing compute.
-4. Complete the cheap **TotalPath + PathAsym** controlled ablation.
-5. If PathAsym does not produce a meaningful gain (roughly >=0.2–0.3 pp), stop adding handcrafted temporal channels and prioritize **T64→T16 knowledge distillation**.
+2. Reject raw PhasePath and normalized PathAsym as default representation directions.
+3. Stop adding handcrafted temporal channels unless a new audit provides a specific reason.
+4. Recover and re-audit the exact historical **M4G-H4 T64** teacher checkpoint/config/source before implementing feature KD.
+5. Once teacher provenance is confirmed, prioritize **logit KD + frame-memory feature KD**, then add router-feature KD only if the first controlled run supports it.
 6. Keep frame memory, post-frame cross-stream router, chunk memory and fixed uniform fusion unless a new controlled counterfactual demonstrates otherwise.
-7. Do not claim preprocessing-free end-to-end 20 MFLOPs: the XLA numbers are **neural forward compute only**. MotionPreserve/Phase/Jitter preprocessing examines the full raw sequence before producing the 16 neural temporal tokens.
+7. Neural XLA GFLOPs exclude full-sequence NumPy preprocessing; keep that disclosure in paper/deployment reporting.
 
 ## Publication hygiene
 
