@@ -30,7 +30,7 @@ def _resolve_examples(annotations, split, protocol: str = "xsub", n: int = 128):
 
 def main(dataset_path: str | None = None) -> None:
     print("=" * 120)
-    print("NESTSAR T16 LOCAL-POSE + GLOBAL-MOTION — TPU8 PREFLIGHT")
+    print("NESTSAR T16 LOCAL-POSE + GLOBAL-MOTION — TPU8 PREFLIGHT V2")
     print("=" * 120)
     print("JAX:", jax.__version__)
     print("BACKEND:", jax.default_backend())
@@ -53,6 +53,7 @@ def main(dataset_path: str | None = None) -> None:
         raise RuntimeError("Could not resolve XSUB examples for preprocessing audit")
 
     changed = 0
+    local_coord_max = 0.0
     pose_max = 0.0
     motion_mae_sum = 0.0
     phase_identity_max = 0.0
@@ -61,6 +62,14 @@ def main(dataset_path: str | None = None) -> None:
 
     for a in examples:
         kp = base.annotation_keypoints(a)
+
+        baseline_local = base.canonicalize_raw(kp)
+        new_local, global_motion = lg.canonicalize_local_and_global(kp)
+        local_coord_max = max(
+            local_coord_max,
+            float(np.max(np.abs(baseline_local - new_local))),
+        )
+
         old = phase.segment_phase_tokens(kp).reshape(
             phase.FRAMES, phase.PERSONS, phase.JOINTS, phase.TOKEN_CHANNELS
         )
@@ -71,31 +80,55 @@ def main(dataset_path: str | None = None) -> None:
         if not np.all(np.isfinite(new)):
             raise RuntimeError("Non-finite LocalPose+GlobalMotion token")
 
-        pose_max = max(pose_max, float(np.max(np.abs(old[..., 0:3] - new[..., 0:3]))))
-        motion_mae = float(np.mean(np.abs(old[..., 3:15] - new[..., 3:15])))
+        pose_max = max(
+            pose_max,
+            float(np.max(np.abs(old[..., 0:3] - new[..., 0:3]))),
+        )
+
+        motion_mae = float(
+            np.mean(np.abs(old[..., 3:15] - new[..., 3:15]))
+        )
         motion_mae_sum += motion_mae
         changed += int(motion_mae > 1e-7)
 
         identity = new[..., 3:6] - (new[..., 6:9] + new[..., 9:12])
-        phase_identity_max = max(phase_identity_max, float(np.max(np.abs(identity))))
+        phase_identity_max = max(
+            phase_identity_max,
+            float(np.max(np.abs(identity))),
+        )
 
-        local, global_motion = lg.canonicalize_local_and_global(kp)
-        if local.shape[0] >= 2:
-            root_motion_local.append(float(np.mean(np.abs(np.diff(local[:, 0, 0, :], axis=0)))))
-            root_motion_global.append(float(np.mean(np.abs(np.diff(global_motion[:, 0, 0, :], axis=0)))))
+        if new_local.shape[0] >= 2:
+            root_motion_local.append(
+                float(np.mean(np.abs(np.diff(new_local[:, 0, 0, :], axis=0))))
+            )
+            root_motion_global.append(
+                float(np.mean(np.abs(np.diff(global_motion[:, 0, 0, :], axis=0))))
+            )
 
     changed_fraction = changed / len(examples)
     motion_mae = motion_mae_sum / len(examples)
 
     print("PREPROCESS EXAMPLES:", len(examples))
+    print("LOCAL COORD MAX DELTA VS base.canonicalize_raw:", local_coord_max)
     print("POSE CHANNEL MAX DELTA VS CHAMPION:", pose_max)
     print("MOTION CHANNEL MEAN ABS DELTA VS CHAMPION:", motion_mae)
     print("SAMPLES WITH CHANGED MOTION CHANNELS:", f"{100*changed_fraction:.2f}%")
     print("MAX |full_disp - (phase_a + phase_b)|:", phase_identity_max)
-    if root_motion_local:
-        print("MEAN PERSON0 ROOT MOTION | LOCAL FRAMEWISE CENTERED:", float(np.mean(root_motion_local)))
-        print("MEAN PERSON0 ROOT MOTION | GLOBAL FIRST-ROOT FRAME:", float(np.mean(root_motion_global)))
 
+    if root_motion_local:
+        print(
+            "MEAN PERSON0 ROOT MOTION | LOCAL FRAMEWISE CENTERED:",
+            float(np.mean(root_motion_local)),
+        )
+        print(
+            "MEAN PERSON0 ROOT MOTION | GLOBAL FIRST-ROOT FRAME:",
+            float(np.mean(root_motion_global)),
+        )
+
+    if local_coord_max > 1e-7:
+        raise RuntimeError(
+            f"Local coordinate path is not exact champion preprocessing: {local_coord_max}"
+        )
     if pose_max > 1e-5:
         raise RuntimeError(f"Pose channels changed unexpectedly: max_delta={pose_max}")
     if changed_fraction <= 0.0:
