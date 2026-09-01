@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 EXPECTED_GPUS = 2
@@ -52,20 +53,35 @@ def probe_gpu(index: int) -> None:
         raise RuntimeError(f"GPU{index}: expected exactly one visible JAX GPU")
 
 
-def stream_output(proc: subprocess.Popen, prefix: str, lock: threading.Lock) -> None:
+def stream_output(proc: subprocess.Popen, prefix: str, lock: threading.Lock, log_path: Path) -> None:
     assert proc.stdout is not None
-    for line in proc.stdout:
-        with lock:
-            print(f"[{prefix}] {line.rstrip()}", flush=True)
+    with log_path.open("a", buffering=1) as log_file:
+        for line in proc.stdout:
+            clean = line.rstrip("\r\n")
+            log_file.write(clean + "\n")
+            with lock:
+                print(f"[{prefix}] {clean}", flush=True)
 
 
 def worker_command(dataset: str, outdir: str, protocol: str) -> list[str]:
     return [sys.executable, "-u", "-m", "experiments.m4_phase_jitter_consistency_localglobal_t16.train_gpu", "--dataset", dataset, "--protocol", protocol, "--epochs", "60", "--patience", "12", "--batch-size", "256", "--eval-batch-size", "512", "--learning-rate", "6e-4", "--min-learning-rate", "2e-5", "--warmup-fraction", "0.08", "--weight-decay", "0.03", "--label-smoothing", "0.05", "--grad-clip", "1.0", "--ema-decay", "0.995", "--stream-aux-weight", "0.15", "--spatial-dim", "24", "--model-dim", "112", "--dropout", "0.10", "--seed", "128", "--jitter-max-shift", "1", "--consistency-weight", "0.08", "--consistency-temperature", "1.0", "--progress-every", "5", "--outdir", outdir]
 
 
-def main() -> int:
-    dataset = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DATASET
-    outdir = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_OUTDIR
+def terminate_workers(processes: list[tuple[str, subprocess.Popen]]) -> None:
+    for _, proc in processes:
+        if proc.poll() is None:
+            proc.terminate()
+    deadline = time.time() + 10.0
+    while time.time() < deadline and any(proc.poll() is None for _, proc in processes):
+        time.sleep(0.2)
+    for _, proc in processes:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def main(dataset: str | None = None, outdir: str | None = None) -> int:
+    dataset = dataset or (sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DATASET)
+    outdir = outdir or (sys.argv[2] if len(sys.argv) > 2 else DEFAULT_OUTDIR)
     if not Path(dataset).is_file():
         raise FileNotFoundError(dataset)
     gpus = visible_gpus()
@@ -81,10 +97,17 @@ def main() -> int:
     print("=" * 120, flush=True)
     print("PREPROCESSING/MODEL PREFLIGHT ON GPU0", flush=True)
     print("=" * 120, flush=True)
-    subprocess.run([sys.executable, "-u", "-m", "experiments.m4_phase_jitter_consistency_localglobal_t16.preflight_gpu", dataset], env=gpu_env(0), check=True)
-    Path(outdir).mkdir(parents=True, exist_ok=True)
+    preflight = subprocess.Popen([sys.executable, "-u", "-m", "experiments.m4_phase_jitter_consistency_localglobal_t16.preflight_gpu", dataset], env=gpu_env(0))
+    while preflight.poll() is None:
+        time.sleep(1.0)
+    if preflight.returncode != 0:
+        raise RuntimeError(f"GPU preflight failed with exit code {preflight.returncode}")
+    out_path = Path(outdir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    logs_dir = out_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
     manifest = {"experiment": "M4PhaseJitterConsistencyLocalPoseGlobalMotionT16_DualT4", "gpu_assignment": {"xsub": 0, "xset": 1}, "dataset": dataset, "outdir": outdir, "batch_size_per_protocol": 256, "optimization": "same global batch/schedule as T16 champion", "expected_params": 1816130, "preprocessing": "local_pose_global_motion_v2"}
-    (Path(outdir) / "dual_t4_manifest.json").write_text(compact_json(manifest))
+    (out_path / "dual_t4_manifest.json").write_text(compact_json(manifest))
     jobs = [("XSUB/GPU0", 0, "xsub"), ("XSET/GPU1", 1, "xset")]
     processes: list[tuple[str, subprocess.Popen]] = []
     lock = threading.Lock()
@@ -98,25 +121,39 @@ def main() -> int:
         print(f"LAUNCH {prefix}: {' '.join(cmd)}", flush=True)
         proc = subprocess.Popen(cmd, env=gpu_env(gpu_index), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         processes.append((prefix, proc))
-        thread = threading.Thread(target=stream_output, args=(proc, prefix, lock), daemon=True)
+        thread = threading.Thread(target=stream_output, args=(proc, prefix, lock, logs_dir / f"{protocol}.log"), daemon=True)
         thread.start()
         threads.append(thread)
-    failures = []
-    for prefix, proc in processes:
-        rc = proc.wait()
-        if rc != 0:
-            failures.append((prefix, rc))
+    start = time.time()
+    last_heartbeat = 0.0
+    try:
+        while True:
+            alive = [(prefix, proc) for prefix, proc in processes if proc.poll() is None]
+            now = time.time()
+            if now - last_heartbeat >= 30.0:
+                status = " | ".join(f"{prefix}={'RUNNING' if proc.poll() is None else 'DONE rc='+str(proc.returncode)}" for prefix, proc in processes)
+                print(f"[DUAL-T4 HEARTBEAT] elapsed={now-start:.0f}s | {status}", flush=True)
+                last_heartbeat = now
+            if not alive:
+                break
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("[DUAL-T4] KeyboardInterrupt received; stopping both GPU workers cleanly...", flush=True)
+        terminate_workers(processes)
+        print(f"[DUAL-T4] Partial logs are in {logs_dir}", flush=True)
+        return 130
     for thread in threads:
         thread.join(timeout=5.0)
+    failures = [(prefix, proc.returncode) for prefix, proc in processes if proc.returncode != 0]
     if failures:
-        raise RuntimeError(f"Dual-T4 worker failure(s): {failures}")
+        raise RuntimeError(f"Dual-T4 worker failure(s): {failures}; logs={logs_dir}")
     results = {}
     for protocol in ("xsub", "xset"):
-        path = Path(outdir) / f"result_{protocol}.json"
+        path = out_path / f"result_{protocol}.json"
         if not path.is_file():
             raise RuntimeError(f"Missing worker result: {path}")
         results[protocol] = json.loads(path.read_text())
-    (Path(outdir) / "summary.json").write_text(compact_json(results))
+    (out_path / "summary.json").write_text(compact_json(results))
     print("=" * 120, flush=True)
     print("DUAL T4 DONE", flush=True)
     print(compact_json(results), flush=True)
