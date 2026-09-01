@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import jax
@@ -17,6 +18,48 @@ EXPECTED_PARAMS = 1_816_130
 
 def compact_json(obj) -> str:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+
+
+class SilentProgress:
+    """tqdm-compatible iterable that emits no carriage-return progress bars."""
+    def __init__(self, iterable=None, *args, **kwargs):
+        self.iterable = iterable if iterable is not None else ()
+
+    def __iter__(self):
+        return iter(self.iterable)
+
+    def set_postfix(self, *args, **kwargs):
+        return None
+
+    def update(self, *args, **kwargs):
+        return None
+
+    def refresh(self, *args, **kwargs):
+        return None
+
+    def close(self):
+        return None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+def install_clean_progress(protocol: str) -> None:
+    ju.tqdm = SilentProgress
+    cons.tqdm = SilentProgress
+    original_build = ju.build_protocol_views
+
+    def clean_build(*args, **kwargs):
+        start = time.time()
+        print(f"{protocol.upper()} PREPROCESSING START | canonical+jitter train + canonical val", flush=True)
+        result = original_build(*args, **kwargs)
+        print(f"{protocol.upper()} PREPROCESSING READY | time={time.time() - start:.1f}s", flush=True)
+        return result
+
+    ju.build_protocol_views = clean_build
 
 
 def _patch_protocol_metadata(outdir: Path, protocol: str) -> None:
@@ -44,6 +87,7 @@ def main() -> None:
     args = cons.parse_args()
     if args.protocol not in ("xsub", "xset"):
         raise ValueError("GPU worker must run exactly one protocol: xsub or xset")
+    install_clean_progress(args.protocol)
     print("=" * 120, flush=True)
     print(f"NESTSAR LOCALGLOBAL V2 | {args.protocol.upper()} | SINGLE T4 WORKER", flush=True)
     print("=" * 120, flush=True)
