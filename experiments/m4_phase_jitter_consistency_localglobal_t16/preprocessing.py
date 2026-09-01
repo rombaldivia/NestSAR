@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-"""Preprocessing-only ablation: local pose + global motion.
+"""Preprocessing-only ablation: exact champion local pose + global motion.
 
-Pose channels use the established NestSAR frame-wise person-0 root centering.
-Motion channels are computed from coordinates referenced to the FIRST VALID
-person-0 root for the whole sequence, so whole-body translation is preserved.
+Pose channels are produced by calling the champion canonicalizer directly:
+    local = base.canonicalize_raw(keypoints)
+This guarantees the pose path and its RMS normalization are exactly the same as
+M4PhaseJitterConsistencyT16.
 
-Token layout stays exactly Phase15:
-  0:3   local pose xyz
+Motion channels are computed from a second raw-coordinate view with the SAME
+person-energy ordering, but referenced to one constant first-valid person-0 root.
+Because that reference is constant over time, temporal differences retain the
+whole-body/root translation that frame-wise centering removes.
+
+Token layout remains exactly Phase15:
+  0:3   local pose xyz                         (champion exact)
   3:6   global full signed displacement xyz
   6:9   global first-half signed displacement xyz
   9:12  global second-half signed displacement xyz
   12:15 global accumulated absolute path xyz
 
-The geometric normalization remains the baseline local-pose RMS so model input
-size, architecture, parameter count, and neural FLOPs are unchanged.
+Input shape, model architecture, parameters and neural FLOPs are unchanged.
 """
 
 import numpy as np
@@ -31,17 +36,8 @@ TOKEN_CHANNELS = phase.TOKEN_CHANNELS
 FEATURES = phase.FEATURES
 
 
-def canonicalize_local_and_global(keypoints: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Return (local_pose_coords, global_motion_coords) with identical ordering.
-
-    local_pose_coords:
-        established NestSAR convention, person-0 joint-0 centered every frame.
-
-    global_motion_coords:
-        same persons/joints, but all frames share one constant reference: the
-        first valid person-0 joint-0 position. Temporal differences therefore
-        retain whole-body translation that frame-wise centering would remove.
-    """
+def _raw_ordered_two_persons(keypoints: np.ndarray) -> np.ndarray:
+    """Raw T,M,V,3 coordinates with the champion's person-energy ordering."""
     x = base.to_tmvc(keypoints)
 
     if x.shape[2] < JOINTS:
@@ -53,7 +49,7 @@ def canonicalize_local_and_global(keypoints: np.ndarray) -> tuple[np.ndarray, np
 
     x = x[:, :, :JOINTS, :XYZ].astype(np.float32, copy=False)
 
-    # Keep the exact established person ordering: descending sequence energy.
+    # EXACT ordering rule used by base.canonicalize_raw().
     person_energy = np.sum(np.abs(x), axis=(0, 2, 3))
     x = x[:, np.argsort(-person_energy)]
 
@@ -69,19 +65,31 @@ def canonicalize_local_and_global(keypoints: np.ndarray) -> tuple[np.ndarray, np
             axis=1,
         )
 
-    x = x[:, :PERSONS]
-    valid_joint = np.any(np.abs(x) > 1e-8, axis=-1, keepdims=True)
+    return x[:, :PERSONS].astype(np.float32, copy=False)
 
-    # Local pose coordinates: EXACT baseline frame-wise centering semantics.
-    center = x[:, 0:1, 0:1, :]
-    valid_center = np.any(np.abs(center) > 1e-8, axis=-1, keepdims=True)
-    local = np.where(valid_center, x - center, x)
-    local = np.where(valid_joint, local, 0.0).astype(np.float32)
 
-    # Global-motion coordinates: one constant reference for the entire sequence.
-    # Use the first valid person-0 root; for ordinary NTU clips this is frame 0.
+def canonicalize_local_and_global(keypoints: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return exact champion local pose coordinates and global-motion coordinates."""
+
+    # CRITICAL CONTROL: do not reimplement the champion local preprocessing.
+    # Call it directly, so pose values and RMS normalization are guaranteed to
+    # follow exactly the same code path as the verified baseline.
+    local = base.canonicalize_raw(keypoints).astype(np.float32, copy=False)
+
+    x = _raw_ordered_two_persons(keypoints)
+
+    if x.shape[0] != local.shape[0]:
+        raise RuntimeError(
+            f"Local/raw temporal mismatch: local={local.shape}, raw={x.shape}"
+        )
+
+    valid_joint_raw = np.any(np.abs(x) > 1e-8, axis=-1, keepdims=True)
+
+    # One constant reference for the WHOLE sequence. For normal NTU clips this
+    # is person-0 joint-0 at frame 0; first-valid fallback handles leading zeros.
     roots = x[:, 0, 0, :]
     valid_roots = np.any(np.abs(roots) > 1e-8, axis=-1)
+
     if np.any(valid_roots):
         ref_idx = int(np.flatnonzero(valid_roots)[0])
         root_ref = roots[ref_idx].reshape(1, 1, 1, XYZ)
@@ -89,13 +97,17 @@ def canonicalize_local_and_global(keypoints: np.ndarray) -> tuple[np.ndarray, np
         root_ref = np.zeros((1, 1, 1, XYZ), dtype=np.float32)
 
     global_motion = x - root_ref
-    global_motion = np.where(valid_joint, global_motion, 0.0).astype(np.float32)
+    global_motion = np.where(
+        valid_joint_raw,
+        global_motion,
+        0.0,
+    ).astype(np.float32)
 
     return local, global_motion
 
 
 def phase_tokens_from_bounds_localglobal(keypoints: np.ndarray, bounds) -> np.ndarray:
-    """Build Phase15 tokens using local pose and global-reference motion."""
+    """Build Phase15 tokens: champion-local pose + global-reference motion."""
     local, global_motion = canonicalize_local_and_global(keypoints)
 
     if local.shape[0] <= 0:
@@ -116,7 +128,7 @@ def phase_tokens_from_bounds_localglobal(keypoints: np.ndarray, bounds) -> np.nd
             d = motion_seg[1:] - motion_seg[:-1]
             full_disp = np.sum(d, axis=0)
 
-            # Preserve the baseline Phase15 split exactly: split transitions.
+            # Split transitions exactly as Phase15 baseline.
             cut = max(1, len(d) // 2)
             phase_a = np.sum(d[:cut], axis=0)
             if cut < len(d):
@@ -137,9 +149,7 @@ def phase_tokens_from_bounds_localglobal(keypoints: np.ndarray, bounds) -> np.nd
         tokens[i, ..., 9:12] = phase_b
         tokens[i, ..., 12:15] = path
 
-    # Keep the champion's normalization convention: one RMS from LOCAL centered
-    # poses for every channel. This isolates only the coordinate frame used to
-    # derive motion; it does not introduce a new scale normalization.
+    # EXACT champion scale source: RMS from base.canonicalize_raw() output.
     nz = np.abs(local) > 1e-8
     if np.any(nz):
         rms = float(np.sqrt(np.mean(np.square(local[nz]))) + 1e-6)
@@ -149,10 +159,11 @@ def phase_tokens_from_bounds_localglobal(keypoints: np.ndarray, bounds) -> np.nd
 
 
 def segment_phase_tokens_localglobal(keypoints: np.ndarray) -> np.ndarray:
-    local, _ = canonicalize_local_and_global(keypoints)
+    local = base.canonicalize_raw(keypoints)
     total = int(local.shape[0])
     if total <= 0:
         return np.zeros((FRAMES, FEATURES), dtype=np.float32)
+
     return phase_tokens_from_bounds_localglobal(
         keypoints,
         base.segment_bounds(total, FRAMES),
