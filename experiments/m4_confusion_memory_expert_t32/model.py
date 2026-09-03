@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-from typing import Sequence
-
+import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
@@ -48,7 +47,11 @@ class ConfusionMemoryExpert(nn.Module):
         topv = jnp.sort(probs, axis=-1)[:, -self.topk_context:]
         topv = topv[:, ::-1]
         margin = topv[:, :1] - topv[:, 1:2]
-        entropy = -jnp.sum(probs * jnp.log(jnp.clip(probs, 1e-8, 1.0)), axis=-1, keepdims=True)
+        entropy = -jnp.sum(
+            probs * jnp.log(jnp.clip(probs, 1e-8, 1.0)),
+            axis=-1,
+            keepdims=True,
+        )
         ctx = jnp.concatenate([topv, margin, entropy], axis=-1)
         ctx = nn.Dense(self.dim, name="context_proj")(ctx)
         ctx = nn.gelu(ctx)
