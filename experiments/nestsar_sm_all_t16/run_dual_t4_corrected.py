@@ -10,9 +10,14 @@ and the same two persistent progress rows.
 
 from experiments.nestsar_sm_all_t16 import run_dual_t4 as legacy
 
+# Keep an immutable reference to the original command builder BEFORE replacing
+# legacy.worker_cmd. Calling legacy.worker_cmd from the wrapper after monkey
+# patching would recurse back into corrected_worker_cmd forever.
+_ORIGINAL_WORKER_CMD = legacy.worker_cmd
+
 
 def corrected_worker_cmd(args, protocol):
-    cmd = legacy.worker_cmd(args, protocol)
+    cmd = _ORIGINAL_WORKER_CMD(args, protocol)
     old = "experiments.nestsar_sm_all_t16.train_gpu"
     new = "experiments.nestsar_sm_all_t16.train_gpu_corrected"
     try:
@@ -24,8 +29,15 @@ def corrected_worker_cmd(args, protocol):
 
 
 def main():
+    # Patch only while the legacy parent launcher is running. Restoring the
+    # original function makes notebook reruns/imports deterministic and avoids
+    # keeping mutated module state after an exception or completed run.
+    previous = legacy.worker_cmd
     legacy.worker_cmd = corrected_worker_cmd
-    legacy.main()
+    try:
+        legacy.main()
+    finally:
+        legacy.worker_cmd = previous
 
 
 if __name__ == "__main__":
