@@ -1,0 +1,25 @@
+name: SM-ALL corrected preprocessing
+
+on:
+  push:
+    branches:
+      - fix/nestsar-sm-all-preprocessing-v2
+  workflow_dispatch:
+
+jobs:
+  preprocessing-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install lightweight test dependencies
+        run: python -m pip install -q numpy pytest
+      - name: Compile corrected wrappers
+        run: |
+          python -m py_compile experiments/nestsar_sm_all_t16/preprocessing_corrected.py
+          python -m py_compile experiments/nestsar_sm_all_t16/train_gpu_corrected.py
+          python -m py_compile experiments/nestsar_sm_all_t16/run_dual_t4_corrected.py
+      - name: Run preprocessing regression tests
+        run: python -m pytest -q experiments/nestsar_sm_all_t16/test_preprocessing_corrected.py
