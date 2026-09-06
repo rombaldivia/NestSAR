@@ -1,0 +1,60 @@
+{
+  "model": "NestSAR-SM-ALL-T16-v1",
+  "experiment_branch": "fix/nestsar-sm-all-preprocessing-v2",
+  "model_source_commit": "490d335fc0fe6ec30a256753185c055c1ff15faf",
+  "dataset": "NTU RGB+D 120",
+  "seed": 128,
+  "processing_frames": 16,
+  "raw_input_frames": "variable",
+  "params": 1826556,
+  "accuracy": {
+    "xsub": {
+      "best_val_accuracy": 0.7632121604901903,
+      "best_epoch": 24,
+      "last_epoch": 29
+    },
+    "xset": {
+      "best_val_accuracy": 0.7806210804176404,
+      "best_epoch": 26,
+      "last_epoch": 31
+    }
+  },
+  "scan_corrected_compute": {
+    "audit": "experiments/nestsar_sm_all_t16/compute_unrolled_audit.py",
+    "jax_version": "0.7.2",
+    "batch_size": 1,
+    "flops_per_clip": 29065216,
+    "mflops_per_clip": 29.065216,
+    "gflops_per_clip": 0.029065216,
+    "gmacs_per_clip_1mac_equals_2flops": 0.014532608
+  },
+  "comparison_scan_corrected": {
+    "localglobal_v2": {
+      "params": 1816130,
+      "flops_per_clip": 28545916,
+      "mflops_per_clip": 28.545916,
+      "gflops_per_clip": 0.028545916
+    },
+    "hand_m4g4_t32": {
+      "params": 1854650,
+      "flops_per_clip": 29612176,
+      "mflops_per_clip": 29.612176,
+      "gflops_per_clip": 0.029612176
+    }
+  },
+  "raw_xla_scan_undercount": {
+    "flops_per_clip": 5155914,
+    "gflops_per_clip": 0.005155914,
+    "use_for_paper": false,
+    "note": "Ordinary XLA cost analysis undercounts recurrent scan execution. Use scan_corrected_compute for reporting."
+  },
+  "configuration": {
+    "fast_rank": 2,
+    "head_rank": 2,
+    "controller_dim": 16,
+    "sm_residual_scale": 0.08,
+    "head_residual_scale": 0.15,
+    "distal_specialist": false,
+    "cdformer_kd": false
+  }
+}
