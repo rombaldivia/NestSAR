@@ -1,0 +1,136 @@
+{
+  "test_count": 42,
+  "tests_passed": true,
+  "local_backend": "CPU",
+  "dual_t4_run_executed": false,
+  "real_ntu120_training_executed": false,
+  "model_equivalence": {
+    "parameters": 1854650,
+    "parameter_values_identical": true,
+    "forward_outputs_identical": true,
+    "max_abs_difference": 0.0,
+    "old_scan_cost_flops": 20456644.0,
+    "new_scan_cost_flops": 20456644.0
+  },
+  "full_compute_audit": {
+    "parameters": 1854650,
+    "full_unrolled_flops": 66523220.0,
+    "full_unrolled_gflops": 0.06652322,
+    "scan_unrolled_outputs_match": true,
+    "max_abs_difference": 0.0,
+    "jax": "0.7.2",
+    "backend": "cpu",
+    "batch": 1,
+    "main_shape": [
+      16,
+      750
+    ],
+    "hand_shape": [
+      32,
+      96
+    ],
+    "convention": "XLA full-forward static unrolling, 1 MAC=2 FLOPs; raw preprocessing excluded"
+  },
+  "smoke": {
+    "xsub": {
+      "epochs": 2,
+      "train_samples": 3,
+      "validation_samples": 4,
+      "resume_passed": true,
+      "all_losses_finite": true,
+      "history": [
+        {
+          "epoch": 1,
+          "train_loss": 5.710134665171306,
+          "train_acc": 0.0,
+          "val_loss": 4.556656837463379,
+          "val_acc": 0.0,
+          "val_main_acc": 0.0,
+          "val_hand_acc": 0.0,
+          "val_top5": 0.0,
+          "bad_epochs": 0,
+          "epoch_s": 35.750789755999904,
+          "prepare_service_s": 0.20103232199994636,
+          "data_wait_s": 0.0076300419996186974,
+          "h2d_s": 0.003981716000225788,
+          "gpu_train_s": 0.2517031830002452,
+          "gpu_eval_s": 0.022578394999982265,
+          "compile_train_s": 33.6123025710001,
+          "compile_eval_s": 1.6072107439999854
+        },
+        {
+          "epoch": 2,
+          "train_loss": 3.6104665199915567,
+          "train_acc": 0.6666666666666666,
+          "val_loss": 4.560625314712524,
+          "val_acc": 0.0,
+          "val_main_acc": 0.0,
+          "val_hand_acc": 0.0,
+          "val_top5": 0.0,
+          "bad_epochs": 1,
+          "epoch_s": 0.19339598500005195,
+          "prepare_service_s": 0.009359600999914619,
+          "data_wait_s": 0.0044552049996582355,
+          "h2d_s": 0.0029490790000181732,
+          "gpu_train_s": 0.16311467999980778,
+          "gpu_eval_s": 0.01755507799998668,
+          "compile_train_s": 0.0,
+          "compile_eval_s": 0.0
+        }
+      ]
+    },
+    "xset": {
+      "epochs": 2,
+      "train_samples": 3,
+      "validation_samples": 4,
+      "resume_passed": true,
+      "all_losses_finite": true,
+      "history": [
+        {
+          "epoch": 1,
+          "train_loss": 5.752631187438965,
+          "train_acc": 0.0,
+          "val_loss": 4.539453983306885,
+          "val_acc": 0.0,
+          "val_main_acc": 0.0,
+          "val_hand_acc": 0.0,
+          "val_top5": 0.0,
+          "bad_epochs": 0,
+          "epoch_s": 32.58861908200015,
+          "prepare_service_s": 2.601868036000269,
+          "data_wait_s": 0.0057910160003302735,
+          "h2d_s": 0.0035537040002964204,
+          "gpu_train_s": 0.22339970800021547,
+          "gpu_eval_s": 0.018072585999789226,
+          "compile_train_s": 30.93858674199987,
+          "compile_eval_s": 1.3883447910000086
+        },
+        {
+          "epoch": 2,
+          "train_loss": 3.542724609375,
+          "train_acc": 0.6666666666666666,
+          "val_loss": 4.543475389480591,
+          "val_acc": 0.0,
+          "val_main_acc": 0.0,
+          "val_hand_acc": 0.0,
+          "val_top5": 0.0,
+          "bad_epochs": 1,
+          "epoch_s": 0.1871983150001597,
+          "prepare_service_s": 0.011642765000260624,
+          "data_wait_s": 0.005345389999774852,
+          "h2d_s": 0.003908385999920938,
+          "gpu_train_s": 0.14927784699989388,
+          "gpu_eval_s": 0.016275907999897754,
+          "compile_train_s": 0.0,
+          "compile_eval_s": 0.0
+        }
+      ]
+    }
+  },
+  "runtime_repair": {
+    "ensurepip_called": false,
+    "offline_wheel_install_in_pip_free_venv_passed": true,
+    "partial_runtime_recovery_passed": true,
+    "best_score_display_and_completion_race_tests_passed": true
+  }
+}
