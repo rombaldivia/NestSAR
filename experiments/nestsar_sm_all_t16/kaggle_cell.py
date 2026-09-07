@@ -32,7 +32,7 @@ importlib.invalidate_caches()
 from experiments.nestsar_sm_all_t16.streaming.launch import run
 
 config = dict(settings.get("config", {}))
-outdir = settings.get("outdir", "/kaggle/working/NestSAR_SM_ALL_T16_SharedCache_v2")
+outdir = settings.get("outdir", "/kaggle/working/NestSAR_SM_ALL_T16_PERSON_AWARE_P2_v3")
 if settings.get("smoke_test", False):
     config.update(epochs=2, micro_batch=32, accumulation_steps=2,
                   eval_batch=64, max_train_samples=256, max_val_samples=256)
@@ -40,7 +40,7 @@ if settings.get("smoke_test", False):
 
 nestsar_results = run(
     dataset=settings.get("dataset"), outdir=outdir,
-    cache_dir=settings.get("cache_dir", "/kaggle/working/NestSAR_SM_ALL_SharedCache_v2"),
+    cache_dir=settings.get("cache_dir", "/kaggle/working/NestSAR_SM_ALL_PERSON_AWARE_P2_CACHE_v3"),
     config=config, raw_layout=settings.get("raw_layout", "MTVC"),
     audit_first=settings.get("audit_first", True),
 )
