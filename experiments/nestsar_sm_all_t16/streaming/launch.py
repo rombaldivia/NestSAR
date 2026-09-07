@@ -1,10 +1,16 @@
 """Notebook owns two persistent bars. Workers write only files, never bars."""
 from __future__ import annotations
-import fcntl, json, os, shutil, signal, subprocess, sys, time
+import fcntl, json, os, shutil, signal, subprocess, sys, time, venv
 from pathlib import Path
 
 from .io_utils import atomic_json, read_json
 from . import VERSION
+from .runtime import (
+    GPU_PROBE, PINNED_GPU_PROBE, RUNTIME_REQUIREMENTS, RUNTIME_SCHEMA, discover_cuda,
+    host_pip_python, install_checked, link_cuda, remove_failed_runtime,
+)
+
+_RUNTIME_ENV = {}
 
 MODULE = "experiments.nestsar_sm_all_t16.streaming"
 
@@ -55,6 +61,8 @@ def validate_config(config):
 
 def _common_env():
     env = dict(os.environ)
+    env.update(_RUNTIME_ENV)
+    env.pop("JAX_SKIP_CUDA_CONSTRAINTS_CHECK", None)
     env.update(
         PYTHONUNBUFFERED="1", OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
         MKL_NUM_THREADS="1", NUMEXPR_NUM_THREADS="1",
@@ -108,12 +116,14 @@ def stop_processes(processes):
         proc.wait()
 
 
-def quiet_run(cmd, log, env, refresh=None):
+def quiet_run(cmd, log, env, refresh=None, timeout=None):
     with Path(log).open("w") as stream:
-        proc = subprocess.Popen(cmd, stdout=stream, stderr=subprocess.STDOUT,
-                                env=env, start_new_session=True)
+        proc = subprocess.Popen(cmd, stdout=stream, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+        started = time.monotonic()
         try:
             while proc.poll() is None:
+                if timeout is not None and time.monotonic() - started > timeout:
+                    raise RuntimeError(f"Stage timed out after {timeout}s. Log: {log}")
                 if refresh:
                     refresh()
                 time.sleep(0.3)
@@ -184,44 +194,130 @@ def update_bar(bar, protocol, gpu, status):
     bar.refresh()
 
 
-def runtime_probe(python, code, env, log):
+def create_runtime_without_pip(runtime):
+    """Complete/recover an interrupted venv without ever calling ensurepip."""
+    runtime = Path(runtime)
+    # clear=False preserves any installed packages from an interrupted setup.
+    # Also finish activation scripts if the former with_pip=True path failed.
+    venv.EnvBuilder(with_pip=False, clear=False, system_site_packages=False).create(runtime)
+    python = runtime / "bin" / "python"
+    if not python.is_file():
+        raise RuntimeError(f"Runtime Python was not created: {python}")
+    return python
+
+
+def install_into_runtime(python, requirements, log, refresh=None, extra_options=()):
+    """The host's pip --python works even when the target has no pip installed.
+
+    https://pip.pypa.io/en/stable/topics/python-option/
+    """
+    command = [host_pip_python(), "-m", "pip", "--python", str(python), "install",
+               "--disable-pip-version-check", "--no-cache-dir", *extra_options, *requirements]
+    quiet_run(command, log, isolated_env(), refresh)
+
+
+def ensure_local_runtime(out, bars, gpu):
+    out = Path(out)
+    _RUNTIME_ENV.clear()
+    def refresh(phase="Runtime check"):
+        for i, (bar, protocol) in enumerate(zip(bars, ("xsub", "xset"))):
+            # Keep already recorded best scores visible while resuming setup.
+            status = read_json(out / protocol / "status.json", {})
+            update_bar(bar, protocol, i, dict(status, phase=phase, current=0, total=1))
+    if runtime_probe(sys.executable, PINNED_GPU_PROBE, isolated_env(gpu), out / "notebook_runtime_probe.log", refresh):
+        atomic_json(out / "runtime.json", {"python": sys.executable, "mode": "notebook", "gpu_execution_verified": True})
+        return sys.executable
+    runtime = out / "runtime"
+    python = runtime / "bin" / "python"
+    manifest = read_json(runtime / "nestsar_runtime.json", {})
+    if manifest.get("schema") == RUNTIME_SCHEMA:
+        _RUNTIME_ENV.update(manifest.get("cuda", {}).get("environment", {}))
+    if python.exists() and runtime_probe(python, PINNED_GPU_PROBE, isolated_env(gpu), out / "cached_runtime_probe.log", refresh):
+        atomic_json(out / "runtime.json", dict(manifest, python=str(python), state="ready", mode="cached", gpu_execution_verified=True))
+        return str(python)
+    _RUNTIME_ENV.clear()
+    refresh("Recover runtime")
+    # This runs under OUT_DIR/run.lock. Incomplete CUDA wheels can occupy several
+    # GiB; discard only this failed venv before any new downloads.
+    recovered = remove_failed_runtime(out)
+    cuda = discover_cuda()
+    _RUNTIME_ENV.update(cuda["environment"])
+    atomic_json(out / "cuda_inventory.json", cuda)
+    refresh("Install local-CUDA runtime")
+    python = create_runtime_without_pip(runtime)
+    manifest = {"schema": RUNTIME_SCHEMA, "state": "installing", "cuda": cuda,
+                "python": str(python), "recovered_failed_runtime": recovered}
+    atomic_json(runtime / "nestsar_runtime.json", manifest)
     try:
-        result = subprocess.run([str(python), "-c", code], env=env,
-                                capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        Path(log).write_text(str(exc))
+        link_cuda(runtime, cuda)
+        installed = install_checked(python, out, isolated_env(), quiet_run,
+                                    lambda: refresh("Install local-CUDA runtime"))
+        if not runtime_probe(python, PINNED_GPU_PROBE, isolated_env(gpu), out / "runtime_probe.log", refresh):
+            raise RuntimeError(
+                "Installed CUDA libraries failed JAX's GPU execution check. No full CUDA stack "
+                f"was downloaded. See {out / 'cuda_inventory.json'} and {out / 'runtime_probe.log'}.\n"
+                + tail(out / "runtime_probe.log")
+            )
+        manifest.update(installed, state="ready", mode="cuda12-local", gpu_execution_verified=True)
+        atomic_json(runtime / "nestsar_runtime.json", manifest)
+        atomic_json(out / "runtime.json", manifest)
+    except BaseException:
+        # The owned temporary wheel directory is already cleaned by its context.
+        # Keep a useful failure record; the next run repairs only this venv.
+        manifest.update(state="failed", gpu_execution_verified=False)
+        try:
+            atomic_json(runtime / "nestsar_runtime.json", manifest)
+        except OSError:
+            pass  # Preserve the original error if another process filled disk.
+        raise
+    return str(python)
+
+
+
+def runtime_probe(python, code, env, log, refresh=None):
+    try:
+        quiet_run([str(python), "-c", code], log, env, refresh, timeout=120)
+    except (OSError, RuntimeError) as exc:
+        with Path(log).open("a") as stream:
+            stream.write("\n" + str(exc))
         return False
-    Path(log).write_text((result.stdout or "") + (result.stderr or ""))
-    return result.returncode == 0
+    return True
 
 
 def ensure_runtime(out, bars, gpu):
-    """Use Kaggle's existing runtime. Never download/install JAX or CUDA wheels."""
+    """Default: keep the user's no-install Kaggle runtime strategy."""
     out = Path(out)
-    refresh = lambda: [update_bar(b, p, i, dict(phase="Runtime probe", current=0, total=1))
-                       for i, (b, p) in enumerate(zip(bars, ("xsub", "xset")))]
+    _RUNTIME_ENV.clear()
+    def refresh():
+        for i, (bar, protocol) in enumerate(zip(bars, ("xsub", "xset"))):
+            status = read_json(out / protocol / "status.json", {})
+            update_bar(bar, protocol, i, dict(status, phase="Runtime probe", current=0, total=1))
     refresh()
-    probe = (
-        "import json,jax,flax,optax,psutil,tqdm,numpy; "
-        "assert jax.default_backend()=='gpu' and jax.local_device_count()==1; "
-        "print('NESTSAR_RUNTIME='+json.dumps({"
-        "'python':__import__('sys').version.split()[0],"
-        "'jax':jax.__version__,'flax':flax.__version__,'optax':optax.__version__,"
-        "'numpy':numpy.__version__,'backend':jax.default_backend(),"
-        "'devices':[str(d) for d in jax.devices()]}))"
-    )
     log = out / "notebook_runtime_probe.log"
-    if not runtime_probe(sys.executable, probe, isolated_env(gpu), log):
+    if not runtime_probe(sys.executable, GPU_PROBE, isolated_env(gpu), log, refresh):
         raise RuntimeError(
-            "Kaggle's existing Python/JAX runtime is not usable on the selected GPU. "
-            "No packages were installed automatically. Ensure accelerator GPU T4 x2 is selected. "
-            f"Inspect {log}:\n{tail(log)}"
+            "Kaggle's existing Python/JAX runtime failed the GPU execution check. "
+            "No packages were installed automatically. Select GPU T4 x2 and inspect "
+            f"{log}:\n{tail(log)}\n"
+            "For the explicit pinned JAX 0.7.2 fallback, set runtime_mode='local-cuda'; "
+            "it requires compatible installed CUDA 12 and checks disk before installing."
         )
     stale = out / "runtime"
-    if stale.exists():
-        shutil.rmtree(stale, ignore_errors=True)
+    manifest = read_json(stale / "nestsar_runtime.json", {})
+    if (stale / "pyvenv.cfg").is_file() and manifest.get("state") != "ready":
+        remove_failed_runtime(out)
+    details = {}
+    if log.is_file():
+        for line in log.read_text(errors="replace").splitlines():
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(value, dict) and value.get("gpu_execution_verified"):
+                details = value
+    atomic_json(out / "runtime.json", dict(details, python=sys.executable,
+                                           mode="host", gpu_execution_verified=True))
     return sys.executable
-
 
 def discover_gpus(python, log):
     """Discover GPUs through a fresh JAX subprocess; nvidia-smi is optional."""
@@ -304,10 +400,15 @@ def check_worker_finished(proc, protocol, out, status):
 
 def run(dataset=None, outdir="/kaggle/working/NestSAR_SM_ALL_T16_SharedCache_v2",
         cache_dir="/kaggle/working/NestSAR_SM_ALL_SharedCache_v2", config=None,
-        raw_layout="MTVC", audit_first=True):
+        raw_layout="MTVC", audit_first=True, runtime_mode="host"):
+    if runtime_mode not in ("host", "local-cuda"):
+        raise ValueError("runtime_mode must be host or local-cuda")
+    _RUNTIME_ENV.clear()
     c = validate_config(config or {})
     dataset = find_dataset(dataset)
     out, cache = Path(outdir), Path(cache_dir)
+    from ..kaggle_bootstrap import recover_disk_failure
+    recover_disk_failure(out)
     out.mkdir(parents=True, exist_ok=True)
     lock = (out / "run.lock").open("a")
     try:
@@ -318,7 +419,13 @@ def run(dataset=None, outdir="/kaggle/working/NestSAR_SM_ALL_T16_SharedCache_v2"
 
     bars, processes, streams = [], [], []
     try:
-        gpus, jax_devices = discover_gpus(sys.executable, out / "gpu_discovery.log")
+        bars = make_bars()
+        if runtime_mode == "local-cuda":
+            # Explicit fallback can repair JAX before host GPU discovery works.
+            python = ensure_local_runtime(out, bars, "0")
+        else:
+            python = sys.executable
+        gpus, jax_devices = discover_gpus(python, out / "gpu_discovery.log")
         atomic_json(out / "hardware.json", {
             "gpu_discovery": "jax_subprocess",
             "jax_devices": jax_devices,
@@ -327,8 +434,8 @@ def run(dataset=None, outdir="/kaggle/working/NestSAR_SM_ALL_T16_SharedCache_v2"
             "pipeline_version": VERSION,
         })
 
-        bars = make_bars()
-        python = ensure_runtime(out, bars, gpus[0])
+        if runtime_mode == "host":
+            python = ensure_runtime(out, bars, gpus[0])
 
         cfg_path = out / "config.json"
         old = read_json(cfg_path)
@@ -347,8 +454,7 @@ def run(dataset=None, outdir="/kaggle/working/NestSAR_SM_ALL_T16_SharedCache_v2"
 
         for i, gpu in enumerate(gpus):
             quiet_run(
-                [python, "-c",
-                 "import jax; assert jax.default_backend()=='gpu' and jax.local_device_count()==1; print(jax.devices())"],
+                [python, "-c", GPU_PROBE],
                 out / f"gpu{i}_probe.log", isolated_env(gpu),
                 lambda i=i: update_bar(bars[i], ("xsub", "xset")[i], i,
                                        dict(phase="GPU probe", current=0, total=1)),

@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 settings = dict(globals().get("NESTSAR_SETTINGS", {}))
-allowed = {"dataset", "outdir", "cache_dir", "config", "raw_layout", "audit_first", "smoke_test"}
+allowed = {"dataset", "outdir", "cache_dir", "config", "raw_layout", "audit_first", "smoke_test", "runtime_mode"}
 if set(settings) - allowed:
     raise ValueError(f"Unknown NESTSAR_SETTINGS keys: {sorted(set(settings) - allowed)}")
 
@@ -43,4 +43,5 @@ nestsar_results = run(
     cache_dir=settings.get("cache_dir", "/kaggle/working/NestSAR_SM_ALL_SharedCache_v2"),
     config=config, raw_layout=settings.get("raw_layout", "MTVC"),
     audit_first=settings.get("audit_first", True),
+    runtime_mode=settings.get("runtime_mode", "host"),
 )

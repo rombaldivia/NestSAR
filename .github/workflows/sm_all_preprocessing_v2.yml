@@ -21,6 +21,7 @@ jobs:
           python -m py_compile experiments/nestsar_sm_all_t16/preprocessing_corrected.py
           python -m py_compile experiments/nestsar_sm_all_t16/train_gpu_corrected.py
           python -m py_compile experiments/nestsar_sm_all_t16/run_dual_t4_corrected.py
+          python -m py_compile experiments/nestsar_sm_all_t16/kaggle_bootstrap.py
           python -m compileall -q experiments/nestsar_sm_all_t16/streaming
       - name: Run preprocessing, shared-cache, runtime, audit and training regression tests
         env:

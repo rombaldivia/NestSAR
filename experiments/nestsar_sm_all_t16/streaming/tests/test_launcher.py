@@ -80,6 +80,7 @@ def test_runtime_uses_host_python_and_removes_legacy_runtime(tmp_path, monkeypat
     stale = tmp_path / "runtime"
     stale.mkdir()
     (stale / "huge_cuda_wheel").write_text("old")
+    (stale / "pyvenv.cfg").write_text("home = /usr/bin\n")
 
     monkeypatch.setattr(launch, "runtime_probe", lambda *a, **k: True)
 
@@ -100,6 +101,19 @@ def test_runtime_failure_never_installs_or_creates_venv(tmp_path, monkeypatch):
 
     assert not (tmp_path / "runtime").exists()
     assert not (tmp_path / "install.log").exists()
+
+
+@pytest.mark.parametrize("ready_venv", [False, True])
+def test_host_reuse_preserves_unknown_directories_and_ready_venvs(tmp_path, monkeypatch, ready_venv):
+    stale = tmp_path / "runtime"
+    stale.mkdir()
+    (stale / "keep.txt").write_text("keep")
+    if ready_venv:
+        (stale / "pyvenv.cfg").write_text("home = /usr/bin\n")
+        atomic_json(stale / "nestsar_runtime.json", {"state": "ready"})
+    monkeypatch.setattr(launch, "runtime_probe", lambda *a, **k: True)
+    assert ensure_runtime(tmp_path, [], "0") == sys.executable
+    assert (stale / "keep.txt").read_text() == "keep"
 
 
 @pytest.mark.parametrize(

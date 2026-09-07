@@ -25,11 +25,44 @@ input. It imports the existing `model.py` without modifying its equations.
   EMA 0.995, and **patience 5 after the 8% learning-rate warm-up**. Padded tails
   are masked in all losses/metrics; every training and validation sample counts.
 - Kaggle bootstrap now uses the notebook's existing Python/JAX/CUDA environment.
-  It **never creates a CUDA/JAX venv and never installs GPU wheels**. GPU discovery
+  The default `runtime_mode="host"` **never creates a CUDA/JAX venv and never
+  installs GPU wheels**. GPU discovery
   is performed by a fresh JAX subprocess, so `nvidia-smi` is optional metadata
   rather than a hard dependency. Each assigned GPU is then probed in isolation
-  before cache preparation or training begins. Legacy auto-generated `runtime/`
-  directories are removed after a successful host-runtime probe.
+  before cache preparation or training begins. The probes compile and synchronize
+  matmul, convolution and gradients and record package versions. Only recognized
+  stale venvs are removed after a successful host probe; ready runtimes, unknown
+  directories, caches, checkpoints and score reports are preserved.
+
+### Full-disk recovery and optional pinned runtime
+
+The old `jax[cuda12]` installer could fill disk with another complete NVIDIA
+library stack. `kaggle_bootstrap.py` can be downloaded into memory at a pinned
+commit before fetching source. It recognizes the reported `Errno 28` install log
+and removes **only** the failed `OUT_DIR/runtime` venv under the launcher's lock.
+The source fetch uses depth 1. The direct CLI has the same recovery step before
+writing new logs. The cache/preprocessing version stays unchanged for resume.
+
+The default reuses the current Kaggle environment and installs no JAX/CUDA
+packages. GPU discovery still uses a fresh JAX subprocess; `nvidia-smi` remains
+optional. The actual versions are saved in `runtime.json` and probe logs.
+
+An **explicit** `NESTSAR_SETTINGS['runtime_mode']='local-cuda'` (CLI:
+`--runtime-mode local-cuda`) enables the pinned fallback if the host Python
+packages are incompatible. It creates a pip-free venv using JAX 0.7.2, Flax
+0.11.2, Optax 0.2.5 and NumPy 2.2.6, with `jax[cuda12-local]` and read-only links
+to the installed CUDA 12 libraries. It never changes the notebook's JAX or
+installs NVIDIA CUDA/cuDNN packages. CUDA 12 ptxas/libdevice and compatible local
+libraries are required; JAX's version checks remain enabled.
+
+This fallback resolves and hashes dependencies, rejects NVIDIA/CUDA 13 payloads,
+downloads wheels once, checks their expanded size, then installs offline. Its
+temporary files use the output volume and are removed on success/failure. The
+initial guard requires 2 GiB free; the exact expanded-size check can require more.
+Both checks retain a 1 GiB reserve. Local validation used 291 MiB of wheels /
+969 MiB expanded, excluding reused CUDA and skeleton/token caches. Future
+resolutions can vary. `cuda_inventory.json`, `runtime_install_plan.json`, and
+`runtime_requirements.lock` record the selected libraries and packages.
 
 The default new output directory is
 `/kaggle/working/NestSAR_SM_ALL_T16_SharedCache_v2`; the cache is
@@ -156,5 +189,6 @@ This is a **HOPE-inspired low-rank self-modifying delta-memory adaptation**, del
 `kaggle_cell.py` calls the shared-cache launcher in the notebook kernel, which
 owns both progress bars. GPU0 runs XSUB and GPU1 runs XSET simultaneously after
 cache preparation. Configure it through `NESTSAR_SETTINGS` (`dataset`, `outdir`,
-`cache_dir`, `config`, `raw_layout`, `audit_first`, and `smoke_test`). The default
+`cache_dir`, `config`, `raw_layout`, `audit_first`, `smoke_test`, and
+`runtime_mode`). The default
 dataset lookup requires exactly one `ntu120_3danno.pkl` under `/kaggle/input`.
