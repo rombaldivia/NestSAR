@@ -22,6 +22,46 @@ def test_absent_person_stays_zero():
     assert np.count_nonzero(tok[:, 1]) == 0
 
 
+def test_ordered_raw_preserves_two_occupied_source_tracks_not_energy_order():
+    # P0 is deliberately low-energy and P1 high-energy. Their identities must
+    # remain in source order rather than being swapped by clip energy.
+    raw = np.zeros((2, 20, 25, 3), np.float32)  # M,T,V,C
+    raw[0, :, :, 0] = 1.0
+    raw[1, :, :, 0] = 9.0
+    out = p.ordered_raw(raw, "MTVC")
+    assert np.allclose(out[:, 0, :, 0], 1.0)
+    assert np.allclose(out[:, 1, :, 0], 9.0)
+
+
+def test_ordered_raw_compacts_empty_leading_track_without_losing_real_actor():
+    raw = np.zeros((2, 20, 25, 3), np.float32)
+    raw[1, :, :, 0] = 4.0
+    out = p.ordered_raw(raw, "MTVC")
+    assert np.allclose(out[:, 0, :, 0], 4.0)
+    assert not out[:, 1].any()
+
+
+def test_intermittent_p2_is_preserved_when_common_midpoint_is_empty():
+    x = clip(32)
+    # Segment 0 is frames [0,2) for T=32 -> 16 segments. Put P2 only at frame
+    # 1; the historical common midpoint selected frame 0 and erased P2 pose.
+    p2_pose = np.random.default_rng(9).normal(0.7, 0.05, (25, 3)).astype(np.float32)
+    x[1, 1] = p2_pose + np.asarray([1.5, 2.5, 3.5], np.float32)
+    tok = p.features(x).reshape(16, 2, 25, 15)
+    assert np.count_nonzero(tok[0, 1, :, 0:3]) > 0
+    # P2 is absent from the next segment and must not leak there.
+    assert np.count_nonzero(tok[1, 1, :, 0:3]) == 0
+
+
+def test_intermittent_p2_does_not_create_false_motion_jump():
+    x = clip(32)
+    p2_pose = np.random.default_rng(11).normal(0.5, 0.1, (25, 3)).astype(np.float32)
+    x[1, 1] = p2_pose + np.asarray([2, 1, 3], np.float32)
+    tok = p.features(x).reshape(16, 2, 25, 15)
+    # One isolated P2 frame has no valid consecutive P2 transition.
+    assert not tok[:, 1, :, 3:].any()
+
+
 def test_translation_invariance_with_padding():
     x = clip(32)
     valid = p.raw_valid(x)
