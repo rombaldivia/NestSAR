@@ -26,10 +26,10 @@
   },
   "cpu_compute_equivalence_check": {
     "params": 1826556,
-    "flops": 68507648.0,
+    "flops": 68507648,
     "gflops": 0.068507648,
     "scan_unrolled_outputs_match": true,
-    "max_abs_difference": 0.0,
+    "max_abs_difference": 0,
     "backend": "cpu",
     "jax": "0.7.2",
     "batch": 1,
@@ -40,7 +40,7 @@
   "historical_t4_reference_gflops": 0.029065216,
   "compute_note": "The CPU cost-analysis value is backend-specific; it is not a replacement for the saved CUDA/T4 report.",
   "runtime_repair": {
-    "upstream_reference_commit": "0a1429828a737f3431d9cdb3f5f98afc3e01ffee",
+    "upstream_reference_commit": "6c5ca849b26ec551c459fce71b714c5a3d82c753",
     "default": "host; no automatic JAX/CUDA installation",
     "preserved_upstream_jax_gpu_discovery": true,
     "nvidia_smi_required": false,

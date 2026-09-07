@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - fix/nestsar-sm-all-preprocessing-v2
+      - fix/nestsar-sm-all-kaggle-disk-recovery
   workflow_dispatch:
 
 jobs:
