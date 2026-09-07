@@ -43,7 +43,7 @@ def _masked_joint_mean(values: jnp.ndarray, valid: jnp.ndarray) -> jnp.ndarray:
     """Mean over joints while excluding padded/missing joints."""
     weight = valid.astype(values.dtype)
     denom = jnp.maximum(jnp.sum(weight, axis=3, keepdims=True), 1.0)
-    return jnp.sum(values * weight[..., None], axis=3) / denom[..., 0]
+    return jnp.sum(values * weight[..., None], axis=3) / denom
 
 
 def person_aware_controller_summary(tok: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
