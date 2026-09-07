@@ -1,4 +1,4 @@
-"""Dual-T4 SM-ALL entrypoint with two parent-owned persistent TQDM bars."""
+"""Dual-T4 SM-ALL person-aware P2 entrypoint with two persistent bars."""
 import argparse
 
 from experiments.nestsar_sm_all_t16.streaming.launch import DEFAULTS, run
@@ -7,8 +7,8 @@ from experiments.nestsar_sm_all_t16.streaming.launch import DEFAULTS, run
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dataset", default=None)
-    p.add_argument("--outdir", default="/kaggle/working/NestSAR_SM_ALL_T16_SharedCache_v2")
-    p.add_argument("--cache-dir", default="/kaggle/working/NestSAR_SM_ALL_SharedCache_v2")
+    p.add_argument("--outdir", default="/kaggle/working/NestSAR_SM_ALL_T16_PERSON_AWARE_P2_v3")
+    p.add_argument("--cache-dir", default="/kaggle/working/NestSAR_SM_ALL_PERSON_AWARE_P2_CACHE_v3")
     p.add_argument("--raw-layout", choices=("MTVC", "TMVC"), default="MTVC")
     p.add_argument("--audit-first", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--batch-size", type=int, help="Effective batch; must divide evenly by --micro-batch")
