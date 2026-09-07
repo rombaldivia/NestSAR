@@ -1,30 +1,18 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-"""NestSAR-SM-ALL-T16.
+"""NestSAR-SM-ALL-T16, person-aware P2 revision.
 
-From-scratch, attention-free LocalGlobal M4/G4 model with whole-network
-self-modulation and low-rank self-modifying fast weights.
+The neural input stays exactly [B,16,750]. The update fixes three representation
+problems without changing the parameter count:
+  * absent people/joints remain masked through the spatial encoder, so a padded P2
+    cannot turn into a learned fake skeleton because of Dense bias/person embeddings;
+  * the self-modulation controller keeps explicit P1/P2 summaries instead of
+    averaging the person dimension away;
+  * the controller receives explicit P2-P1 pose/motion relations and person/pair
+    presence indicators.
 
-Hard temporal contract:
-  raw NTU clip length is arbitrary at preprocessing time;
-  the neural network always receives exactly 16 temporal tokens.
-
-The existing LocalGlobal V2 topology is preserved:
-  J / B / JM / BM streams
-  -> SpatialEncoder
-  -> frame BiMemory (M4)
-  -> post-frame CrossStreamRouter
-  -> chunk BiMemory (G4)
-  -> stream classifiers.
-
-Self-modification is deliberately cheap:
-  * one shared controller modulates input channels and per-stream features;
-  * M4 and G4 keep the original BiMemory and receive a rank-r fast-weight
-    residual updated by a learned eta/alpha delta rule;
-  * fusion is clip-adaptive but zero-initialized to uniform;
-  * final classifier correction is a rank-r dynamic head, evaluated once/clip.
-
+The proven J/B/JM/BM -> M4 -> cross-stream router -> G4 topology is retained.
 No attention, GCN, TCN, Transformer, or T x T operation is introduced.
 """
 
@@ -45,12 +33,64 @@ FEATURES = ju.FEATURES
 NUM_CLASSES = ju.NUM_CLASSES
 NUM_STREAMS = ju.NUM_STREAMS
 
-if FRAMES != 16:
-    raise RuntimeError(f"NestSAR-SM-ALL-T16 requires FRAMES=16, got {FRAMES}")
+if FRAMES != 16 or PERSONS != 2 or TOKEN_CHANNELS != 15:
+    raise RuntimeError(
+        f"Person-aware SM-ALL requires T16/M2/C15, got T{FRAMES}/M{PERSONS}/C{TOKEN_CHANNELS}"
+    )
+
+
+def _masked_joint_mean(values: jnp.ndarray, valid: jnp.ndarray) -> jnp.ndarray:
+    """Mean over joints while excluding padded/missing joints."""
+    weight = valid.astype(values.dtype)
+    denom = jnp.maximum(jnp.sum(weight, axis=3, keepdims=True), 1.0)
+    return jnp.sum(values * weight[..., None], axis=3) / denom[..., 0]
+
+
+def person_aware_controller_summary(tok: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Return an explicit 15-D P1/P2/relational summary per frame.
+
+    Layout (15 dims):
+      0:3   masked mean P1 pose
+      3:6   masked mean P2 pose
+      6:9   P2-P1 relative pose (zero when the pair is absent)
+      9:12  P2-P1 relative full displacement (zero when pair absent)
+      12    P1 present
+      13    P2 present
+      14    P1&P2 pair present
+
+    This keeps the existing controller input width at 15, so no parameters are
+    added and the previous parameter budget remains valid.
+    """
+    if tok.ndim != 5 or tok.shape[2] != PERSONS or tok.shape[3] != JOINTS or tok.shape[4] != TOKEN_CHANNELS:
+        raise ValueError(f"Expected [B,T,2,25,15], got {tok.shape}")
+
+    # A root-centered joint can legitimately be exactly zero. Person presence is
+    # therefore inferred from all joints/channels, not one root coordinate.
+    joint_valid = jnp.any(jnp.abs(tok) > 1e-8, axis=-1)
+    person_present = jnp.any(joint_valid, axis=3).astype(tok.dtype)  # [B,T,M]
+    pair_present = person_present[..., 0] * person_present[..., 1]
+
+    pose_mean = _masked_joint_mean(tok[..., 0:3], joint_valid)
+    disp_mean = _masked_joint_mean(tok[..., 3:6], joint_valid)
+
+    p1_pose = pose_mean[..., 0, :]
+    p2_pose = pose_mean[..., 1, :]
+    rel_pose = (p2_pose - p1_pose) * pair_present[..., None]
+
+    p1_disp = disp_mean[..., 0, :]
+    p2_disp = disp_mean[..., 1, :]
+    rel_disp = (p2_disp - p1_disp) * pair_present[..., None]
+
+    presence = jnp.stack(
+        [person_present[..., 0], person_present[..., 1], pair_present],
+        axis=-1,
+    )
+    summary = jnp.concatenate([p1_pose, p2_pose, rel_pose, rel_disp, presence], axis=-1)
+    return summary, person_present, joint_valid
 
 
 class SharedSMController(nn.Module):
-    """Tiny controller shared by every adaptive stage."""
+    """Tiny person-aware controller shared by every adaptive stage."""
 
     controller_dim: int = 16
     head_rank: int = 2
@@ -64,9 +104,9 @@ class SharedSMController(nn.Module):
 
     @nn.compact
     def __call__(self, tok: jnp.ndarray) -> Mapping[str, jnp.ndarray]:
-        # tok: [B,T,M,V,C]. The controller sees one cheap per-frame summary.
-        pooled = jnp.mean(tok, axis=(2, 3))  # [B,T,C]
-        h = nn.Dense(self.controller_dim, name="in_proj")(pooled)
+        # Keep explicit actor identity and pair geometry instead of mean(M,V).
+        summary, person_present, joint_valid = person_aware_controller_summary(tok)
+        h = nn.Dense(self.controller_dim, name="in_proj")(summary)
         h = nn.LayerNorm(name="norm")(nn.gelu(h))
 
         zero = nn.initializers.zeros
@@ -100,7 +140,6 @@ class SharedSMController(nn.Module):
         beta = self.input_shift * jnp.tanh(beta_raw)
         stream_gate = 1.0 + self.stream_gain * jnp.tanh(stream_raw)
 
-        # Initial values: eta=0.10, alpha~=0.9495.
         eta = self.eta_max * jax.nn.sigmoid(lr_raw[..., 0:1])
         alpha = (
             self.alpha_min
@@ -137,23 +176,69 @@ class SharedSMController(nn.Module):
             "alpha": alpha,
             "fusion_logits": fusion_logits,
             "head_coeff": head_coeff,
+            "person_present": person_present,
+            "joint_valid": joint_valid,
         }
 
 
-class FastWeightDeltaResidual(nn.Module):
-    """Low-rank self-modifying fast-weight memory.
+class MaskSafeSpatialEncoder(nn.Module):
+    """Parameter-compatible SpatialEncoder that cannot fabricate an absent P2.
 
-    Memory state S_t has shape [rank, dim] per sample and changes inside the
-    sequence using a learned eta/alpha delta rule:
-
-      pred_t = k_t^T S_{t-1}
-      err_t  = v_t - pred_t
-      S_t    = alpha_t S_{t-1} + eta_t k_t err_t^T
-      r_t    = q_t^T S_t
-
-    S_0 is meta-learned by the outer training loop. S_t is reset to S_0 for
-    every new clip. This keeps the adaptive state O(rank * dim), not O(dim^2).
+    Parameter names/shapes intentionally match the historical SpatialEncoder.
+    Missing joints are zeroed after input embeddings and again after the joint
+    memory. Therefore Dense biases and learned person embeddings are available
+    only for joints that actually belong to a present skeleton.
     """
+
+    spatial_dim: int = 24
+    model_dim: int = 112
+    dropout: float = 0.10
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, valid: jnp.ndarray, training: bool) -> jnp.ndarray:
+        b, t, m, _, _ = x.shape
+        if valid.shape != x.shape[:-1]:
+            raise ValueError(f"Spatial validity mismatch: x={x.shape}, valid={valid.shape}")
+        valid_f = valid[..., None].astype(x.dtype)
+
+        h = nn.Dense(self.spatial_dim, name="in_proj")(x)
+        je = self.param(
+            "joint_embed",
+            nn.initializers.normal(0.02),
+            (1, 1, 1, JOINTS, self.spatial_dim),
+        )
+        pe = self.param(
+            "person_embed",
+            nn.initializers.normal(0.02),
+            (1, 1, PERSONS, 1, self.spatial_dim),
+        )
+        h = nn.gelu(h + je + pe) * valid_f
+
+        order = jnp.asarray(base.JOINT_ORDER)
+        inv = jnp.argsort(order)
+        h = jnp.take(h, order, axis=3)
+        vm = jnp.take(valid_f, order, axis=3)
+        h = h.reshape(b * t * m, JOINTS, self.spatial_dim)
+        vm = vm.reshape(b * t * m, JOINTS, 1)
+
+        mem = base.GatedSweep(self.spatial_dim, reverse=False, name="joint_memory")(h)
+        h = nn.LayerNorm(name="joint_memory_norm")(h + mem) * vm
+
+        h = h.reshape(b, t, m, JOINTS, self.spatial_dim)
+        h = jnp.take(h, inv, axis=3)
+
+        mask = jnp.asarray(base.PART_MASK_NP, h.dtype)
+        counts = jnp.asarray(base.PART_COUNTS_NP, h.dtype)
+        parts = jnp.einsum("btmvd,pv->btmpd", h, mask)
+        parts = parts / counts[None, None, None, :, None]
+        flat = parts.reshape(b, t, m * 10 * self.spatial_dim)
+        y = nn.Dense(self.model_dim, name="part_fuse")(flat)
+        y = nn.LayerNorm(name="out_norm")(nn.gelu(y))
+        return nn.Dropout(self.dropout)(y, deterministic=not training)
+
+
+class FastWeightDeltaResidual(nn.Module):
+    """Low-rank self-modifying fast-weight memory."""
 
     dim: int
     rank: int = 2
@@ -326,15 +411,17 @@ class NestSARSMAllT16(nn.Module):
             name="sm_controller",
         )(tok)
 
-        # Whole-input self-modulation. Preserve zero/padded joints.
-        valid = jnp.any(
-            jnp.abs(tok[..., 0:3]) > 1e-8,
-            axis=-1,
-            keepdims=True,
-        ).astype(tok.dtype)
+        # Preserve padded/missing joints through whole-input self-modulation.
+        # Force root validity for a present person because root-centered pose can
+        # legitimately be zero even when that actor is real.
+        joint_valid = controller["joint_valid"]
+        person_present = controller["person_present"].astype(bool)
+        joint_valid = joint_valid.at[..., 0].set(person_present)
+        valid_f = joint_valid[..., None].astype(tok.dtype)
+
         gamma = controller["gamma"][:, :, None, None, :]
         beta = controller["beta"][:, :, None, None, :]
-        tok = tok * gamma + valid * beta
+        tok = (tok * gamma + valid_f * beta) * valid_f
 
         pose = tok[..., 0:3]
         full_disp = tok[..., 3:6]
@@ -344,7 +431,9 @@ class NestSARSMAllT16(nn.Module):
 
         joint = pose
         parents = jnp.asarray(base.PARENTS)
-        bone = joint - jnp.take(joint, parents, axis=3)
+        parent_valid = jnp.take(joint_valid, parents, axis=3)
+        bone_valid = joint_valid & parent_valid
+        bone = (joint - jnp.take(joint, parents, axis=3)) * bone_valid[..., None]
 
         joint_motion = jnp.concatenate(
             [full_disp, phase_a, phase_b, path],
@@ -364,7 +453,7 @@ class NestSARSMAllT16(nn.Module):
                 jnp.abs(path - parent_path),
             ],
             axis=-1,
-        )
+        ) * bone_valid[..., None]
 
         raw_streams = (
             joint,
@@ -372,16 +461,22 @@ class NestSARSMAllT16(nn.Module):
             joint_motion,
             bone_motion,
         )
+        stream_valid = (
+            joint_valid,
+            bone_valid,
+            joint_valid,
+            bone_valid,
+        )
 
-        # Spatial/local-global stage remains proven, but is dynamically gated.
+        # Spatial/local-global stage with mask-safe learned P1/P2 embeddings.
         spatial = []
-        for i, stream in enumerate(raw_streams):
-            s = base.SpatialEncoder(
+        for i, (stream, valid) in enumerate(zip(raw_streams, stream_valid)):
+            s = MaskSafeSpatialEncoder(
                 self.spatial_dim,
                 self.model_dim,
                 self.dropout,
                 name=f"spatial_{i}",
-            )(stream, training)
+            )(stream, valid, training)
             gate = controller["stream_gate"][:, :, i:i + 1]
             spatial.append(s * gate)
 
@@ -445,14 +540,12 @@ class NestSARSMAllT16(nn.Module):
         descs = jnp.stack(descriptors, axis=1)
         sl = jnp.stack(stream_logits, axis=1)
 
-        # Zero-initialized controller => exact uniform fusion at initialization.
         fusion = jax.nn.softmax(
             controller["fusion_logits"],
             axis=-1,
         )
         main_logits = jnp.einsum("bs,bsc->bc", fusion, sl)
 
-        # Clip-level low-rank adaptive classifier correction.
         fused_desc = jnp.einsum("bs,bsd->bd", fusion, descs)
         head_u = nn.Dense(
             self.head_rank,
@@ -484,4 +577,9 @@ class NestSARSMAllT16(nn.Module):
             "sm_eta_mean": jnp.mean(controller["eta"], axis=(1, 2)),
             "sm_alpha_mean": jnp.mean(controller["alpha"], axis=(1, 2)),
             "sm_head_coeff": controller["head_coeff"],
+            "person_presence_rate": jnp.mean(controller["person_present"], axis=1),
+            "pair_presence_rate": jnp.mean(
+                controller["person_present"][..., 0] * controller["person_present"][..., 1],
+                axis=1,
+            ),
         }
