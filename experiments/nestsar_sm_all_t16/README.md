@@ -24,9 +24,12 @@ input. It imports the existing `model.py` without modifying its equations.
 - Default training is 60 epochs, effective batch 256 (64 × 4 accumulation),
   EMA 0.995, and **patience 5 after the 8% learning-rate warm-up**. Padded tails
   are masked in all losses/metrics; every training and validation sample counts.
-- Setup creates a pip-free venv when necessary and installs through the notebook
-  Python's `pip --python`. It never invokes `ensurepip` or changes the kernel's
-  JAX installation. JAX 0.7.2, Flax 0.11.2, Optax 0.2.5 and NumPy 2.2.6 are pinned.
+- Kaggle bootstrap now uses the notebook's existing Python/JAX/CUDA environment.
+  It **never creates a CUDA/JAX venv and never installs GPU wheels**. GPU discovery
+  is performed by a fresh JAX subprocess, so `nvidia-smi` is optional metadata
+  rather than a hard dependency. Each assigned GPU is then probed in isolation
+  before cache preparation or training begins. Legacy auto-generated `runtime/`
+  directories are removed after a successful host-runtime probe.
 
 The default new output directory is
 `/kaggle/working/NestSAR_SM_ALL_T16_SharedCache_v2`; the cache is
