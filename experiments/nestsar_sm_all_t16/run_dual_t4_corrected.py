@@ -1,43 +1,34 @@
-#!/usr/bin/env python3
-from __future__ import annotations
+"""Dual-T4 SM-ALL entrypoint with two parent-owned persistent TQDM bars."""
+import argparse
 
-"""Dual-T4 launcher for SM-ALL with corrected preprocessing.
-
-Reuses the existing parent launcher unchanged except for the worker module name.
-GPU0 -> XSUB and GPU1 -> XSET, with exactly the same model/training arguments
-and the same two persistent progress rows.
-"""
-
-from experiments.nestsar_sm_all_t16 import run_dual_t4 as legacy
-
-# Keep an immutable reference to the original command builder BEFORE replacing
-# legacy.worker_cmd. Calling legacy.worker_cmd from the wrapper after monkey
-# patching would recurse back into corrected_worker_cmd forever.
-_ORIGINAL_WORKER_CMD = legacy.worker_cmd
-
-
-def corrected_worker_cmd(args, protocol):
-    cmd = _ORIGINAL_WORKER_CMD(args, protocol)
-    old = "experiments.nestsar_sm_all_t16.train_gpu"
-    new = "experiments.nestsar_sm_all_t16.train_gpu_corrected"
-    try:
-        i = cmd.index(old)
-    except ValueError as exc:
-        raise RuntimeError(f"Could not locate legacy worker module in command: {cmd}") from exc
-    cmd[i] = new
-    return cmd
+from experiments.nestsar_sm_all_t16.streaming.launch import DEFAULTS, run
 
 
 def main():
-    # Patch only while the legacy parent launcher is running. Restoring the
-    # original function makes notebook reruns/imports deterministic and avoids
-    # keeping mutated module state after an exception or completed run.
-    previous = legacy.worker_cmd
-    legacy.worker_cmd = corrected_worker_cmd
-    try:
-        legacy.main()
-    finally:
-        legacy.worker_cmd = previous
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--dataset", default=None)
+    p.add_argument("--outdir", default="/kaggle/working/NestSAR_SM_ALL_T16_SharedCache_v2")
+    p.add_argument("--cache-dir", default="/kaggle/working/NestSAR_SM_ALL_SharedCache_v2")
+    p.add_argument("--raw-layout", choices=("MTVC", "TMVC"), default="MTVC")
+    p.add_argument("--audit-first", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--batch-size", type=int, help="Effective batch; must divide evenly by --micro-batch")
+    for key, value in DEFAULTS.items():
+        names = ["--" + key.replace("_", "-")]
+        if key == "eval_batch":
+            names.append("--eval-batch-size")
+        if key == "jitter_shift":
+            names.append("--jitter-max-shift")
+        if isinstance(value, bool):
+            p.add_argument(*names, dest=key, action=argparse.BooleanOptionalAction, default=value)
+        else:
+            p.add_argument(*names, dest=key, type=type(value), default=value)
+    args = p.parse_args()
+    config = {key: getattr(args, key) for key in DEFAULTS}
+    if args.batch_size is not None:
+        if args.batch_size < 1 or args.batch_size % config["micro_batch"]:
+            p.error("--batch-size must be a positive multiple of --micro-batch")
+        config["accumulation_steps"] = args.batch_size // config["micro_batch"]
+    return run(args.dataset, args.outdir, args.cache_dir, config, args.raw_layout, args.audit_first)
 
 
 if __name__ == "__main__":

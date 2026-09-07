@@ -1,0 +1,42 @@
+{
+  "reference_commit": "082babd14f9667e90f04c307ca11230483864e0a",
+  "regression_tests_passed": 27,
+  "smoke": {
+    "backend": "cpu",
+    "real_model_params": 1826556,
+    "protocols": [
+      "xsub",
+      "xset"
+    ],
+    "concurrent_workers": true,
+    "epochs_per_protocol": 2,
+    "train_samples_per_protocol": 3,
+    "val_samples_per_protocol": 2,
+    "resume_and_alias_repair_passed": true,
+    "real_ntu_accuracy_measured": false,
+    "dual_t4_executed": false
+  },
+  "equivalence": {
+    "reference_commit": "082babd14f9667e90f04c307ca11230483864e0a",
+    "preprocessing_replay_cases": 24,
+    "canonical_and_augmented_arrays_identical": true,
+    "original_initial_parameter_values_identical": true,
+    "original_rng_key_identical": true,
+    "parameters": 1826556
+  },
+  "cpu_compute_equivalence_check": {
+    "params": 1826556,
+    "flops": 68507648.0,
+    "gflops": 0.068507648,
+    "scan_unrolled_outputs_match": true,
+    "max_abs_difference": 0.0,
+    "backend": "cpu",
+    "jax": "0.7.2",
+    "batch": 1,
+    "convention": "Static-unrolled XLA forward; 1 MAC=2 FLOPs; preprocessing excluded"
+  },
+  "new_ntu120_accuracy_measured": false,
+  "dual_t4_training_executed": false,
+  "historical_t4_reference_gflops": 0.029065216,
+  "compute_note": "The CPU cost-analysis value is backend-specific; it is not a replacement for the saved CUDA/T4 report."
+}

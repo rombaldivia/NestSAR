@@ -127,15 +127,20 @@ def features(x, valid=None, rng=None, shift=0):
     return tokens.reshape(FRAMES, FEATURES).astype(np.float32)
 
 
-def training_views(x, seed, epoch, sample_index, rotation_degrees=8.0, shift=1):
-    """Return canonical and fresh augmented views, rebuilt from raw skeletons."""
-    valid = raw_valid(x)
-    canonical = features(x, valid)
+def augmented_features(x, seed, epoch, sample_index, rotation_degrees=8.0, shift=1):
+    """Build only the augmented view; canonical tokens can be shared on disk.
 
+    Seeds and equations match training_views, including the raw validity mask.
+    """
+    valid = raw_valid(x)
     rng = np.random.default_rng(np.random.SeedSequence([seed, epoch, sample_index]))
     theta = np.deg2rad(rng.uniform(-rotation_degrees, rotation_degrees)) if rotation_degrees else 0.0
     c, s = np.cos(theta), np.sin(theta)
     rotation = np.asarray([[c, 0, s], [0, 1, 0], [-s, 0, c]], np.float32)
     augmented = np.where(valid[..., None], x @ rotation.T, 0)
-    aug = features(augmented, valid, rng=rng, shift=shift)
-    return canonical, aug
+    return features(augmented, valid, rng=rng, shift=shift)
+
+
+def training_views(x, seed, epoch, sample_index, rotation_degrees=8.0, shift=1):
+    """Compatibility API for callers that need both views."""
+    return features(x), augmented_features(x, seed, epoch, sample_index, rotation_degrees, shift)

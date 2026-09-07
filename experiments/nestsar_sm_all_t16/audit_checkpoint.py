@@ -34,6 +34,8 @@ from tqdm.auto import tqdm
 from experiments.m4_motionpreserve_t16 import train_m4_motionpreserve_t16_tpu as base
 from experiments.m4_phase_jitter_uniform_t16 import train_tpu as ju
 from experiments.m4_phase_jitter_consistency_localglobal_t16 import preprocessing as lg
+from experiments.nestsar_sm_all_t16 import preprocessing_corrected as corrected
+from experiments.nestsar_sm_all_t16.streaming.data import resolve_splits
 from experiments.m4_phase_jitter_consistency_localglobal_hand_m4g4_t32.model import (
     M4LocalGlobalHandM4G4T32,
 )
@@ -57,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset", required=True)
     p.add_argument(
         "--sm-outdir",
-        default="/kaggle/working/NestSAR_SM_ALL_T16_v1_DualT4",
+        default="/kaggle/working/NestSAR_SM_ALL_T16_SharedCache_v2",
     )
     p.add_argument(
         "--baseline-outdir",
@@ -65,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--audit-outdir",
-        default="/kaggle/working/NestSAR_SM_ALL_T16_v1_DualT4/audit",
+        default="/kaggle/working/NestSAR_SM_ALL_T16_SharedCache_v2/audit",
     )
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument(
@@ -75,6 +77,9 @@ def parse_args() -> argparse.Namespace:
         help="Number of validation samples used for expensive intermediate capture.",
     )
     p.add_argument("--progress-every", type=int, default=20)
+    p.add_argument("--sm-preprocessing", choices=("corrected", "legacy"), default="corrected",
+                   help="Use corrected for the verified preprocessing-v2 run; legacy only for older uncorrected weights")
+    p.add_argument("--raw-layout", choices=("MTVC", "TMVC"), default="MTVC")
     return p.parse_args()
 
 
@@ -119,29 +124,25 @@ def count_params(params) -> int:
 
 
 def xla_flops(model, params) -> float:
-    dummy = jnp.zeros((1, FRAMES, FEATURES), jnp.float32)
-    fn = jax.jit(
-        lambda p, x: model.apply({"params": p}, x, training=False)["logits"]
-    )
-    compiled = fn.lower(params, dummy).compile()
-    ca = compiled.cost_analysis()
-    if isinstance(ca, list):
-        ca = ca[0] if ca else {}
-    return float(ca.get("flops", float("nan")))
+    from experiments.nestsar_sm_all_t16.streaming.audit import audit_model
+    return audit_model(model, params)["flops"]
 
 
 def resolve_val(annotations, split, protocol: str):
-    by_id, _, val_ids = ju.resolve_protocol_ids(annotations, split, protocol)
+    ids, protocols = resolve_splits(annotations, split)
+    by_id = dict(zip(ids, annotations))
+    val_ids = [ids[i] for i in protocols[f"{protocol}_val"]]
     return by_id, val_ids
 
 
-def iter_validation_batches(by_id, val_ids, batch_size: int):
-    """Canonical validation views for SM-T16 and Hand-T32 baseline."""
+def iter_validation_batches(by_id, val_ids, batch_size: int, sm_preprocessing="corrected", raw_layout="MTVC"):
+    """Each checkpoint receives its own training-time canonical representation."""
     for start in range(0, len(val_ids), batch_size):
         ids = val_ids[start : start + batch_size]
         n = len(ids)
 
         x = np.zeros((batch_size, FRAMES, FEATURES), np.float32)
+        baseline_x = np.zeros_like(x)
         h = np.zeros((batch_size, HAND_FRAMES, HAND_FEATURES), np.float32)
         y = np.zeros((batch_size,), np.int32)
         mask = np.zeros((batch_size,), np.float32)
@@ -149,12 +150,18 @@ def iter_validation_batches(by_id, val_ids, batch_size: int):
         for j, sid in enumerate(ids):
             a = by_id[sid]
             kp = base.annotation_keypoints(a)
-            x[j] = lg.segment_phase_tokens_localglobal(kp)
+            baseline_x[j] = lg.segment_phase_tokens_localglobal(kp)
+            if sm_preprocessing == "corrected":
+                x[j] = corrected.features(corrected.ordered_raw(kp, raw_layout))
+            elif sm_preprocessing == "legacy":
+                x[j] = baseline_x[j]
+            else:
+                raise ValueError(f"Unknown SM preprocessing: {sm_preprocessing}")
             h[j] = hand_tokens_t32(kp)
             y[j] = base.annotation_label(a)
             mask[j] = 1.0
 
-        yield x, h, y, mask, n
+        yield x, baseline_x, h, y, mask, n
 
 
 def safe_ratio(num: np.ndarray, den: np.ndarray, eps: float = 1e-8) -> np.ndarray:
@@ -346,6 +353,9 @@ def audit_protocol(args, annotations, split, protocol: str):
 
     sm_payload = load_payload(sm_ckpt)
     base_payload = load_payload(base_ckpt)
+    if sm_payload.get("preprocessing_version"):
+        if args.sm_preprocessing != "corrected" or sm_payload["preprocessing_version"] != corrected.VERSION:
+            raise ValueError("SM checkpoint preprocessing metadata does not match the selected audit pipeline")
 
     sm_model = model_from_sm_payload(sm_payload)
     base_model = model_from_baseline_payload(base_payload)
@@ -363,7 +373,7 @@ def audit_protocol(args, annotations, split, protocol: str):
     flops = xla_flops(sm_model, sm_params)
     gflops = flops / 1e9
     print(f"1) PARAMS       : {nparams:,}")
-    print(f"   XLA FLOPs    : {flops:,.0f}")
+    print(f"   Unrolled FLOPs: {flops:,.0f}")
     print(f"   XLA GFLOPs   : {gflops:.9f}")
     print(f"   XLA MFLOPs   : {flops/1e6:.6f}")
 
@@ -417,13 +427,13 @@ def audit_protocol(args, annotations, split, protocol: str):
         mininterval=0.5,
     )
 
-    for batch_i, (xb, hb, yb, mask, n) in enumerate(
-        iter_validation_batches(by_id, val_ids, args.batch_size),
+    for batch_i, (xb, baseline_xb, hb, yb, mask, n) in enumerate(
+        iter_validation_batches(by_id, val_ids, args.batch_size, args.sm_preprocessing, args.raw_layout),
         start=1,
     ):
         sm_out = jax.device_get(sm_apply(sm_params, jnp.asarray(xb)))
         base_out = jax.device_get(
-            base_apply(base_params, jnp.asarray(xb), jnp.asarray(hb))
+            base_apply(base_params, jnp.asarray(baseline_xb), jnp.asarray(hb))
         )
 
         y = yb[:n]
@@ -610,6 +620,11 @@ def audit_protocol(args, annotations, split, protocol: str):
 
     result = {
         "protocol": protocol,
+        "sm_preprocessing": args.sm_preprocessing,
+        "sm_preprocessing_version": corrected.VERSION if args.sm_preprocessing == "corrected" else "legacy-localglobal",
+        "baseline_preprocessing": "legacy-hand-m4g4-t32",
+        "compute_method": "static-unrolled-forward-equivalence-checked",
+        "validation_samples": total,
         "checkpoint_epoch": int(sm_payload.get("epoch", 0)),
         "params": nparams,
         "flops": flops,
