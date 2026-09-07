@@ -6,6 +6,48 @@ This experiment keeps the neural input at **16 x 750** and keeps the historical
 **1,826,556-parameter** SM-ALL budget while fixing the remaining person/P2 data
 and representation gaps.
 
+## Verified person-aware P2 v3 result
+
+Dual-T4 NTU RGB+D 120 run, seed 128, fixed neural processing length T=16:
+
+| Protocol | Best held-out accuracy | Best epoch | Last epoch |
+| --- | ---: | ---: | ---: |
+| XSUB | **76.971268%** | 24 | 29 |
+| XSET | **78.423592%** | 31 | 36 |
+
+Relative to the preceding corrected-preprocessing-v2 baseline:
+
+| Protocol | corrected-v2 | person-aware P2 v3 | Gain |
+| --- | ---: | ---: | ---: |
+| XSUB | 76.321216% | **76.971268%** | **+0.650052 pp** |
+| XSET | 78.062108% | **78.423592%** | **+0.361484 pp** |
+
+Model size remains **1,826,556 parameters**.
+
+Static-unrolled compute audit for the person-aware P2 v3 model:
+
+- **29,412,272 FLOPs/clip**
+- **29.412272 MFLOPs/clip**
+- **0.029412272 GFLOPs/clip**
+- **0.014706136 GMACs/clip** under the convention `1 MAC = 2 FLOPs`
+
+Compared with corrected-v2 SM-ALL at 29.065216 MFLOPs/clip, person awareness adds
+**0.347056 MFLOPs/clip (+1.194%)**.
+
+The complete issue-closure audit passed **70/70 checks**. The full NTU120 cache
+contains 113,945 usable samples; P2 is preserved in **100%** of raw clips in which
+it is present, with zero complete P2 loss after T16 preprocessing.
+
+### Evaluation-protocol note
+
+`xsub_val` and `xset_val` are the official NTU120 held-out benchmark partitions.
+This training run evaluated them every epoch for checkpoint selection and early
+stopping. Therefore the numbers above are the verified scores of this experiment,
+but they should not be described as untouched one-shot final-test scores in a
+paper. Future architecture selection should use an internal validation split made
+only from the official training partition, then evaluate the official held-out
+partition after the model/configuration is frozen.
+
 ## Preprocessing
 
 - Missing people/joints are still detected before centering and remain zero.
@@ -38,6 +80,3 @@ Use new Kaggle paths so the v2 canonical cache cannot be reused accidentally:
 
 - output: `/kaggle/working/NestSAR_SM_ALL_T16_PERSON_AWARE_P2_v3`
 - cache: `/kaggle/working/NestSAR_SM_ALL_PERSON_AWARE_P2_CACHE_v3`
-
-The verified 76.321216% XSUB / 78.062108% XSET scores belong to the preceding
-corrected-preprocessing-v2 baseline, not to this new person-aware experiment.
