@@ -26,6 +26,12 @@ from . import VERSION
 EXPECTED_PARAMS = 1_826_556
 
 
+def experiment_identity(experiment):
+    """Prevent a packed experiment checkpoint being mistaken for legacy P2."""
+    return dict(model="NestSAR-SM-ALL-T16-" + experiment["version"],
+                preprocessing_version=experiment["version"], experiment=experiment)
+
+
 def make_model(config):
     return NestSARSMAllT16(**{k: config[k] for k in (
         "spatial_dim", "model_dim", "dropout", "controller_dim", "fast_rank",
@@ -106,7 +112,7 @@ def build_steps(model, config):
     return train_step, eval_step
 
 
-def create_state(config, steps_per_epoch):
+def create_state(config, steps_per_epoch, model=None):
     total = config["epochs"] * steps_per_epoch
     warm = max(1, int(total * config["warmup_fraction"]))
     # A one-epoch smoke run still has a well-defined schedule.
@@ -115,7 +121,7 @@ def create_state(config, steps_per_epoch):
                                                 max(total, warm + 1), end_value=config["min_learning_rate"])
     optimizer = optax.chain(optax.clip_by_global_norm(config["grad_clip"]),
                            optax.adamw(schedule, weight_decay=config["weight_decay"]))
-    model = make_model(config)
+    model = make_model(config) if model is None else model
     key, init = jax.random.split(jax.random.PRNGKey(config["seed"]))
     params = model.init({"params": init, "dropout": init}, jnp.zeros((1, FRAMES, FEATURES)), training=False)["params"]
     count = sum(x.size for x in jax.tree.leaves(params))
@@ -180,10 +186,13 @@ def publish_best(out, metadata):
         raise ValueError("Invalid best-checkpoint filename")
     payload = (out / name).read_bytes()
     atomic_bytes(out / "best.msgpack", payload)
-    atomic_json(out / "best.json", dict(model="NestSAR-SM-ALL-T16-v1",
+    info = dict(model="NestSAR-SM-ALL-T16-v1",
         epoch=metadata["best_epoch"], val_accuracy=metadata["best"], params=EXPECTED_PARAMS,
         preprocessing_version=PREPROCESSING_VERSION, pipeline_version=VERSION,
-        config_hash=metadata["config_hash"]))
+        config_hash=metadata["config_hash"])
+    if "experiment" in metadata:
+        info.update(experiment_identity(metadata["experiment"]))
+    atomic_json(out / "best.json", info)
 
 
 def write_result(out, protocol, metadata, digest, resumed=False):
@@ -195,12 +204,14 @@ def write_result(out, protocol, metadata, digest, resumed=False):
               "config_hash": digest, "checkpoint": str(out / "best.msgpack"),
               "preprocessing_version": PREPROCESSING_VERSION, "pipeline_version": VERSION,
               "stopped_early": metadata["stopped_early"], "resumed_completed": resumed}
+    if "experiment" in metadata:
+        result.update(experiment_identity(metadata["experiment"]))
     atomic_json(out / "result.json", result)
     atomic_json(out.parent / f"result_{protocol}.json", result)
     return result
 
 
-def run(config, protocol, cache, outdir, allow_cpu=False):
+def run(config, protocol, cache, outdir, allow_cpu=False, *, model=None, dataset=None, experiment=None):
     from .launch import validate_config
     config = validate_config(config)
     if protocol not in ("xsub", "xset"):
@@ -212,7 +223,7 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
            best=None, best_epoch=0, completed_epoch=0)
     if not allow_cpu and (jax.default_backend() != "gpu" or len(jax.local_devices()) != 1):
         raise RuntimeError(f"Expected one isolated GPU; backend={jax.default_backend()}, devices={jax.local_devices()}")
-    dataset = Dataset(cache)
+    dataset = Dataset(cache) if dataset is None else dataset
     train_ids = dataset.splits[f"{protocol}_train"]
     val_ids = dataset.splits[f"{protocol}_val"]
     if config["max_train_samples"]:
@@ -225,16 +236,20 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
     steps = math.ceil(len(train_ids) / batch_size)
     signature = {"config": config, "protocol": protocol, "cache": dataset.meta["signature"],
                  "parameters": EXPECTED_PARAMS, "pipeline_version": VERSION}
+    if experiment is not None:
+        signature["experiment"] = experiment
     digest = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
     previous = read_json(out / "run_config.json")
     if previous is not None and previous != signature:
         raise ValueError("OUT_DIR contains another run's config/data. Choose a new OUT_DIR.")
     atomic_json(out / "run_config.json", signature)
     report(phase="Initialize SM-ALL", train_samples=len(train_ids), val_samples=len(val_ids))
-    model, state, key, schedule, warmup_epochs = create_state(config, steps)
+    model, state, key, schedule, warmup_epochs = create_state(config, steps, model)
     metadata = {"config_hash": digest, "epoch": 0, "best": -1.0, "best_epoch": 0,
                 "bad_epochs": 0, "history": [], "warmup_epochs": warmup_epochs,
                 "best_checkpoint": None, "stopped_early": False}
+    if experiment is not None:
+        metadata["experiment"] = experiment
     last = out / "last.msgpack"
     if last.exists():
         state, key, metadata = restore_checkpoint(last, state, digest)
@@ -341,6 +356,8 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
                             "config": config, "preprocessing_version": PREPROCESSING_VERSION,
                             "pipeline_version": VERSION, "cache_signature": dataset.meta["signature"],
                             "train_samples": len(train_ids), "val_samples": len(val_ids)}
+            if experiment is not None:
+                best_payload.update(experiment_identity(experiment))
             atomic_bytes(out / metadata["best_checkpoint"], serialization.to_bytes(best_payload))
         row.update(best_val_accuracy=best, best_epoch=metadata["best_epoch"])
         metadata["history"].append(row)

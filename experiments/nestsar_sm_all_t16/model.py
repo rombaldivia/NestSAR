@@ -46,7 +46,7 @@ def _masked_joint_mean(values: jnp.ndarray, valid: jnp.ndarray) -> jnp.ndarray:
     return jnp.sum(values * weight[..., None], axis=3) / denom
 
 
-def person_aware_controller_summary(tok: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+def person_aware_controller_summary(tok: jnp.ndarray, extra_valid=None) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Return an explicit 15-D P1/P2/relational summary per frame.
 
     Layout (15 dims):
@@ -67,6 +67,8 @@ def person_aware_controller_summary(tok: jnp.ndarray) -> tuple[jnp.ndarray, jnp.
     # A root-centered joint can legitimately be exactly zero. Person presence is
     # therefore inferred from all joints/channels, not one root coordinate.
     joint_valid = jnp.any(jnp.abs(tok) > 1e-8, axis=-1)
+    if extra_valid is not None:
+        joint_valid = joint_valid | extra_valid
     person_present = jnp.any(joint_valid, axis=3).astype(tok.dtype)  # [B,T,M]
     pair_present = person_present[..., 0] * person_present[..., 1]
 
@@ -103,9 +105,9 @@ class SharedSMController(nn.Module):
     fusion_scale: float = 0.15
 
     @nn.compact
-    def __call__(self, tok: jnp.ndarray) -> Mapping[str, jnp.ndarray]:
+    def __call__(self, tok: jnp.ndarray, extra_valid=None) -> Mapping[str, jnp.ndarray]:
         # Keep explicit actor identity and pair geometry instead of mean(M,V).
-        summary, person_present, joint_valid = person_aware_controller_summary(tok)
+        summary, person_present, joint_valid = person_aware_controller_summary(tok, extra_valid)
         h = nn.Dense(self.controller_dim, name="in_proj")(summary)
         h = nn.LayerNorm(name="norm")(nn.gelu(h))
 
@@ -274,8 +276,10 @@ class FastWeightDeltaResidual(nn.Module):
 
         k = jnp.tanh(k)
         q = jnp.tanh(q)
-        k = k / jnp.maximum(jnp.linalg.norm(k, axis=-1, keepdims=True), 1e-6)
-        q = q / jnp.maximum(jnp.linalg.norm(q, axis=-1, keepdims=True), 1e-6)
+        # Guard INSIDE sqrt: maximum(norm(x), eps) has a NaN derivative at
+        # exactly zero, even when a padded sample's loss weight is zero.
+        k = k / jnp.sqrt(jnp.maximum(jnp.sum(k * k, axis=-1, keepdims=True), 1e-12))
+        q = q / jnp.sqrt(jnp.maximum(jnp.sum(q * q, axis=-1, keepdims=True), 1e-12))
 
         memory0 = self.param(
             "memory0",
@@ -375,6 +379,34 @@ class SelfModDescriptorHead(nn.Module):
         return chunks, pooled
 
 
+def unpack_relative_tokens(tok):
+    """Reconstruct the legacy phase layout before independently learned gains."""
+    relative_path = tok[..., 9:12]
+    legacy = jnp.concatenate([tok[..., :9], tok[..., 3:6] - tok[..., 6:9],
+                              tok[..., 12:15]], axis=-1)
+    return legacy, relative_path
+
+
+def skeleton_streams(tok, joint_valid, relative_path=None, path_gain=None):
+    """Build unchanged-width J/B/JM/BM streams from modulated legacy tokens."""
+    pose, full, early, late, path = jnp.split(tok, 5, axis=-1)
+    parents = jnp.asarray(base.PARENTS)
+    parent = lambda a: jnp.take(a, parents, axis=3)
+    bone_valid = joint_valid & parent(joint_valid)
+    bone = (pose - parent(pose)) * bone_valid[..., None]
+    if relative_path is None:
+        bone_path = jnp.abs(path - parent(path))
+    else:
+        # Shared positive path gain preserves travel units. A shared additive
+        # shift cancels between endpoints; adding beta would invent motion.
+        bone_path = relative_path * path_gain
+    joint_motion = jnp.concatenate([full, early, late, path], axis=-1)
+    bone_motion = jnp.concatenate([full - parent(full), early - parent(early),
+                                   late - parent(late), bone_path], axis=-1)
+    return ((pose, bone, joint_motion, bone_motion * bone_valid[..., None]),
+            (joint_valid, bone_valid, joint_valid, bone_valid))
+
+
 class NestSARSMAllT16(nn.Module):
     spatial_dim: int = 24
     model_dim: int = 112
@@ -385,6 +417,9 @@ class NestSARSMAllT16(nn.Module):
     head_rank: int = 2
     sm_residual_scale: float = 0.08
     head_residual_scale: float = 0.15
+    # Default retains the original P2 interface/checkpoints. Both experiment
+    # modes receive packed tokens; only "relative" changes the BM path.
+    motion_path: str = "legacy"
 
     @nn.compact
     def __call__(
@@ -404,12 +439,18 @@ class NestSARSMAllT16(nn.Module):
             JOINTS,
             TOKEN_CHANNELS,
         )
+        if self.motion_path not in ("legacy", "proxy", "relative"):
+            raise ValueError("motion_path must be legacy, proxy or relative")
+        relative_path = extra_valid = None
+        if self.motion_path != "legacy":
+            tok, relative_path = unpack_relative_tokens(tok)
+            extra_valid = jnp.any(relative_path > 1e-8, axis=-1)
 
         controller = SharedSMController(
             controller_dim=self.controller_dim,
             head_rank=self.head_rank,
             name="sm_controller",
-        )(tok)
+        )(tok, extra_valid)
 
         # Preserve padded/missing joints through whole-input self-modulation.
         # Force root validity for a present person because root-centered pose can
@@ -423,49 +464,10 @@ class NestSARSMAllT16(nn.Module):
         beta = controller["beta"][:, :, None, None, :]
         tok = (tok * gamma + valid_f * beta) * valid_f
 
-        pose = tok[..., 0:3]
-        full_disp = tok[..., 3:6]
-        phase_a = tok[..., 6:9]
-        phase_b = tok[..., 9:12]
-        path = tok[..., 12:15]
-
-        joint = pose
-        parents = jnp.asarray(base.PARENTS)
-        parent_valid = jnp.take(joint_valid, parents, axis=3)
-        bone_valid = joint_valid & parent_valid
-        bone = (joint - jnp.take(joint, parents, axis=3)) * bone_valid[..., None]
-
-        joint_motion = jnp.concatenate(
-            [full_disp, phase_a, phase_b, path],
-            axis=-1,
-        )
-
-        parent_full = jnp.take(full_disp, parents, axis=3)
-        parent_a = jnp.take(phase_a, parents, axis=3)
-        parent_b = jnp.take(phase_b, parents, axis=3)
-        parent_path = jnp.take(path, parents, axis=3)
-
-        bone_motion = jnp.concatenate(
-            [
-                full_disp - parent_full,
-                phase_a - parent_a,
-                phase_b - parent_b,
-                jnp.abs(path - parent_path),
-            ],
-            axis=-1,
-        ) * bone_valid[..., None]
-
-        raw_streams = (
-            joint,
-            bone,
-            joint_motion,
-            bone_motion,
-        )
-        stream_valid = (
-            joint_valid,
-            bone_valid,
-            joint_valid,
-            bone_valid,
+        raw_streams, stream_valid = skeleton_streams(
+            tok, joint_valid,
+            relative_path if self.motion_path == "relative" else None,
+            gamma[..., 12:15],
         )
 
         # Spatial/local-global stage with mask-safe learned P1/P2 embeddings.

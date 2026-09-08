@@ -102,8 +102,8 @@ class UnrolledFastWeightDeltaResidual(nn.Module):
 
         k = jnp.tanh(k)
         q = jnp.tanh(q)
-        k = k / jnp.maximum(jnp.linalg.norm(k, axis=-1, keepdims=True), 1e-6)
-        q = q / jnp.maximum(jnp.linalg.norm(q, axis=-1, keepdims=True), 1e-6)
+        k = k / jnp.sqrt(jnp.maximum(jnp.sum(k * k, axis=-1, keepdims=True), 1e-12))
+        q = q / jnp.sqrt(jnp.maximum(jnp.sum(q * q, axis=-1, keepdims=True), 1e-12))
 
         memory0 = self.param(
             "memory0",

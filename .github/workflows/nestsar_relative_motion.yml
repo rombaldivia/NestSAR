@@ -1,0 +1,39 @@
+name: True relative motion T16
+on:
+  push:
+    branches: ['experiment/nestsar-true-relative-path-t16']
+  pull_request:
+    paths:
+      - 'experiments/nestsar_sm_all_t16/relative_motion/**'
+      - 'experiments/nestsar_sm_all_t16/model.py'
+      - 'experiments/nestsar_sm_all_t16/compute_unrolled_audit.py'
+      - 'experiments/nestsar_sm_all_t16/streaming/worker.py'
+      - 'experiments/nestsar_sm_all_t16/kaggle_relative_motion.py'
+      - '.github/workflows/nestsar_relative_motion.yml'
+permissions:
+  contents: read
+jobs:
+  cpu-verification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      JAX_PLATFORMS: cpu
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install 'jax[cpu]==0.7.2' 'flax==0.11.2' 'optax==0.2.5' 'numpy==2.2.6' 'pytest==8.4.2' psutil tqdm
+      - run: python -m pytest -q experiments/nestsar_sm_all_t16/relative_motion/tests experiments/nestsar_sm_all_t16/test_preprocessing_corrected.py experiments/nestsar_sm_all_t16/streaming/tests/test_person_awareness.py experiments/nestsar_sm_all_t16/streaming/tests/test_training.py experiments/nestsar_sm_all_t16/nonlinear_compare/tests
+      - run: python -m experiments.nestsar_sm_all_t16.relative_motion.smoke_cpu --outdir /tmp/relative-smoke > /tmp/relative-smoke-console.log 2>&1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: relative-motion-validation
+          path: |
+            /tmp/relative-smoke/validation.json
+            /tmp/relative-smoke/run_smoke/results.json
+            /tmp/relative-smoke/run_smoke/**/worker.log
+            /tmp/relative-smoke-console.log

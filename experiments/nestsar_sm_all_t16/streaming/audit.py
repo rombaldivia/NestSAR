@@ -14,8 +14,9 @@ from .launch import validate_config
 from .worker import make_model, EXPECTED_PARAMS
 
 
-def audit_model(model, params):
-    x = jax.random.normal(jax.random.PRNGKey(31), (1, 16, 750)) * 0.1
+def audit_model(model, params, x=None):
+    if x is None:
+        x = jax.random.normal(jax.random.PRNGKey(31), (1, 16, 750)) * 0.1
     original = jax.block_until_ready(jax.jit(lambda p, a: model.apply({"params": p}, a, training=False)["logits"])(params, x))
     old_gated, old_fast = base.GatedSweep, sm.FastWeightDeltaResidual
     try:
