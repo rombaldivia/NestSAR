@@ -1,0 +1,30 @@
+name: P2 nonlinear comparison
+on:
+  push:
+    paths:
+      - 'experiments/nestsar_sm_all_t16/nonlinear_compare/**'
+      - 'experiments/nestsar_sm_all_t16/kaggle_nonlinear_compare.py'
+      - '.github/workflows/nestsar_nonlinear_comparison.yml'
+  pull_request:
+    paths:
+      - 'experiments/nestsar_sm_all_t16/nonlinear_compare/**'
+      - 'experiments/nestsar_sm_all_t16/kaggle_nonlinear_compare.py'
+      - '.github/workflows/nestsar_nonlinear_comparison.yml'
+permissions:
+  contents: read
+jobs:
+  cpu-diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      JAX_PLATFORMS: cpu
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install 'jax[cpu]==0.7.2' 'flax==0.11.2' 'optax==0.2.5' 'numpy==2.2.6' 'pytest==8.4.2' psutil tqdm
+      - run: python -m pytest -q experiments/nestsar_sm_all_t16/nonlinear_compare/tests
+      - run: python -m experiments.nestsar_sm_all_t16.nonlinear_compare.smoke_cpu --outdir /tmp/p2_compare_smoke

@@ -1,0 +1,21 @@
+{
+  "date": "2026-09-08",
+  "base_commit": "47b6b7960fe8f0327b0b82175f708bbf1374ce06",
+  "environment": {"backend": "cpu", "python": "3.12", "jax": "0.7.2", "flax": "0.11.2", "optax": "0.2.5", "numpy": "2.2.6"},
+  "regression_tests_passed": 10,
+  "regressions": ["group separation and reproducibility", "held-out access guard", "padding/translation-safe sequence features", "no interpolation across missing joints", "fit-only normalization", "paired group bootstrap", "identical sequence16/64 parameter values", "finite masked model output", "padded-batch gradient invariance", "interrupted optimizer/RNG/best-checkpoint resume equivalence"],
+  "integration": {
+    "simultaneous_protocol_workers": true,
+    "arms": 3,
+    "inner_trials_per_arm": 2,
+    "epochs_per_trial": 2,
+    "final_predictions_saved": true,
+    "completed_resume_identical": true,
+    "poisoned_official_heldout_not_accessed": true,
+    "temporary_trial_weights_removed": true,
+    "missing_cache_rebuilt_with_original_p2_builder": true,
+    "existing_cache_reused_without_pickle_read": true
+  },
+  "dual_t4_executed": false,
+  "real_ntu_accuracy_measured": false
+}
