@@ -1,160 +1,134 @@
-# NestSAR
+<h1 align="center">NestSAR</h1>
 
-Nested multi-timescale memory networks for skeleton-based action recognition in JAX.
+<p align="center">
+  <strong>Ultra-light nested-memory networks for skeleton-based action recognition</strong><br>
+  JAX · NTU RGB+D 120 · edge-oriented · fixed 16-token neural processing
+</p>
 
-The repository uses **one readable Python file**, `nestsar.py`. The complete implementation is visible directly in that file: configuration, NTU RGB+D 120 loading and preprocessing, H0/H2/H3/NestSAR-4L networks, losses, optimizer, scheduler, training, evaluation, smoke tests, GPU assignment, checkpoints, exact resume, logging, and CLI arguments.
+<p align="center">
+  <img alt="XSUB" src="https://img.shields.io/badge/NTU120%20XSUB-76.32%25-success">
+  <img alt="XSET" src="https://img.shields.io/badge/NTU120%20XSET-78.06%25-success">
+  <img alt="Parameters" src="https://img.shields.io/badge/Params-1.83M-blue">
+  <img alt="Compute" src="https://img.shields.io/badge/Compute-29.07%20MFLOPs%2Fclip-blueviolet">
+  <img alt="Frames" src="https://img.shields.io/badge/Neural%20tokens-16-orange">
+</p>
 
-There are no compressed payloads, hidden generated modules, or secondary trainer scripts.
+NestSAR is a research line for **low-compute Skeleton Action Recognition (SAR)**. The current architecture explores nested multi-timescale memory, HOPE-inspired low-rank self-modification, motion-preserving representations and adaptive cross-stream fusion while avoiding the usual heavy spatial/temporal backbones.
 
-## Models inside `nestsar.py`
+**No softmax attention · No Transformer · No GCN/GNN · No CNN/TCN · No T×T operation.**
+
+> The raw NTU sequence can have a variable number of frames. The current edge-oriented pipeline summarizes the complete sequence into **16 motion-preserving temporal tokens**, so neural processing remains fixed at `T=16` rather than scaling directly with the raw frame count.
+
+## Current results
+
+### Best fully verified result
+
+**NestSAR-SM-ALL-T16 v1 — corrected preprocessing v2**  
+NTU RGB+D 120 · seed 128 · from-scratch training
+
+| Protocol | Best validation accuracy | Best epoch |
+| --- | ---: | ---: |
+| **XSUB** | **76.321216%** | 24 |
+| **XSET** | **78.062108%** | 26 |
+
+| Metric | Value |
+| --- | ---: |
+| Parameters | **1,826,556** |
+| Processing length | **16 tokens** |
+| FLOPs / clip | **29,065,216** |
+| MFLOPs / clip | **29.065216** |
+| GFLOPs / clip | **0.029065216** |
+| GMACs / clip (`1 MAC = 2 FLOPs`) | **0.014532608** |
+
+The compute figure above is the **scan-corrected static-unrolled JAX/XLA audit**. Raw `lax.scan` cost analysis undercounts recurrent execution and is not used as the paper-facing FLOP value.
+
+This result uses corrected mask-safe preprocessing, complete raw-frame transition accounting, fresh label-preserving augmentation, self-modifying M4/G4 memory, adaptive routing/fusion and a rank-2 dynamic head. **No CD-Former knowledge distillation and no distal specialist were used.**
+
+Verified experiment branch: [`fix/nestsar-sm-all-preprocessing-v2`](https://github.com/rombaldivia/NestSAR/tree/fix/nestsar-sm-all-preprocessing-v2)  
+Machine-readable record: [`verified_results.json`](https://github.com/rombaldivia/NestSAR/blob/fix/nestsar-sm-all-preprocessing-v2/experiments/nestsar_sm_all_t16/verified_results.json)
+
+### Historical accuracy leader — re-audit required
+
+A previous **M4G-H4 + SASM + L3Fix** line produced the highest historical accuracy currently recorded in the project ledger:
+
+| Protocol | Historical score | Status |
+| --- | ---: | --- |
+| XSUB | **~76.44%** | Re-audit required |
+| XSET | **~78.54%** | Re-audit required |
+
+These values are intentionally **not presented as fully verified paper results yet**. The exact checkpoint, configuration and scan-corrected compute must be recovered/re-audited before publication-facing use.
+
+## Recent model progression
+
+| Variant | Tokens | XSUB | XSET | Params | Scan-corrected compute |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| LocalGlobal V2 | 16 | 75.3118% | 75.9268% | 1,816,130 | 28.545916 MFLOPs |
+| HardNeg | 16 | 75.3098% | 76.0647% | 1,816,130 | — |
+| Hand-M4/G4 T32 | 32 | 75.4335% | 76.1773% | 1,854,650 | 29.612176 MFLOPs |
+| **SM-ALL-T16 corrected v2** | **16** | **76.3212%** | **78.0621%** | **1,826,556** | **29.065216 MFLOPs** |
+| M4G-H4 + SASM + L3Fix | historical | **~76.44%** | **~78.54%** | re-audit | re-audit |
+
+The older readable `nestsar.py` NestSAR-4L run on `main` reached **63.259294% XSUB / 61.216941% XSET**. It remains a legacy reproduction target, not the current research best.
+
+## What changed in the corrected pipeline
+
+Three preprocessing details materially affect the signal seen by the model:
+
+1. **Missing people/joints stay missing.** Validity is captured from raw coordinates before centering, preventing absent zero skeletons from becoming artificial non-zero bodies.
+2. **Movement between temporal segments is preserved.** Adjacent raw-frame differences are computed before segmentation, so boundary motion is not silently dropped.
+3. **Motion is represented with fixed neural cost.** The full raw sequence is summarized into 16 LocalGlobal motion-preserving tokens while the neural graph remains fixed-length.
+
+## Architecture direction
+
+The current SM-ALL family retains a compact LocalGlobal M4/G4 topology and adds low-rank self-modifying fast-memory residuals. A shared controller modulates streams and the model learns adaptive fusion without materializing attention matrices.
+
+For a temporal state, the HOPE-inspired delta-memory update is:
 
 ```text
-h0           Direct-motion baseline
-h2           Predictive-memory model
-h3           Low-rank nested-memory ablation
-nestsar_4l   Causal four-level NestSAR
+pred_t = k_t^T S_(t-1)
+err_t  = v_t - pred_t
+S_t    = alpha_t S_(t-1) + eta_t k_t err_t^T
+read_t = q_t^T S_t
+```
+
+`S_0` is learned by the outer NTU120 optimization and reset for every clip. This is a compressed, edge-oriented **HOPE-inspired** mechanism; it is not claimed to be a verbatim reproduction of the full language-model HOPE stack.
+
+## Repository structure
+
+The stable readable trainer remains available as [`nestsar.py`](./nestsar.py). Research variants are developed in versioned experiment directories/branches so architecture, preprocessing and compute changes can be audited independently.
+
+```text
+nestsar.py                                  readable baseline trainer
+experiments/                               versioned research experiments
+experiments/nestsar_sm_all_t16/            current SM-ALL T16 line
+NESTSAR_EXPERIMENT_STATUS_2026-08-31.md    historical experiment ledger
 ```
 
 ## Kaggle
 
-Enable a GPU accelerator and Internet, attach the NTU120 pickle to the notebook, and run:
-
-```python
-!rm -rf /kaggle/working/NestSAR
-!git clone --depth 1 https://github.com/rombaldivia/NestSAR.git /kaggle/working/NestSAR
-%cd /kaggle/working/NestSAR
-
-!python nestsar.py --list-gpus
-```
-
-### Full NestSAR-4L experiment
-
-```python
-!python -u nestsar.py \
-    --model nestsar_4l \
-    --protocol both \
-    --dataset auto \
-    --seed 128 \
-    --frames 16 \
-    --num-classes 120 \
-    --model-dim 128 \
-    --memory-dim 64 \
-    --dropout 0.15 \
-    --batch-size 128 \
-    --eval-batch-size 256 \
-    --epochs 150 \
-    --patience 40 \
-    --learning-rate 0.0002 \
-    --weight-decay 0.03 \
-    --warmup-fraction 0.10 \
-    --label-smoothing 0.05 \
-    --grad-clip 1.0 \
-    --frame-blocks 2 \
-    --chunk-blocks 2 \
-    --clip-blocks 2 \
-    --controller-blocks 2 \
-    --chunk-size 4 \
-    --clip-size 8 \
-    --controller-rank 32 \
-    --max-train-samples 0 \
-    --max-val-samples 0 \
-    --gpu-map auto \
-    --resume auto
-```
-
-This follows the same practical idea as the previous CD-Former workflow, but `%%writefile` is unnecessary because the complete readable `.py` is already versioned in GitHub.
-
-## GPU behavior
+For the readable `main` trainer:
 
 ```bash
-python nestsar.py --list-gpus
-```
-
-With `--gpu-map auto`:
-
-- No GPU: training stops unless `--allow-cpu` is used for a small test.
-- One GPU: XSUB and XSET run sequentially on the same GPU.
-- Two or more visible GPUs: XSUB uses the first GPU and XSET uses the second GPU in parallel.
-- `--max-gpus N` limits the visible devices considered.
-- `--gpu-map xsub:0,xset:1` defines an explicit assignment.
-
-The current implementation parallelizes the two official protocols. It does not divide a single XSUB or XSET worker across several GPUs.
-
-## Other experiments
-
-```bash
-python -u nestsar.py --model h0 --protocol both --dataset auto --seed 28 --gpu-map auto
-python -u nestsar.py --model h2 --protocol both --dataset auto --seed 28 --gpu-map auto
-python -u nestsar.py --model h3 --protocol both --dataset auto --seed 28 --gpu-map auto
-```
-
-Use `--protocol xsub` or `--protocol xset` to train only one official protocol.
-
-## Smoke test
-
-```bash
-python -u nestsar.py \
-    --model nestsar_4l \
-    --protocol xsub \
-    --dataset auto \
-    --seed 128 \
-    --batch-size 128 \
-    --eval-batch-size 256 \
-    --smoke-only
-```
-
-The smoke test checks tensor shapes, finite values, temporal causality, state reset, forward pass, backward pass, and a physical-batch optimization step.
-
-## Exact resume
-
-```bash
-python -u nestsar.py [same training arguments] --resume auto
-```
-
-The last checkpoint stores model parameters, AdamW state, optimizer step, epoch, RNG state, best result, and early-stopping state. Resume continues from the next completed epoch when the configuration hash matches.
-
-## Outputs
-
-Each experiment is stored under:
-
-```text
-runs/<model>/seed_<seed>/<config_hash>/
-```
-
-The directory contains resolved configuration, environment metadata, history, logs, final/best results, and last/best checkpoints. Datasets and generated checkpoints are excluded from Git.
-
-## Local virtual environment
-
-Install a CUDA-compatible JAX build for the local CUDA version, then install the remaining dependencies:
-
-```bash
-git clone https://github.com/rombaldivia/NestSAR.git
+git clone --depth 1 https://github.com/rombaldivia/NestSAR.git
 cd NestSAR
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
 python nestsar.py --list-gpus
 ```
 
-Run with an explicit dataset path:
+For the corrected SM-ALL-T16 research pipeline used by the verified result:
 
 ```bash
-python -u nestsar.py \
-    --model nestsar_4l \
-    --protocol both \
-    --dataset /absolute/path/ntu120_3danno.pkl \
-    --seed 128 \
-    --gpu-map auto \
-    --resume auto
+git clone --depth 1 \
+  --branch fix/nestsar-sm-all-preprocessing-v2 \
+  https://github.com/rombaldivia/NestSAR.git
+cd NestSAR
 ```
 
-## Legacy reproduction target
+The experiment contains the dual-T4 launcher, shared-cache pipeline, checkpoint/resume support, preprocessing regression tests and scan-corrected compute audit. XSUB and XSET can run simultaneously on two T4 GPUs.
 
-The previous validated NestSAR-4L run reached:
+## Reproducibility policy
 
-- XSUB: 63.259294%
-- XSET: 61.216941%
-- Seed: 128
-- Physical batch size: 128
+Paper-facing NestSAR results should include the exact Git commit, protocol, seed, processing length, preprocessing version, checkpoint, parameter count, validation accuracy, confusion/per-class metrics and **scan-corrected** inference compute. Historical or partially recovered results stay explicitly labeled until they satisfy that audit trail.
 
-These values remain the reproduction target. The standardized readable trainer still needs a complete Kaggle GPU run before those final accuracies can be claimed as reproduced.
+---
+
+**Research focus:** efficient Skeleton Action Recognition, nested/self-modifying memory, motion representation and edge AI.
