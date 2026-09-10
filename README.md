@@ -12,14 +12,6 @@
   <img alt="JAX" src="https://img.shields.io/badge/Framework-JAX-blue">
 </p>
 
-## Architecture
-
-<p align="center">
-  <img src="assets/nestsar_architecture.svg" width="100%" alt="NestSAR architecture">
-</p>
-
-<p align="center"><em>NestSAR: fixed-length multi-stream skeleton tokenization, nested self-adapting H4 memory, cross-stream associative memory, and lightweight global classification.</em></p>
-
 NestSAR is a research line for **low-compute Skeleton Action Recognition (SAR)**. It explores nested multi-timescale memory, HOPE-inspired low-rank self-modification, motion-preserving skeleton representations and adaptive cross-stream fusion for accurate recognition under a very small compute budget.
 
 **No softmax attention · No Transformer · No GCN/GNN · No CNN/TCN · No T×T operation.**
@@ -73,6 +65,14 @@ Machine-readable audited record: [`verified_results.json`](https://github.com/ro
 | **Current NestSAR best** | **16** | **76.971268%** | **78.423592%** | — | — |
 
 The current-best row reports the latest accuracy result. Its exact checkpoint-linked parameter/FLOP audit should be attached before those fields are used in publication comparisons.
+
+## Architecture
+
+<p align="center">
+  <img src="assets/nestsar_architecture.svg" width="100%" alt="NestSAR architecture">
+</p>
+
+<p align="center"><em>NestSAR: fixed-length multi-stream skeleton tokenization, nested self-adapting H4 memory, cross-stream associative memory, and lightweight global classification.</em></p>
 
 ## Why NestSAR
 
