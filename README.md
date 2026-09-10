@@ -6,32 +6,39 @@
 </p>
 
 <p align="center">
-  <img alt="XSUB" src="https://img.shields.io/badge/NTU120%20XSUB-76.32%25-success">
-  <img alt="XSET" src="https://img.shields.io/badge/NTU120%20XSET-78.06%25-success">
-  <img alt="Parameters" src="https://img.shields.io/badge/Params-1.83M-blue">
-  <img alt="Compute" src="https://img.shields.io/badge/Compute-29.07%20MFLOPs%2Fclip-blueviolet">
-  <img alt="Frames" src="https://img.shields.io/badge/Neural%20tokens-16-orange">
+  <img alt="XSUB" src="https://img.shields.io/badge/NTU120%20XSUB-76.97%25-success">
+  <img alt="XSET" src="https://img.shields.io/badge/NTU120%20XSET-78.42%25-success">
+  <img alt="Neural tokens" src="https://img.shields.io/badge/Neural%20tokens-16-orange">
+  <img alt="JAX" src="https://img.shields.io/badge/Framework-JAX-blue">
 </p>
 
-NestSAR is a research line for **low-compute Skeleton Action Recognition (SAR)**. The current architecture explores nested multi-timescale memory, HOPE-inspired low-rank self-modification, motion-preserving representations and adaptive cross-stream fusion while avoiding the usual heavy spatial/temporal backbones.
+NestSAR is a research line for **low-compute Skeleton Action Recognition (SAR)**. It explores nested multi-timescale memory, HOPE-inspired low-rank self-modification, motion-preserving skeleton representations and adaptive cross-stream fusion for accurate recognition under a very small compute budget.
 
 **No softmax attention · No Transformer · No GCN/GNN · No CNN/TCN · No T×T operation.**
 
-> The raw NTU sequence can have a variable number of frames. The current edge-oriented pipeline summarizes the complete sequence into **16 motion-preserving temporal tokens**, so neural processing remains fixed at `T=16` rather than scaling directly with the raw frame count.
+> Raw NTU clips may contain a variable number of frames. The current edge-oriented pipeline summarizes the complete sequence into **16 motion-preserving temporal tokens**, keeping neural processing fixed at `T=16` rather than directly proportional to raw clip length.
 
-## Current results
+## Current best accuracy
 
-### Best fully verified result
+### NTU RGB+D 120
 
-**NestSAR-SM-ALL-T16 v1 — corrected preprocessing v2**  
-NTU RGB+D 120 · seed 128 · from-scratch training
+| Protocol | Best validation accuracy |
+| --- | ---: |
+| **XSUB** | **76.971268%** |
+| **XSET** | **78.423592%** |
 
-| Protocol | Best validation accuracy | Best epoch |
+These are the **current best NestSAR scores** recorded in the project.
+
+## Audited SM-ALL-T16 reference
+
+The previous fully documented **NestSAR-SM-ALL-T16 v1 — corrected preprocessing v2** run remains the current compute-audited reference:
+
+| Protocol | Accuracy | Best epoch |
 | --- | ---: | ---: |
-| **XSUB** | **76.321216%** | 24 |
-| **XSET** | **78.062108%** | 26 |
+| XSUB | 76.321216% | 24 |
+| XSET | 78.062108% | 26 |
 
-| Metric | Value |
+| Metric | Audited value |
 | --- | ---: |
 | Parameters | **1,826,556** |
 | Processing length | **16 tokens** |
@@ -40,49 +47,51 @@ NTU RGB+D 120 · seed 128 · from-scratch training
 | GFLOPs / clip | **0.029065216** |
 | GMACs / clip (`1 MAC = 2 FLOPs`) | **0.014532608** |
 
-The compute figure above is the **scan-corrected static-unrolled JAX/XLA audit**. Raw `lax.scan` cost analysis undercounts recurrent execution and is not used as the paper-facing FLOP value.
+The compute value above comes from the **scan-corrected static-unrolled JAX/XLA audit**. Ordinary cost analysis of recurrent `lax.scan` graphs can undercount repeated recurrent execution, so the raw scan value is not used for paper-facing reporting.
 
-This result uses corrected mask-safe preprocessing, complete raw-frame transition accounting, fresh label-preserving augmentation, self-modifying M4/G4 memory, adaptive routing/fusion and a rank-2 dynamic head. **No CD-Former knowledge distillation and no distal specialist were used.**
+The audited run used corrected mask-safe preprocessing, complete raw-frame transition accounting, fresh label-preserving augmentation, self-modifying M4/G4 memory, adaptive routing/fusion and a rank-2 dynamic head. It did **not** use CD-Former knowledge distillation or the distal specialist.
 
-Verified experiment branch: [`fix/nestsar-sm-all-preprocessing-v2`](https://github.com/rombaldivia/NestSAR/tree/fix/nestsar-sm-all-preprocessing-v2)  
-Machine-readable record: [`verified_results.json`](https://github.com/rombaldivia/NestSAR/blob/fix/nestsar-sm-all-preprocessing-v2/experiments/nestsar_sm_all_t16/verified_results.json)
+Verified reference branch: [`fix/nestsar-sm-all-preprocessing-v2`](https://github.com/rombaldivia/NestSAR/tree/fix/nestsar-sm-all-preprocessing-v2)  
+Machine-readable audited record: [`verified_results.json`](https://github.com/rombaldivia/NestSAR/blob/fix/nestsar-sm-all-preprocessing-v2/experiments/nestsar_sm_all_t16/verified_results.json)
 
-### Historical accuracy leader — re-audit required
+## Model progression
 
-A previous **M4G-H4 + SASM + L3Fix** line produced the highest historical accuracy currently recorded in the project ledger:
-
-| Protocol | Historical score | Status |
-| --- | ---: | --- |
-| XSUB | **~76.44%** | Re-audit required |
-| XSET | **~78.54%** | Re-audit required |
-
-These values are intentionally **not presented as fully verified paper results yet**. The exact checkpoint, configuration and scan-corrected compute must be recovered/re-audited before publication-facing use.
-
-## Recent model progression
-
-| Variant | Tokens | XSUB | XSET | Params | Scan-corrected compute |
+| Variant | Tokens | XSUB | XSET | Params | Compute |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | LocalGlobal V2 | 16 | 75.3118% | 75.9268% | 1,816,130 | 28.545916 MFLOPs |
 | HardNeg | 16 | 75.3098% | 76.0647% | 1,816,130 | — |
 | Hand-M4/G4 T32 | 32 | 75.4335% | 76.1773% | 1,854,650 | 29.612176 MFLOPs |
-| **SM-ALL-T16 corrected v2** | **16** | **76.3212%** | **78.0621%** | **1,826,556** | **29.065216 MFLOPs** |
-| M4G-H4 + SASM + L3Fix | historical | **~76.44%** | **~78.54%** | re-audit | re-audit |
+| SM-ALL-T16 corrected v2 | 16 | 76.3212% | 78.0621% | 1,826,556 | 29.065216 MFLOPs |
+| **Current NestSAR best** | **16** | **76.971268%** | **78.423592%** | — | — |
 
-The older readable `nestsar.py` NestSAR-4L run on `main` reached **63.259294% XSUB / 61.216941% XSET**. It remains a legacy reproduction target, not the current research best.
+The current-best row reports the latest accuracy result. Its exact checkpoint-linked parameter/FLOP audit should be attached before those fields are used in publication comparisons.
 
-## What changed in the corrected pipeline
+## Why NestSAR
 
-Three preprocessing details materially affect the signal seen by the model:
+NestSAR is designed around a different trade-off from conventional skeleton-recognition systems: preserve useful motion and relational information while keeping inference compact enough for edge deployment.
 
-1. **Missing people/joints stay missing.** Validity is captured from raw coordinates before centering, preventing absent zero skeletons from becoming artificial non-zero bodies.
-2. **Movement between temporal segments is preserved.** Adjacent raw-frame differences are computed before segmentation, so boundary motion is not silently dropped.
-3. **Motion is represented with fixed neural cost.** The full raw sequence is summarized into 16 LocalGlobal motion-preserving tokens while the neural graph remains fixed-length.
+Key design goals include:
 
-## Architecture direction
+- **Fixed short neural sequence:** full raw clips are compressed to 16 informative temporal tokens.
+- **Nested memory:** local and global temporal states operate at multiple timescales.
+- **Self-modification:** low-rank fast-memory updates adapt internal state during a clip.
+- **Motion preservation:** displacement, phase and path information are retained instead of relying only on sampled poses.
+- **Adaptive fusion:** complementary skeleton streams are combined without quadratic attention.
+- **Edge-oriented compute:** inference is kept in the tens-of-MFLOPs regime.
 
-The current SM-ALL family retains a compact LocalGlobal M4/G4 topology and adds low-rank self-modifying fast-memory residuals. A shared controller modulates streams and the model learns adaptive fusion without materializing attention matrices.
+## Corrected preprocessing
 
-For a temporal state, the HOPE-inspired delta-memory update is:
+Three data-path corrections materially improved the reliability of the representation:
+
+1. **Missing people/joints remain zero.** Validity is captured from raw coordinates before centering so absent skeletons do not become artificial non-zero bodies.
+2. **All adjacent-frame motion is preserved.** Differences are computed before temporal segmentation so movement across segment boundaries is not dropped.
+3. **The complete clip contributes to fixed-cost tokens.** Raw sequences are summarized into a fixed 16-token neural representation while retaining motion statistics from the full sequence.
+
+Recent experiments also investigate **true parent-relative motion paths**, separating real local articulation from whole-body displacement proxies.
+
+## Self-modifying memory
+
+The SM-ALL family keeps a compact LocalGlobal M4/G4 topology and adds low-rank self-modifying fast-memory residuals. A shared controller modulates stream features and adaptive fusion without materializing attention matrices.
 
 ```text
 pred_t = k_t^T S_(t-1)
@@ -91,16 +100,16 @@ S_t    = alpha_t S_(t-1) + eta_t k_t err_t^T
 read_t = q_t^T S_t
 ```
 
-`S_0` is learned by the outer NTU120 optimization and reset for every clip. This is a compressed, edge-oriented **HOPE-inspired** mechanism; it is not claimed to be a verbatim reproduction of the full language-model HOPE stack.
+`S_0` is learned by the outer NTU120 optimization and reset for every clip. This is a compressed, edge-oriented **HOPE-inspired** mechanism and is not claimed to reproduce the full language-model HOPE stack verbatim.
 
 ## Repository structure
 
-The stable readable trainer remains available as [`nestsar.py`](./nestsar.py). Research variants are developed in versioned experiment directories/branches so architecture, preprocessing and compute changes can be audited independently.
+The readable baseline trainer remains available as [`nestsar.py`](./nestsar.py). New ideas are developed in versioned experiment directories and branches so architecture, preprocessing and compute changes can be audited independently.
 
 ```text
 nestsar.py                                  readable baseline trainer
 experiments/                               versioned research experiments
-experiments/nestsar_sm_all_t16/            current SM-ALL T16 line
+experiments/nestsar_sm_all_t16/            SM-ALL T16 research line
 NESTSAR_EXPERIMENT_STATUS_2026-08-31.md    historical experiment ledger
 ```
 
@@ -114,7 +123,7 @@ cd NestSAR
 python nestsar.py --list-gpus
 ```
 
-For the corrected SM-ALL-T16 research pipeline used by the verified result:
+For the corrected SM-ALL-T16 reference pipeline:
 
 ```bash
 git clone --depth 1 \
@@ -123,12 +132,12 @@ git clone --depth 1 \
 cd NestSAR
 ```
 
-The experiment contains the dual-T4 launcher, shared-cache pipeline, checkpoint/resume support, preprocessing regression tests and scan-corrected compute audit. XSUB and XSET can run simultaneously on two T4 GPUs.
+The research pipeline includes dual-T4 execution, shared-cache preprocessing, checkpoint/resume support, regression tests and scan-corrected compute auditing. XSUB and XSET can run simultaneously on two T4 GPUs.
 
 ## Reproducibility policy
 
-Paper-facing NestSAR results should include the exact Git commit, protocol, seed, processing length, preprocessing version, checkpoint, parameter count, validation accuracy, confusion/per-class metrics and **scan-corrected** inference compute. Historical or partially recovered results stay explicitly labeled until they satisfy that audit trail.
+Publication-facing NestSAR results should be tied to an exact Git commit, protocol, seed, processing length, preprocessing version, checkpoint, parameter count, validation accuracy, per-class/confusion metrics and **scan-corrected** inference compute.
 
 ---
 
-**Research focus:** efficient Skeleton Action Recognition, nested/self-modifying memory, motion representation and edge AI.
+**Research focus:** efficient Skeleton Action Recognition · nested/self-modifying memory · motion representation · edge AI
