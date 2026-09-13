@@ -7,7 +7,9 @@ held-out split:
     XSUB train=63,026  val=50,919
     XSET train=54,468  val=59,477
 
-The two protocols are then launched in parallel through streaming.launch (GPU0/GPU1).
+The two protocols are launched in parallel through streaming.launch (GPU0/GPU1). In Kaggle
+or Jupyter, progress is rendered with two persistent ipywidget rows so polling updates do not
+produce a new physical output line on every refresh.
 """
 from __future__ import annotations
 
@@ -16,7 +18,11 @@ import json
 from pathlib import Path
 
 from experiments.nestsar_sm_all_t16.streaming.data import prepare
-from experiments.nestsar_sm_all_t16.streaming.launch import find_dataset, run
+from experiments.nestsar_sm_all_t16.streaming import launch as streaming_launch
+from experiments.nestsar_sm_all_t16.streaming.notebook_progress import (
+    make_bars as persistent_make_bars,
+    update_bar as persistent_update_bar,
+)
 
 EXPECTED = {
     "xsub_train": 63026,
@@ -80,7 +86,7 @@ def main() -> None:
     parser.add_argument("--patience", type=int, default=5)
     args = parser.parse_args()
 
-    dataset = find_dataset(args.dataset)
+    dataset = streaming_launch.find_dataset(args.dataset)
     out = Path(args.outdir)
     cache = Path(args.cache)
     out.mkdir(parents=True, exist_ok=True)
@@ -105,6 +111,7 @@ def main() -> None:
         print(f"{name:10s}: {count:,}")
     print("Subset caps: OFF (max_train_samples=0, max_val_samples=0)")
     print("Assignment: XSUB -> GPU0 | XSET -> GPU1")
+    print("Progress UI: two persistent notebook rows (no repeated tqdm lines)")
     print("=" * 110)
 
     config = {
@@ -114,7 +121,14 @@ def main() -> None:
         "max_val_samples": 0,
     }
 
-    results = run(
+    # Replace only the launcher's presentation layer. Training, status files, checkpointing,
+    # data loading, loss, optimizer, EMA and model code are untouched. Because launch.run()
+    # resolves make_bars/update_bar from its module globals, this patch also covers setup,
+    # cache/audit stages and both concurrent workers.
+    streaming_launch.make_bars = persistent_make_bars
+    streaming_launch.update_bar = persistent_update_bar
+
+    results = streaming_launch.run(
         dataset=str(dataset),
         outdir=str(out),
         cache_dir=str(cache),
