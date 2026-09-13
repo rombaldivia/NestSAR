@@ -8,8 +8,8 @@ held-out split:
     XSET train=54,468  val=59,477
 
 The two protocols are launched in parallel through streaming.launch (GPU0/GPU1). Call
-``run_full_official`` directly from a Kaggle/Jupyter cell to get two persistent ipywidget
-progress rows; the worker processes still remain isolated one-per-GPU.
+``run_full_official`` directly from a Kaggle/Jupyter cell to get two persistent HTML progress
+rows updated through notebook display IDs; no ipywidgets model is required.
 """
 from __future__ import annotations
 
@@ -105,7 +105,7 @@ def run_full_official(
         print(f"{name:10s}: {count:,}")
     print("Subset caps: OFF (max_train_samples=0, max_val_samples=0)")
     print("Assignment: XSUB -> GPU0 | XSET -> GPU1")
-    print("Progress UI: two persistent notebook rows (no repeated tqdm lines)")
+    print("Progress UI: two persistent HTML rows (no ipywidgets / no repeated tqdm lines)")
     print("=" * 110)
 
     config = {
