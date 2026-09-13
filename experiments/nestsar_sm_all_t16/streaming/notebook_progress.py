@@ -1,51 +1,78 @@
 """Persistent dual-protocol progress display for Kaggle/Jupyter.
 
-Kaggle's captured stdout/stderr can render every tqdm refresh as a new physical line.
-This module avoids terminal control sequences in notebooks: two ipywidgets rows are displayed
-once and only their widget values are updated afterwards. Terminal execution still uses tqdm.
+Kaggle can render every tqdm refresh as a new physical line, and some Kaggle frontends do
+not load the ipywidgets model manager ("Error displaying widget: model not found").
+
+Notebook mode therefore uses plain IPython HTML display IDs: two rows are displayed once and
+updated in place with ``update_display``. This has no widget-model dependency. Plain terminal
+execution still uses tqdm.
 """
 from __future__ import annotations
 
 from html import escape
+import uuid
 
 
-class _NotebookBar:
-    def __init__(self, protocol: str, gpu: int, widgets):
+class _NotebookDisplayBar:
+    def __init__(self, protocol: str, gpu: int, HTML, display, update_display):
         self.protocol = protocol
         self.gpu = gpu
-        self._widgets = widgets
+        self._HTML = HTML
+        self._display = display
+        self._update_display = update_display
+        self._display_id = f"nestsar-{protocol.lower()}-{gpu}-{uuid.uuid4().hex}"
         self._last_signature = None
         self._closed = False
+        self._last_status = dict(phase="Starting", current=0, total=1, epoch=0)
+        self._display(self._HTML(self._render(self._last_status)), display_id=self._display_id)
 
-        self.title = widgets.HTML(
-            value=f"<b>{escape(protocol.upper())} G{gpu}</b>",
-            layout=widgets.Layout(width="240px"),
+    @staticmethod
+    def _progress_bar(current: int, total: int, done: bool, failed: bool) -> str:
+        pct = 100.0 * current / max(total, 1)
+        color = "#19a974" if done else ("#d64545" if failed else "#4c78ff")
+        return (
+            "<div style='height:11px;background:#e6e6e6;border-radius:7px;overflow:hidden;"
+            "min-width:280px;flex:1 1 38%;'>"
+            f"<div style='height:100%;width:{pct:.3f}%;background:{color};transition:width .12s linear'></div>"
+            "</div>"
         )
-        self.progress = widgets.IntProgress(
-            value=0,
-            min=0,
-            max=1,
-            description="",
-            bar_style="",
-            orientation="horizontal",
-            layout=widgets.Layout(width="42%", min_width="320px"),
-        )
-        self.counter = widgets.HTML(
-            value="0/1",
-            layout=widgets.Layout(width="90px"),
-        )
-        self.stats = widgets.HTML(
-            value="BEST=--",
-            layout=widgets.Layout(width="auto", flex="1 1 auto"),
-        )
-        self.row = widgets.HBox(
-            [self.title, self.progress, self.counter, self.stats],
-            layout=widgets.Layout(
-                width="100%",
-                align_items="center",
-                gap="8px",
-                overflow="hidden",
-            ),
+
+    def _render(self, status: dict) -> str:
+        phase = str(status.get("phase", "Starting"))
+        epoch = int(status.get("epoch", 0) or 0)
+        total = max(int(status.get("total", 1) or 1), 1)
+        current = min(max(int(status.get("current", 0) or 0), 0), total)
+        done = bool(status.get("done"))
+        failed = "failed" in phase.lower()
+
+        best = status.get("best")
+        best_epoch = int(status.get("best_epoch", 0) or 0)
+        best_text = f"{100 * float(best):.4f}%@E{best_epoch:02d}" if best is not None and best_epoch else "--"
+
+        stats = [f"BEST={best_text}"]
+        if status.get("val_acc") is not None:
+            stats.append(f"val={100 * float(status['val_acc']):.2f}%")
+        if status.get("train_acc") is not None:
+            stats.append(f"tr={100 * float(status['train_acc']):.2f}%")
+        if "loss" in status:
+            stats.append(f"loss={float(status['loss']):.3f}")
+        if "rss_gib" in status:
+            stats.append(f"RAM={float(status['rss_gib']):.1f}G")
+        if "wait_s" in status:
+            stats.append(f"wait={float(status['wait_s']):.0f}s")
+        if "gpu_s" in status:
+            stats.append(f"GPU={float(status['gpu_s']):.0f}s")
+
+        return (
+            "<div style='display:flex;align-items:center;gap:10px;width:100%;"
+            "font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;"
+            "padding:3px 0;'>"
+            f"<div style='width:235px;white-space:nowrap'><b>{escape(self.protocol.upper())} G{self.gpu} E{epoch:02d}</b> "
+            f"<span style='opacity:.68'>{escape(phase)}</span></div>"
+            f"{self._progress_bar(current, total, done, failed)}"
+            f"<div style='width:82px;text-align:right'>{current}/{total}</div>"
+            f"<div style='flex:1 1 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'>{escape('  '.join(stats))}</div>"
+            "</div>"
         )
 
     def update_status(self, protocol: str, gpu: int, status: dict):
@@ -53,51 +80,23 @@ class _NotebookBar:
         epoch = int(status.get("epoch", 0) or 0)
         total = max(int(status.get("total", 1) or 1), 1)
         current = min(max(int(status.get("current", 0) or 0), 0), total)
-
         best = status.get("best")
         best_epoch = int(status.get("best_epoch", 0) or 0)
-        best_text = f"{100 * float(best):.4f}%@E{best_epoch:02d}" if best is not None and best_epoch else "--"
-
-        parts = [f"BEST={best_text}"]
-        if status.get("val_acc") is not None:
-            parts.append(f"val={100 * float(status['val_acc']):.2f}%")
-        if status.get("train_acc") is not None:
-            parts.append(f"tr={100 * float(status['train_acc']):.2f}%")
-        if "loss" in status:
-            parts.append(f"loss={float(status['loss']):.3f}")
-        if "rss_gib" in status:
-            parts.append(f"RAM={float(status['rss_gib']):.1f}G")
-        if "wait_s" in status:
-            parts.append(f"wait={float(status['wait_s']):.0f}s")
-        if "gpu_s" in status:
-            parts.append(f"GPU={float(status['gpu_s']):.0f}s")
-
-        # Do not touch widgets when the visible state did not change. This also reduces
-        # notebook comm traffic while the launcher polls status files several times/second.
-        signature = (protocol, gpu, phase, epoch, current, total, tuple(parts), bool(status.get("done")))
+        signature = (
+            protocol, gpu, phase, epoch, current, total,
+            None if best is None else float(best), best_epoch,
+            status.get("val_acc"), status.get("train_acc"), status.get("loss"),
+            status.get("rss_gib"), status.get("wait_s"), status.get("gpu_s"),
+            bool(status.get("done")),
+        )
         if signature == self._last_signature:
             return
         self._last_signature = signature
-
-        self.progress.max = total
-        self.progress.value = current
-        if status.get("done"):
-            self.progress.bar_style = "success"
-        elif "failed" in phase.lower():
-            self.progress.bar_style = "danger"
-        else:
-            self.progress.bar_style = ""
-
-        self.title.value = (
-            f"<b>{escape(protocol.upper())} G{gpu} E{epoch:02d}</b> "
-            f"<span style='opacity:.72'>{escape(phase)}</span>"
-        )
-        self.counter.value = f"<code>{current}/{total}</code>"
-        self.stats.value = "<code>" + escape("  ".join(parts)) + "</code>"
+        self._last_status = dict(status)
+        self._update_display(self._HTML(self._render(status)), display_id=self._display_id)
 
     def close(self):
-        # Keep the final state visible. Closing an ipywidget removes/invalidates the display,
-        # which is the opposite of tqdm(leave=True).
+        # Keep final row visible, matching tqdm(leave=True).
         self._closed = True
 
 
@@ -113,23 +112,17 @@ def _is_notebook() -> bool:
 def make_bars():
     if _is_notebook():
         try:
-            import ipywidgets as widgets
-            from IPython.display import display
+            from IPython.display import HTML, display, update_display
         except ImportError:
             pass
         else:
-            bars = [
-                _NotebookBar("XSUB", 0, widgets),
-                _NotebookBar("XSET", 1, widgets),
+            # No ipywidgets: only basic notebook display IDs, which Kaggle supports even when
+            # the Jupyter widget model manager is unavailable.
+            return [
+                _NotebookDisplayBar("XSUB", 0, HTML, display, update_display),
+                _NotebookDisplayBar("XSET", 1, HTML, display, update_display),
             ]
-            panel = widgets.VBox(
-                [bar.row for bar in bars],
-                layout=widgets.Layout(width="100%", gap="4px"),
-            )
-            display(panel)
-            return bars
 
-    # Plain terminals keep normal carriage-return tqdm behavior.
     from tqdm import tqdm
     return [
         tqdm(
@@ -149,8 +142,7 @@ def update_bar(bar, protocol: str, gpu: int, status: dict):
         bar.update_status(protocol, gpu, status)
         return
 
-    # Terminal fallback. Avoid reset(), which can print an extra completed line when total or
-    # phase changes. Mutate total/n in place and refresh the same physical terminal line.
+    # Terminal fallback. Mutate n/total in place; avoid reset(), which can emit extra lines.
     phase = status.get("phase", "Starting")
     total = max(int(status.get("total", 1) or 1), 1)
     epoch = int(status.get("epoch", 0) or 0)
