@@ -7,9 +7,9 @@ held-out split:
     XSUB train=63,026  val=50,919
     XSET train=54,468  val=59,477
 
-The two protocols are launched in parallel through streaming.launch (GPU0/GPU1). In Kaggle
-or Jupyter, progress is rendered with two persistent ipywidget rows so polling updates do not
-produce a new physical output line on every refresh.
+The two protocols are launched in parallel through streaming.launch (GPU0/GPU1). Call
+``run_full_official`` directly from a Kaggle/Jupyter cell to get two persistent ipywidget
+progress rows; the worker processes still remain isolated one-per-GPU.
 """
 from __future__ import annotations
 
@@ -71,24 +71,18 @@ def verify_full_official_cache(cache: Path) -> dict:
     }
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default=None)
-    parser.add_argument(
-        "--outdir",
-        default="/kaggle/working/NestSAR_SM_ALL_T16_PERSON_AWARE_P2_FULL_OFFICIAL",
-    )
-    parser.add_argument(
-        "--cache",
-        default="/kaggle/working/NestSAR_SM_ALL_PERSON_AWARE_P2_CACHE_FULL_OFFICIAL",
-    )
-    parser.add_argument("--epochs", type=int, default=60)
-    parser.add_argument("--patience", type=int, default=5)
-    args = parser.parse_args()
-
-    dataset = streaming_launch.find_dataset(args.dataset)
-    out = Path(args.outdir)
-    cache = Path(args.cache)
+def run_full_official(
+    dataset=None,
+    outdir="/kaggle/working/NestSAR_SM_ALL_T16_PERSON_AWARE_P2_FULL_OFFICIAL",
+    cache="/kaggle/working/NestSAR_SM_ALL_PERSON_AWARE_P2_CACHE_FULL_OFFICIAL",
+    epochs=60,
+    patience=5,
+    audit_first=True,
+):
+    """Run both complete official protocols; notebook callers get persistent two-row UI."""
+    dataset = streaming_launch.find_dataset(dataset)
+    out = Path(outdir)
+    cache = Path(cache)
     out.mkdir(parents=True, exist_ok=True)
     cache.mkdir(parents=True, exist_ok=True)
 
@@ -115,16 +109,15 @@ def main() -> None:
     print("=" * 110)
 
     config = {
-        "epochs": args.epochs,
-        "patience": args.patience,
+        "epochs": int(epochs),
+        "patience": int(patience),
         "max_train_samples": 0,
         "max_val_samples": 0,
     }
 
-    # Replace only the launcher's presentation layer. Training, status files, checkpointing,
-    # data loading, loss, optimizer, EMA and model code are untouched. Because launch.run()
-    # resolves make_bars/update_bar from its module globals, this patch also covers setup,
-    # cache/audit stages and both concurrent workers.
+    # Presentation-only patch. Training, status files, checkpointing, data loading, loss,
+    # optimizer, EMA and model code are untouched. Because streaming_launch.run resolves
+    # these names from module globals, setup/cache/audit and both workers use the same UI.
     streaming_launch.make_bars = persistent_make_bars
     streaming_launch.update_bar = persistent_update_bar
 
@@ -134,11 +127,38 @@ def main() -> None:
         cache_dir=str(cache),
         config=config,
         raw_layout="MTVC",
-        audit_first=True,
+        audit_first=bool(audit_first),
     )
 
     print("\nFULL OFFICIAL RUN COMPLETE")
     print(json.dumps(results, indent=2, default=str))
+    return results
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", default=None)
+    parser.add_argument(
+        "--outdir",
+        default="/kaggle/working/NestSAR_SM_ALL_T16_PERSON_AWARE_P2_FULL_OFFICIAL",
+    )
+    parser.add_argument(
+        "--cache",
+        default="/kaggle/working/NestSAR_SM_ALL_PERSON_AWARE_P2_CACHE_FULL_OFFICIAL",
+    )
+    parser.add_argument("--epochs", type=int, default=60)
+    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--no-audit", action="store_true")
+    args = parser.parse_args()
+
+    run_full_official(
+        dataset=args.dataset,
+        outdir=args.outdir,
+        cache=args.cache,
+        epochs=args.epochs,
+        patience=args.patience,
+        audit_first=not args.no_audit,
+    )
 
 
 if __name__ == "__main__":
