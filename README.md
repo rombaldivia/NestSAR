@@ -1,5 +1,11 @@
 # NestSAR
 
+**This branch: Sampler B on the full official NTU120 XSUB/XSET protocols.**
+The experiment preserves the current SM-ALL M4/G4 network, T16 input and last
+full-run settings. See [Sampler B setup and method](experiments/nestsar_sm_all_t16/SAMPLER_B.md)
+and [the Kaggle entry point](experiments/nestsar_sm_all_t16/kaggle_sampler_b.py).
+The remaining sections below describe the older single-file models.
+
 Nested multi-timescale memory networks for skeleton-based action recognition in JAX.
 
 The repository uses **one readable Python file**, `nestsar.py`. The complete implementation is visible directly in that file: configuration, NTU RGB+D 120 loading and preprocessing, H0/H2/H3/NestSAR-4L networks, losses, optimizer, scheduler, training, evaluation, smoke tests, GPU assignment, checkpoints, exact resume, logging, and CLI arguments.

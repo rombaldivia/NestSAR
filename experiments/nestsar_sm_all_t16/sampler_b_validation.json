@@ -1,0 +1,42 @@
+{
+  "base_commit": "0de94e304d15f2fe7ce591471f188f4a574aca60",
+  "sampler_version": "local-motion-sampler-b-v1",
+  "regression_tests_passed": 103,
+  "regression_duration_seconds": 34.86,
+  "test_command": "python -m pytest -q experiments/nestsar_sm_all_t16/test_sampler_b.py experiments/nestsar_sm_all_t16/test_preprocessing_corrected.py experiments/nestsar_sm_all_t16/streaming/tests",
+  "model_source_unchanged": true,
+  "model_sha256": "4ea7e307a3ad7fc2a4a19917f277f44be1b3aeaeb6bd00d8ec51629732b9eed7",
+  "sampler_changes_only_three_pose_channels": true,
+  "twelve_motion_channels_bitwise_identical_in_canonical_and_augmented_tests": true,
+  "protocol_training_only_calibration_and_full_sample_accounting_checked": true,
+  "training_padding_guard_gradient_equivalence_checked": true,
+  "best_checkpoint_calibration_round_trip_checked": true,
+  "smoke": {
+    "backend": "cpu",
+    "real_model_params": 1826556,
+    "protocols": [
+      "xsub",
+      "xset"
+    ],
+    "concurrent_workers": true,
+    "epochs_per_protocol": 2,
+    "train_samples_per_protocol": 3,
+    "val_samples_per_protocol": 2,
+    "resume_and_alias_repair_passed": true,
+    "sampler_b": true,
+    "real_ntu_accuracy_measured": false,
+    "dual_t4_executed": false
+  },
+  "runtime": {
+    "python": "3.12",
+    "jax": "0.7.2",
+    "flax": "0.11.2",
+    "optax": "0.2.5",
+    "numpy": "2.2.6",
+    "backend": "cpu"
+  },
+  "full_ntu120_training_executed": false,
+  "accuracy_gain_measured": false,
+  "dual_t4_execution_verified": false,
+  "notes": "Initial CPU smoke exposed undefined fast-weight norm gradients on zero-weight all-zero batch padding. The training-only reference-fill guard passed gradient equivalence and the real-model two-worker rerun/resume. The deployed model is unchanged."
+}

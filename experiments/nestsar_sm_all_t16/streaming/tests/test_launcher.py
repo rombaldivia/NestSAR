@@ -168,13 +168,15 @@ def test_worker_failure_is_reported_with_log(tmp_path):
         check_worker_finished(Process(), "xset", tmp_path, {})
 
 
-def test_parent_launches_both_isolated_protocols_and_keeps_two_bars(tmp_path, monkeypatch):
+@pytest.mark.parametrize("sampler_b", [False, True])
+def test_parent_launches_both_isolated_protocols_and_keeps_two_bars(tmp_path, monkeypatch, sampler_b):
     dataset = tmp_path / "ntu.pkl"
     dataset.write_bytes(b"fixture; preparation tested separately")
     out = tmp_path / "out"
 
     bars = [Bar(), Bar()]
     started = []
+    stages = []
 
     monkeypatch.setattr(launch, "make_bars", lambda: bars)
     monkeypatch.setattr(
@@ -190,7 +192,7 @@ def test_parent_launches_both_isolated_protocols_and_keeps_two_bars(tmp_path, mo
     )
     monkeypatch.setattr(launch, "optional_nvidia_smi", lambda: None)
     monkeypatch.setattr(launch, "ensure_runtime", lambda *a: sys.executable)
-    monkeypatch.setattr(launch, "quiet_run", lambda *a, **k: None)
+    monkeypatch.setattr(launch, "quiet_run", lambda cmd, *a, **k: stages.append(cmd))
 
     def run_command(cmd, **kwargs):
         return SimpleNamespace(returncode=0, stdout="test-sha\n", stderr="")
@@ -205,6 +207,8 @@ def test_parent_launches_both_isolated_protocols_and_keeps_two_bars(tmp_path, mo
             return 0
 
     def spawn(cmd, **kwargs):
+        if sampler_b:
+            assert any('experiments.nestsar_sm_all_t16.streaming.sampler_b_data' in stage for stage in stages)
         protocol = cmd[cmd.index("--protocol") + 1]
         started.append((protocol, kwargs["env"]["CUDA_VISIBLE_DEVICES"]))
         assert kwargs["env"]["JAX_PLATFORMS"] == "cuda"
@@ -226,7 +230,9 @@ def test_parent_launches_both_isolated_protocols_and_keeps_two_bars(tmp_path, mo
 
     monkeypatch.setattr(launch.subprocess, "Popen", spawn)
 
-    results = launch.run(dataset=dataset, outdir=out, cache_dir=tmp_path / "cache")
+    from experiments.nestsar_sm_all_t16.sampler_b import VERSION as SAMPLER_VERSION
+    config = {'pose_sampler': SAMPLER_VERSION} if sampler_b else {}
+    results = launch.run(dataset=dataset, outdir=out, cache_dir=tmp_path / "cache", config=config)
 
     assert started == [("xsub", "0"), ("xset", "1")]
     assert results["xsub"]["best_val_accuracy"] == .76

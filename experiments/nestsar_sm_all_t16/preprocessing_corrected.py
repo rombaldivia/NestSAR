@@ -137,7 +137,7 @@ def transition_owners(total, ends):
     return owners
 
 
-def features(x, valid=None, rng=None, shift=0):
+def features(x, valid=None, rng=None, shift=0, pose_selector=None):
     """Build corrected fixed [16,750] pose/motion tokens."""
     x = np.asarray(x, np.float32)
     local, valid, scale = canonicalize_raw(x, valid)
@@ -146,7 +146,7 @@ def features(x, valid=None, rng=None, shift=0):
         return np.zeros((FRAMES, FEATURES), np.float32)
 
     starts, ends = segment_bounds(total, rng=rng, shift=shift)
-    pose = representative_pose(local, valid, starts, ends)
+    pose = (representative_pose if pose_selector is None else pose_selector)(local, valid, starts, ends)
 
     # Compute ALL adjacent transitions before temporal segmentation. Both
     # endpoints must be valid, so a disappearing/reappearing joint never creates
@@ -174,7 +174,7 @@ def features(x, valid=None, rng=None, shift=0):
     return tokens.reshape(FRAMES, FEATURES).astype(np.float32)
 
 
-def augmented_features(x, seed, epoch, sample_index, rotation_degrees=8.0, shift=1):
+def augmented_features(x, seed, epoch, sample_index, rotation_degrees=8.0, shift=1, pose_selector=None):
     """Build only the augmented view; canonical tokens can be shared on disk."""
     valid = raw_valid(x)
     rng = np.random.default_rng(np.random.SeedSequence([seed, epoch, sample_index]))
@@ -182,7 +182,9 @@ def augmented_features(x, seed, epoch, sample_index, rotation_degrees=8.0, shift
     c, s = np.cos(theta), np.sin(theta)
     rotation = np.asarray([[c, 0, s], [0, 1, 0], [-s, 0, c]], np.float32)
     augmented = np.where(valid[..., None], x @ rotation.T, 0)
-    return features(augmented, valid, rng=rng, shift=shift)
+    if pose_selector is None:
+        return features(augmented, valid, rng=rng, shift=shift)
+    return features(augmented, valid, rng=rng, shift=shift, pose_selector=pose_selector)
 
 
 def training_views(x, seed, epoch, sample_index, rotation_degrees=8.0, shift=1):

@@ -42,6 +42,23 @@ def ce(logits, labels, smoothing):
     return -jnp.sum(target * jax.nn.log_softmax(logits), axis=-1)
 
 
+def safe_training_padding(batch):
+    """Avoid differentiating norm(0) in artificial, zero-weight batch slots.
+
+    All real samples, their masks and RNG positions are unchanged. LayerNorm and
+    the memories operate per sample; duplicating a real input into unused slots
+    has zero contribution to the loss/gradient. This does not fill missing people
+    or joints in real skeletons, and adds no deployed model operation.
+    """
+    first_real = jnp.argmax(batch["mask"] > 0)
+    result = dict(batch)
+    for name in ("x", "xa"):
+        value = batch[name]
+        mask = (batch["mask"] > 0).reshape((-1,) + (1,) * (value.ndim - 1))
+        result[name] = jnp.where(mask, value, value[first_real])
+    return result
+
+
 def build_steps(model, config):
     def per_sample(params, key, batch):
         k1, k2 = jax.random.split(key)
@@ -65,6 +82,7 @@ def build_steps(model, config):
     @jax.jit
     def train_step(state, key, batch):
         # Sum microbatch gradients, then update AdamW and EMA ONCE per batch.
+        batch = safe_training_padding(batch)
         k = config["accumulation_steps"]
         micros = jax.tree.map(lambda x: x.reshape(k, config["micro_batch"], *x.shape[1:]), batch)
         denom = jnp.maximum(jnp.sum(batch["mask"]), 1)
@@ -180,10 +198,13 @@ def publish_best(out, metadata):
         raise ValueError("Invalid best-checkpoint filename")
     payload = (out / name).read_bytes()
     atomic_bytes(out / "best.msgpack", payload)
-    atomic_json(out / "best.json", dict(model="NestSAR-SM-ALL-T16-v1",
+    summary = dict(model="NestSAR-SM-ALL-T16-v1",
         epoch=metadata["best_epoch"], val_accuracy=metadata["best"], params=EXPECTED_PARAMS,
         preprocessing_version=PREPROCESSING_VERSION, pipeline_version=VERSION,
-        config_hash=metadata["config_hash"]))
+        config_hash=metadata["config_hash"])
+    if "sampler_b" in metadata:
+        summary["sampler_b"] = metadata["sampler_b"]
+    atomic_json(out / "best.json", summary)
 
 
 def write_result(out, protocol, metadata, digest, resumed=False):
@@ -195,6 +216,8 @@ def write_result(out, protocol, metadata, digest, resumed=False):
               "config_hash": digest, "checkpoint": str(out / "best.msgpack"),
               "preprocessing_version": PREPROCESSING_VERSION, "pipeline_version": VERSION,
               "stopped_early": metadata["stopped_early"], "resumed_completed": resumed}
+    if "sampler_b" in metadata:
+        result["sampler_b"] = metadata["sampler_b"]
     atomic_json(out / "result.json", result)
     atomic_json(out.parent / f"result_{protocol}.json", result)
     return result
@@ -213,6 +236,11 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
     if not allow_cpu and (jax.default_backend() != "gpu" or len(jax.local_devices()) != 1):
         raise RuntimeError(f"Expected one isolated GPU; backend={jax.default_backend()}, devices={jax.local_devices()}")
     dataset = Dataset(cache)
+    sampler_identity = None
+    if config.get("pose_sampler"):
+        from .sampler_b_data import attach_sampler_b
+        report(phase="Load B poses")
+        sampler_identity = attach_sampler_b(dataset, cache, Path(outdir) / "sampler_b", protocol)
     train_ids = dataset.splits[f"{protocol}_train"]
     val_ids = dataset.splits[f"{protocol}_val"]
     if config["max_train_samples"]:
@@ -225,6 +253,8 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
     steps = math.ceil(len(train_ids) / batch_size)
     signature = {"config": config, "protocol": protocol, "cache": dataset.meta["signature"],
                  "parameters": EXPECTED_PARAMS, "pipeline_version": VERSION}
+    if sampler_identity is not None:
+        signature["sampler_b"] = sampler_identity
     digest = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
     previous = read_json(out / "run_config.json")
     if previous is not None and previous != signature:
@@ -235,6 +265,8 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
     metadata = {"config_hash": digest, "epoch": 0, "best": -1.0, "best_epoch": 0,
                 "bad_epochs": 0, "history": [], "warmup_epochs": warmup_epochs,
                 "best_checkpoint": None, "stopped_early": False}
+    if sampler_identity is not None:
+        metadata["sampler_b"] = sampler_identity
     last = out / "last.msgpack"
     if last.exists():
         state, key, metadata = restore_checkpoint(last, state, digest)
@@ -341,6 +373,8 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
                             "config": config, "preprocessing_version": PREPROCESSING_VERSION,
                             "pipeline_version": VERSION, "cache_signature": dataset.meta["signature"],
                             "train_samples": len(train_ids), "val_samples": len(val_ids)}
+            if sampler_identity is not None:
+                best_payload["sampler_b"] = sampler_identity
             atomic_bytes(out / metadata["best_checkpoint"], serialization.to_bytes(best_payload))
         row.update(best_val_accuracy=best, best_epoch=metadata["best_epoch"])
         metadata["history"].append(row)

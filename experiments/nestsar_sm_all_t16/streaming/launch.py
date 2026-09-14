@@ -23,10 +23,16 @@ DEFAULTS = dict(
 
 
 def validate_config(config):
-    unknown = set(config) - set(DEFAULTS)
+    unknown = set(config) - set(DEFAULTS) - {"pose_sampler"}
     if unknown:
         raise ValueError(f"Unknown config keys: {sorted(unknown)}")
     c = dict(DEFAULTS, **config)
+    if "pose_sampler" in c:
+        from ..sampler_b import VERSION as SAMPLER_B_VERSION
+        if c["pose_sampler"] != SAMPLER_B_VERSION:
+            raise ValueError("Unknown pose_sampler")
+        if c["max_train_samples"] or c["max_val_samples"]:
+            raise ValueError("Sampler B uses complete official protocols; subset caps must be zero")
     for k in ("epochs", "patience", "micro_batch", "accumulation_steps", "eval_batch", "progress_every"):
         if not isinstance(c[k], int) or c[k] < 1:
             raise ValueError(f"{k} must be a positive integer")
@@ -355,8 +361,11 @@ def run(dataset=None, outdir="/kaggle/working/NestSAR_SM_ALL_T16_SharedCache_v2"
             )
 
         tests = Path(__file__).resolve().parent.parent / "test_preprocessing_corrected.py"
+        test_files = [str(tests)]
+        if c.get("pose_sampler"):
+            test_files.append(str(tests.with_name("test_sampler_b.py")))
         quiet_run(
-            [python, "-m", "pytest", "-q", str(tests)],
+            [python, "-m", "pytest", "-q", *test_files],
             out / "preprocessing_tests.log", isolated_env(),
             lambda: update_bar(bars[0], "xsub", 0,
                                dict(phase="Regression checks", current=0, total=1)),
@@ -371,6 +380,16 @@ def run(dataset=None, outdir="/kaggle/working/NestSAR_SM_ALL_T16_SharedCache_v2"
                 b, p, i, read_json(status_path, dict(phase="Prepare cache", current=0, total=1))
             ) for i, (b, p) in enumerate(zip(bars, ("xsub", "xset")))],
         )
+
+        if c.get("pose_sampler"):
+            status_path = out / "sampler_prepare_status.json"
+            quiet_run(
+                [python, "-m", MODULE + ".sampler_b_data", "--cache", str(cache),
+                 "--out", str(out / "sampler_b"), "--status", str(status_path)],
+                out / "sampler_prepare.log", isolated_env(),
+                lambda: [update_bar(b, p, i, read_json(status_path, dict(phase="Prepare B", current=0, total=1)))
+                         for i, (b, p) in enumerate(zip(bars, ("xsub", "xset")))],
+            )
 
         if audit_first:
             quiet_run(

@@ -153,6 +153,7 @@ class Dataset:
         self.offsets = np.load(cache / "offsets.npy", mmap_mode="r")
         self.labels = np.load(cache / "labels.npy", mmap_mode="r")
         self.splits = json.loads((cache / "splits.json").read_text())
+        self.pose_sampler = self.pose_overlay = self.pose_protocol = None
 
     def sample(self, index):
         total, people = self.shape[index]
@@ -169,6 +170,10 @@ class Dataset:
              "y": np.zeros(size, np.int32), "mask": np.zeros(size, np.float32)}
         # Advanced indexing copies only this batch, never a whole split.
         b["x"][:len(indices)] = self.canonical[indices]
+        if self.pose_overlay is not None:
+            if protocol != self.pose_protocol:
+                raise ValueError("B overlay/calibration protocol mismatch")
+            b["x"].reshape(size, pp.FRAMES, 2, 25, 15)[:len(indices), ..., :3] = self.pose_overlay[indices]
         b["y"][:len(indices)] = self.labels[indices]
         b["mask"][:len(indices)] = 1
         if training:
@@ -177,7 +182,8 @@ class Dataset:
             for j, (index, position) in enumerate(zip(indices, positions)):
                 b["xa"][j] = pp.augmented_features(
                     self.sample(index), protocol_seed, epoch if config["fresh_augmentation"] else 1,
-                    int(position), config["rotation_degrees"], config["jitter_shift"])
+                    int(position), config["rotation_degrees"], config["jitter_shift"],
+                    pose_selector=self.pose_sampler)
         return b, time.perf_counter() - t0
 
     def batches(self, indices, size, config, epoch=0, training=False, protocol="xsub"):
