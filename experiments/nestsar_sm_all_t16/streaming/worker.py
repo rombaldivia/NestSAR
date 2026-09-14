@@ -26,8 +26,22 @@ from . import VERSION
 EXPECTED_PARAMS = 1_826_556
 
 
+def expected_parameters(config):
+    if config.get("part_readout"):
+        from ..part_readout_config import extra_parameters
+        return EXPECTED_PARAMS + extra_parameters(config["spatial_dim"])
+    return EXPECTED_PARAMS
+
+
+def model_metadata(config):
+    result = dict(model="NestSAR-SM-ALL-T16-v1", params=expected_parameters(config))
+    if config.get("part_readout"):
+        result.update(model="NestSAR-SM-ALL-T16-LocalSubspace-v1", part_readout=config["part_readout"])
+    return result
+
+
 def make_model(config):
-    return NestSARSMAllT16(**{k: config[k] for k in (
+    return NestSARSMAllT16(part_readout=bool(config.get("part_readout")), **{k: config[k] for k in (
         "spatial_dim", "model_dim", "dropout", "controller_dim", "fast_rank",
         "head_rank", "sm_residual_scale", "head_residual_scale")})
 
@@ -137,8 +151,9 @@ def create_state(config, steps_per_epoch):
     key, init = jax.random.split(jax.random.PRNGKey(config["seed"]))
     params = model.init({"params": init, "dropout": init}, jnp.zeros((1, FRAMES, FEATURES)), training=False)["params"]
     count = sum(x.size for x in jax.tree.leaves(params))
-    if count != EXPECTED_PARAMS:
-        raise RuntimeError(f"Model parameter mismatch: {count} != {EXPECTED_PARAMS}")
+    expected = expected_parameters(config)
+    if count != expected:
+        raise RuntimeError(f"Model parameter mismatch: {count} != {expected}")
     state = State.create(apply_fn=model.apply, params=params, tx=optimizer, ema_params=params)
     return model, state, key, schedule, int(math.ceil(warm / steps_per_epoch))
 
@@ -198,26 +213,30 @@ def publish_best(out, metadata):
         raise ValueError("Invalid best-checkpoint filename")
     payload = (out / name).read_bytes()
     atomic_bytes(out / "best.msgpack", payload)
-    summary = dict(model="NestSAR-SM-ALL-T16-v1",
-        epoch=metadata["best_epoch"], val_accuracy=metadata["best"], params=EXPECTED_PARAMS,
+    summary = dict(model=metadata.get("model", "NestSAR-SM-ALL-T16-v1"),
+        epoch=metadata["best_epoch"], val_accuracy=metadata["best"], params=metadata.get("params", EXPECTED_PARAMS),
         preprocessing_version=PREPROCESSING_VERSION, pipeline_version=VERSION,
         config_hash=metadata["config_hash"])
     if "sampler_b" in metadata:
         summary["sampler_b"] = metadata["sampler_b"]
+    if "part_readout" in metadata:
+        summary["part_readout"] = metadata["part_readout"]
     atomic_json(out / "best.json", summary)
 
 
 def write_result(out, protocol, metadata, digest, resumed=False):
-    result = {"model": "NestSAR-SM-ALL-T16-v1", "protocol": protocol,
+    result = {"model": metadata.get("model", "NestSAR-SM-ALL-T16-v1"), "protocol": protocol,
               "best_val_accuracy": metadata["best"], "best_accuracy": metadata["best"],
               "best_epoch": metadata["best_epoch"], "last_epoch": metadata["epoch"],
-              "epochs_run": metadata["epoch"], "params": EXPECTED_PARAMS,
+              "epochs_run": metadata["epoch"], "params": metadata.get("params", EXPECTED_PARAMS),
               "backend": jax.default_backend(), "devices": [str(d) for d in jax.local_devices()],
               "config_hash": digest, "checkpoint": str(out / "best.msgpack"),
               "preprocessing_version": PREPROCESSING_VERSION, "pipeline_version": VERSION,
               "stopped_early": metadata["stopped_early"], "resumed_completed": resumed}
     if "sampler_b" in metadata:
         result["sampler_b"] = metadata["sampler_b"]
+    if "part_readout" in metadata:
+        result["part_readout"] = metadata["part_readout"]
     atomic_json(out / "result.json", result)
     atomic_json(out.parent / f"result_{protocol}.json", result)
     return result
@@ -240,7 +259,8 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
     if config.get("pose_sampler"):
         from .sampler_b_data import attach_sampler_b
         report(phase="Load B poses")
-        sampler_identity = attach_sampler_b(dataset, cache, Path(outdir) / "sampler_b", protocol)
+        sampler_identity = attach_sampler_b(dataset, cache,
+            Path(config.get("sampler_cache_dir", Path(outdir) / "sampler_b")), protocol)
     train_ids = dataset.splits[f"{protocol}_train"]
     val_ids = dataset.splits[f"{protocol}_val"]
     if config["max_train_samples"]:
@@ -252,7 +272,7 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
     batch_size = config["micro_batch"] * config["accumulation_steps"]
     steps = math.ceil(len(train_ids) / batch_size)
     signature = {"config": config, "protocol": protocol, "cache": dataset.meta["signature"],
-                 "parameters": EXPECTED_PARAMS, "pipeline_version": VERSION}
+                 "parameters": expected_parameters(config), "pipeline_version": VERSION}
     if sampler_identity is not None:
         signature["sampler_b"] = sampler_identity
     digest = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
@@ -265,6 +285,7 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
     metadata = {"config_hash": digest, "epoch": 0, "best": -1.0, "best_epoch": 0,
                 "bad_epochs": 0, "history": [], "warmup_epochs": warmup_epochs,
                 "best_checkpoint": None, "stopped_early": False}
+    metadata.update(model_metadata(config))
     if sampler_identity is not None:
         metadata["sampler_b"] = sampler_identity
     last = out / "last.msgpack"
@@ -368,11 +389,12 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
         report(phase="Save checkpoint", current=1, total=1)
         if improved:
             metadata.update(best_epoch=epoch, best_checkpoint=f"best_epoch_{epoch:04d}.msgpack")
-            best_payload = {"model": "NestSAR-SM-ALL-T16-v1", "protocol": protocol, "epoch": epoch,
+            best_payload = {"model": metadata.get("model", "NestSAR-SM-ALL-T16-v1"), "protocol": protocol, "epoch": epoch,
                             "val_accuracy": val, "ema_params": jax.device_get(state.ema_params),
                             "config": config, "preprocessing_version": PREPROCESSING_VERSION,
                             "pipeline_version": VERSION, "cache_signature": dataset.meta["signature"],
                             "train_samples": len(train_ids), "val_samples": len(val_ids)}
+            best_payload.update(model_metadata(config))
             if sampler_identity is not None:
                 best_payload["sampler_b"] = sampler_identity
             atomic_bytes(out / metadata["best_checkpoint"], serialization.to_bytes(best_payload))

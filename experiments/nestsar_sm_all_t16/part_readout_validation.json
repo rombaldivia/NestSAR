@@ -1,0 +1,60 @@
+{
+  "experiment": "local-subspace-v1",
+  "base_commit": "7ca0fcd99ffe0217ba97e035c41bba7b8138611b",
+  "unit_tests": {
+    "passed": 27,
+    "seconds": 37.08,
+    "scope": [
+      "test_part_readout.py",
+      "streaming/tests/test_training.py",
+      "streaming/tests/test_person_awareness.py",
+      "streaming/tests/test_launcher.py"
+    ]
+  },
+  "compute": {
+    "params": 1829060,
+    "flops": 73111440.0,
+    "gflops": 0.07311144,
+    "scan_unrolled_outputs_match": true,
+    "max_abs_difference": 0.0,
+    "backend": "cpu",
+    "jax": "0.7.2",
+    "batch": 1,
+    "convention": "Static-unrolled XLA forward; 1 MAC=2 FLOPs; preprocessing excluded",
+    "model": "NestSAR-SM-ALL-T16-LocalSubspace-v1",
+    "part_readout": "local-subspace-v1",
+    "baseline": {
+      "params": 1826556,
+      "flops": 68797520.0,
+      "gflops": 0.06879752,
+      "scan_unrolled_outputs_match": true,
+      "max_abs_difference": 0.0,
+      "backend": "cpu",
+      "jax": "0.7.2",
+      "batch": 1,
+      "convention": "Static-unrolled XLA forward; 1 MAC=2 FLOPs; preprocessing excluded"
+    },
+    "extra_params": 2504,
+    "extra_flops": 4313920.0,
+    "flop_increase_percent": 6.270458586297878
+  },
+  "integration": {
+    "backend": "cpu",
+    "real_model_params": 1829060,
+    "protocols": [
+      "xsub",
+      "xset"
+    ],
+    "concurrent_workers": true,
+    "epochs_per_protocol": 2,
+    "train_samples_per_protocol": 3,
+    "val_samples_per_protocol": 2,
+    "resume_and_alias_repair_passed": true,
+    "sampler_b": true,
+    "part_readout": true,
+    "real_ntu_accuracy_measured": false,
+    "dual_t4_executed": false
+  },
+  "accuracy_gain_measured": false,
+  "t4_compute_measured": false
+}

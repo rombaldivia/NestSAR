@@ -11,7 +11,7 @@ from ..compute_unrolled_audit import UnrolledGatedSweep, UnrolledFastWeightDelta
 from experiments.m4_motionpreserve_t16 import train_m4_motionpreserve_t16_tpu as base
 from .io_utils import atomic_json
 from .launch import validate_config
-from .worker import make_model, EXPECTED_PARAMS
+from .worker import make_model, expected_parameters, model_metadata
 
 
 def audit_model(model, params):
@@ -48,8 +48,19 @@ def main():
     model = make_model(config)
     params = model.init({"params": jax.random.PRNGKey(128)}, jnp.zeros((1,16,750)), training=False)["params"]
     result = audit_model(model, params)
-    if result["params"] != EXPECTED_PARAMS:
+    if result["params"] != expected_parameters(config):
         raise RuntimeError("SM-ALL parameter count changed")
+    result.update(model_metadata(config))
+    if config.get("part_readout"):
+        baseline_config = dict(config)
+        baseline_config.pop("part_readout")
+        baseline = make_model(baseline_config)
+        baseline_params = baseline.init(jax.random.PRNGKey(128), jnp.zeros((1,16,750)), training=False)["params"]
+        reference = audit_model(baseline, baseline_params)
+        result["baseline"] = reference
+        result["extra_params"] = result["params"] - reference["params"]
+        result["extra_flops"] = result["flops"] - reference["flops"]
+        result["flop_increase_percent"] = 100 * result["extra_flops"] / reference["flops"]
     atomic_json(args.output, result)
 
 

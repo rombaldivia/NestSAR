@@ -14,6 +14,10 @@ problems without changing the parameter count:
 
 The proven J/B/JM/BM -> M4 -> cross-stream router -> G4 topology is retained.
 No attention, GCN, TCN, Transformer, or T x T operation is introduced.
+
+An optional local-subspace-v1 part readout adds a nonlinear spatial residual.
+It changes the deployed spatial encoder and adds 2,504 parameters at default
+widths; the baseline remains the default and all M4/G4 blocks are identical.
 """
 
 from typing import Mapping
@@ -188,11 +192,13 @@ class MaskSafeSpatialEncoder(nn.Module):
     Missing joints are zeroed after input embeddings and again after the joint
     memory. Therefore Dense biases and learned person embeddings are available
     only for joints that actually belong to a present skeleton.
+    Enabling part_readout adds new parameters under that name only.
     """
 
     spatial_dim: int = 24
     model_dim: int = 112
     dropout: float = 0.10
+    part_readout: bool = False
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, valid: jnp.ndarray, training: bool) -> jnp.ndarray:
@@ -231,6 +237,9 @@ class MaskSafeSpatialEncoder(nn.Module):
         counts = jnp.asarray(base.PART_COUNTS_NP, h.dtype)
         parts = jnp.einsum("btmvd,pv->btmpd", h, mask)
         parts = parts / counts[None, None, None, :, None]
+        if self.part_readout:
+            from .part_readout import NonlinearPartReadout
+            parts = parts + NonlinearPartReadout(self.spatial_dim, name="part_readout")(h, valid)
         flat = parts.reshape(b, t, m * 10 * self.spatial_dim)
         y = nn.Dense(self.model_dim, name="part_fuse")(flat)
         y = nn.LayerNorm(name="out_norm")(nn.gelu(y))
@@ -379,6 +388,7 @@ class NestSARSMAllT16(nn.Module):
     spatial_dim: int = 24
     model_dim: int = 112
     dropout: float = 0.10
+    part_readout: bool = False
 
     controller_dim: int = 16
     fast_rank: int = 2
@@ -475,6 +485,7 @@ class NestSARSMAllT16(nn.Module):
                 self.spatial_dim,
                 self.model_dim,
                 self.dropout,
+                part_readout=self.part_readout,
                 name=f"spatial_{i}",
             )(stream, valid, training)
             gate = controller["stream_gate"][:, :, i:i + 1]

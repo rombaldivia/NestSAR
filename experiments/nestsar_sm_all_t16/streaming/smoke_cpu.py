@@ -19,6 +19,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--outdir", required=True)
     parser.add_argument("--sampler-b", action="store_true")
+    parser.add_argument("--part-readout", action="store_true")
     args = parser.parse_args()
     root = Path(args.outdir)
     root.mkdir(parents=True, exist_ok=True)
@@ -34,11 +35,18 @@ def main():
     dataset.write_bytes(pickle.dumps(dict(annotations=annotations, split=splits)))
     prepare(dataset, root/'cache', root/'prepare_status.json')
     config = validate_config(dict(epochs=2, micro_batch=2, accumulation_steps=2, eval_batch=4))
+    if args.part_readout:
+        from ..part_readout_config import VERSION as READOUT_VERSION
+        config = validate_config(dict(config, part_readout=READOUT_VERSION))
     if args.sampler_b:
         from .sampler_b_data import prepare_sampler_b
         from ..sampler_b import VERSION as SAMPLER_VERSION
-        prepare_sampler_b(root/'cache', root/'run'/'sampler_b', root/'sampler_status.json', require_full=False)
-        config = validate_config(dict(config, pose_sampler=SAMPLER_VERSION))
+        sampler_root = root/'shared_sampler_b' if args.part_readout else root/'run'/'sampler_b'
+        prepare_sampler_b(root/'cache', sampler_root, root/'sampler_status.json', require_full=False)
+        options = dict(config, pose_sampler=SAMPLER_VERSION)
+        if args.part_readout:
+            options['sampler_cache_dir'] = str(sampler_root)
+        config = validate_config(options)
     atomic_json(root/'config.json', config)
     env = dict(os.environ, JAX_PLATFORMS='cpu', CUDA_VISIBLE_DEVICES='',
                OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1')
@@ -71,14 +79,29 @@ def main():
             assert status['best_epoch'] > 0 and len(history) == 2
             assert all(row['train_samples'] == 3 and row['val_samples'] == 2 for row in history)
             assert (out/'best.msgpack').exists()
+            result = json.loads((out/'result.json').read_text())
             if args.sampler_b:
-                result = json.loads((out/'result.json').read_text())
                 assert result['sampler_b']['calibration']['fit_split'] == protocol + '_train'
+            if args.part_readout:
+                from flax import serialization
+                from .worker import make_model, expected_parameters
+                import jax
+                import jax.numpy as jnp
+                payload = serialization.msgpack_restore((out/'best.msgpack').read_bytes())
+                assert payload['params'] == expected_parameters(config)
+                restored_model = make_model(payload['config'])
+                prediction = restored_model.apply({'params': payload['ema_params']}, jnp.zeros((1,16,750)))['logits']
+                assert np.isfinite(jax.device_get(prediction)).all()
+                assert result['params'] == expected_parameters(config)
+                if args.sampler_b:
+                    assert not (root/'run'/'sampler_b').exists()  # No duplicate overlays.
+        from .worker import expected_parameters
         atomic_json(root/'smoke_report.json', dict(
-            backend='cpu', real_model_params=1826556, protocols=['xsub', 'xset'],
+            backend='cpu', real_model_params=expected_parameters(config), protocols=['xsub', 'xset'],
             concurrent_workers=True, epochs_per_protocol=2, train_samples_per_protocol=3,
             val_samples_per_protocol=2, resume_and_alias_repair_passed=True,
-            sampler_b=args.sampler_b, real_ntu_accuracy_measured=False, dual_t4_executed=False))
+            sampler_b=args.sampler_b, part_readout=args.part_readout,
+            real_ntu_accuracy_measured=False, dual_t4_executed=False))
     finally:
         # CPU smoke workers do not own process groups, so terminate them directly.
         for proc in processes:
