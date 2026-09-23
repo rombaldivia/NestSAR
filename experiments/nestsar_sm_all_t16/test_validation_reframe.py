@@ -24,10 +24,35 @@ class CenteredWindowTest(unittest.TestCase):
                 target.mkdir()
                 (target / "best.msgpack").write_bytes(b"frozen-checkpoint")
                 (target / "best.json").write_text(json.dumps({
-                    "model": "NestSAR-SM-ALL-T16-v1", "pipeline_version": "p2-v3"}))
+                    "model": "NestSAR-SM-ALL-T16-v1", "pipeline_version": "p2-v3",
+                    "params": 1_826_556, "preprocessing_version": pp.VERSION}))
             with patch("experiments.nestsar_sm_all_t16.validation_reframe._mounted_file_candidates",
                        return_value=iter(())):
                 self.assertEqual(checkpoint_location(root), (root, "p2-v3"))
+
+    def test_existing_g4_pair_is_accepted_with_matching_model_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for protocol in ("xsub", "xset"):
+                target = root / protocol
+                target.mkdir()
+                (target / "best.msgpack").write_bytes(b"frozen-g4-checkpoint")
+                (target / "best.json").write_text(json.dumps({
+                    "model": "NestSAR-SM-ALL-T16-G4-MOMENTS-v1",
+                    "params": 1_827_452, "preprocessing_version": pp.VERSION,
+                    "pipeline_version": "sm-all-shared-cache-personaware-p2-g4-moments-v1",
+                }))
+            with patch("experiments.nestsar_sm_all_t16.validation_reframe._mounted_file_candidates",
+                       return_value=iter(())):
+                self.assertEqual(checkpoint_location(root), (
+                    root, "sm-all-shared-cache-personaware-p2-g4-moments-v1"))
+                (root / "xset" / "best.json").write_text(json.dumps({
+                    "model": "NestSAR-SM-ALL-T16-v1", "params": 1_826_556,
+                    "preprocessing_version": pp.VERSION,
+                    "pipeline_version": "sm-all-shared-cache-personaware-p2-g4-moments-v1",
+                }))
+                with self.assertRaises(FileNotFoundError):
+                    checkpoint_location(root)
 
     def test_only_matching_preprocessing_and_pipeline_cache_is_reused(self):
         with tempfile.TemporaryDirectory() as directory:
