@@ -11,7 +11,7 @@ from unittest.mock import patch
 import numpy as np
 
 from . import preprocessing_corrected as pp
-from .validation_reframe import cache_location, centered, checkpoint_location, variants
+from .validation_reframe import cache_location, centered, checkpoint_location, checkpoint_pairs, variants
 
 
 class CenteredWindowTest(unittest.TestCase):
@@ -70,6 +70,27 @@ class CenteredWindowTest(unittest.TestCase):
                 with self.assertRaises(FileNotFoundError):
                     checkpoint_location(root)
 
+    def test_all_available_model_pairs_are_discovered_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            for name, model, params in (
+                ("p2", "NestSAR-SM-ALL-T16-v1", 1_826_556),
+                ("g4", "NestSAR-SM-ALL-T16-G4-MOMENTS-v1", 1_827_452),
+            ):
+                for protocol in ("xsub", "xset"):
+                    folder = base / name / protocol
+                    folder.mkdir(parents=True)
+                    (folder / "best.msgpack").write_bytes(b"frozen")
+                    (folder / "best.json").write_text(json.dumps({
+                        "model": model, "params": params,
+                        "preprocessing_version": pp.VERSION, "pipeline_version": name,
+                    }))
+            files = [base / name / "xsub" / "best.msgpack" for name in ("p2", "g4")]
+            with patch("experiments.nestsar_sm_all_t16.validation_reframe._mounted_file_candidates",
+                       return_value=iter(files)):
+                self.assertEqual(checkpoint_pairs(base / "p2"),
+                                 [(base / "p2", "p2"), (base / "g4", "g4")])
+
     def test_only_matching_preprocessing_and_pipeline_cache_is_reused(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -85,14 +106,18 @@ class CenteredWindowTest(unittest.TestCase):
                        return_value=iter(())):
                 self.assertEqual(cache_location(root, "p2-v3"), root)
 
-    def test_short_clip_reuses_original_tokens_and_keeps_missing_actor_zero(self):
+    def test_short_clip_repeats_last_frame_without_creating_missing_actor(self):
         raw = np.zeros((12, 2, 25, 3), np.float32)
         raw[:, 0, :, :] = [1.0, 2.0, 3.0]
         raw[:, 0, 4, 0] += np.arange(len(raw), dtype=np.float32) * 0.03
         canonical = pp.features(raw)
         result = variants(raw, canonical)
-        for mode in result:
-            np.testing.assert_array_equal(result[mode], canonical)
+        np.testing.assert_array_equal(result["original"], canonical)
+        for window in (24, 32):
+            mode = f"center{window}"
+            padded = np.concatenate((raw, np.repeat(raw[-1:], window - len(raw), axis=0)))
+            np.testing.assert_array_equal(centered(raw, window), padded)
+            np.testing.assert_array_equal(result[mode], pp.features(padded))
             np.testing.assert_array_equal(result[mode].reshape(16, 2, 25, 15)[:, 1], 0)
 
     def test_center_window_excludes_edges_and_changes_tokens(self):
@@ -104,7 +129,8 @@ class CenteredWindowTest(unittest.TestCase):
         np.testing.assert_array_equal(centered(raw, 32)[0], raw[24])
         result = variants(raw, pp.features(raw))
         self.assertFalse(np.array_equal(result["original"], result["center32"]))
-        np.testing.assert_array_equal(result["center64"], pp.features(raw[8:72]))
+        np.testing.assert_array_equal(result["center24"], pp.features(raw[28:52]))
+        np.testing.assert_array_equal(result["center32"], pp.features(raw[24:56]))
 
 
 if __name__ == "__main__":
