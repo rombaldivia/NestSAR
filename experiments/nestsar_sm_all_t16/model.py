@@ -12,8 +12,10 @@ problems without changing the parameter count:
   * the controller receives explicit P2-P1 pose/motion relations and person/pair
     presence indicators.
 
-The proven J/B/JM/BM -> M4 -> cross-stream router -> G4 topology is retained.
-No attention, GCN, TCN, Transformer, or T x T operation is introduced.
+The deployed J/B/JM/BM -> M4 -> cross-stream router -> G4 topology is retained.
+A single global attention block is attached to M4 only while training and is
+removed/skipped for evaluation and deployment. The deployed graph still contains
+no attention, GCN, TCN, Transformer, or T x T operation.
 """
 
 from typing import Mapping
@@ -375,6 +377,92 @@ class SelfModDescriptorHead(nn.Module):
         return chunks, pooled
 
 
+class TrainingOnlyAttentionSupervisor(nn.Module):
+    """Single-block global attention used only while optimizing NestSAR.
+
+    The deployable NestSAR path never calls this module. During training it sees
+    the full M4 tensor [B,T,S,D], flattens the T16 x 4 streams into 64 tokens,
+    and supplies an auxiliary CE objective whose gradients shape the M4/backbone
+    representation. No attention output is fed into the deployed forward path.
+    """
+
+    dim: int = 112
+    num_heads: int = 4
+    dropout: float = 0.10
+
+    @nn.compact
+    def __call__(self, frame_stack: jnp.ndarray, training: bool) -> jnp.ndarray:
+        if frame_stack.ndim != 4:
+            raise ValueError(f"Expected [B,T,S,D], got {frame_stack.shape}")
+        if frame_stack.shape[1] != FRAMES or frame_stack.shape[2] != NUM_STREAMS:
+            raise ValueError(
+                f"Expected T={FRAMES}, S={NUM_STREAMS}, got {frame_stack.shape}"
+            )
+        if frame_stack.shape[-1] != self.dim:
+            raise ValueError(f"Expected D={self.dim}, got {frame_stack.shape}")
+        if self.dim % self.num_heads:
+            raise ValueError(
+                f"dim={self.dim} must be divisible by num_heads={self.num_heads}"
+            )
+
+        temporal_embed = self.param(
+            "temporal_embed",
+            nn.initializers.normal(0.02),
+            (1, FRAMES, 1, self.dim),
+        )
+        stream_embed = self.param(
+            "stream_embed",
+            nn.initializers.normal(0.02),
+            (1, 1, NUM_STREAMS, self.dim),
+        )
+
+        h = frame_stack + temporal_embed + stream_embed
+        h = h.reshape(h.shape[0], FRAMES * NUM_STREAMS, self.dim)
+        n = nn.LayerNorm(name="pre_norm")(h)
+
+        q = nn.Dense(self.dim, name="q_proj")(n)
+        k = nn.Dense(self.dim, name="k_proj")(n)
+        v = nn.Dense(self.dim, name="v_proj")(n)
+
+        head_dim = self.dim // self.num_heads
+
+        def split_heads(x):
+            return x.reshape(
+                x.shape[0],
+                x.shape[1],
+                self.num_heads,
+                head_dim,
+            )
+
+        q = split_heads(q)
+        k = split_heads(k)
+        v = split_heads(v)
+
+        scale = jnp.asarray(head_dim, dtype=h.dtype) ** -0.5
+        scores = jnp.einsum("bnhd,bmhd->bhnm", q, k) * scale
+        weights = jax.nn.softmax(scores, axis=-1)
+        weights = nn.Dropout(self.dropout, name="attn_dropout")(
+            weights,
+            deterministic=not training,
+        )
+
+        context = jnp.einsum("bhnm,bmhd->bnhd", weights, v)
+        context = context.reshape(
+            context.shape[0],
+            context.shape[1],
+            self.dim,
+        )
+        context = nn.Dense(self.dim, name="out_proj")(context)
+        context = nn.Dropout(self.dropout, name="out_dropout")(
+            context,
+            deterministic=not training,
+        )
+
+        h = nn.LayerNorm(name="post_norm")(h + context)
+        pooled = jnp.mean(h, axis=1)
+        return nn.Dense(NUM_CLASSES, name="classifier")(pooled)
+
+
 class NestSARSMAllT16(nn.Module):
     spatial_dim: int = 24
     model_dim: int = 112
@@ -385,6 +473,10 @@ class NestSARSMAllT16(nn.Module):
     head_rank: int = 2
     sm_residual_scale: float = 0.08
     head_residual_scale: float = 0.15
+
+    # Training-only auxiliary attention. It is skipped entirely when training=False.
+    attention_heads: int = 4
+    attention_dropout: float = 0.10
 
     @nn.compact
     def __call__(
@@ -498,6 +590,21 @@ class NestSARSMAllT16(nn.Module):
 
         frame_stack = jnp.stack(frame_streams, axis=2)
 
+        # Training-only global relation supervisor. Its logits contribute only to
+        # the auxiliary training loss; they never enter the deployed NestSAR path.
+        if training:
+            attention_aux_logits = TrainingOnlyAttentionSupervisor(
+                dim=self.model_dim,
+                num_heads=self.attention_heads,
+                dropout=self.attention_dropout,
+                name="training_attention_supervisor",
+            )(frame_stack, training=True)
+        else:
+            attention_aux_logits = jnp.zeros(
+                (x.shape[0], NUM_CLASSES),
+                dtype=frame_stack.dtype,
+            )
+
         mixed, router_weights = base.CrossStreamRouter(
             self.model_dim,
             name="cross_stream_after_frame",
@@ -566,6 +673,7 @@ class NestSARSMAllT16(nn.Module):
             "logits": logits,
             "main_logits": main_logits,
             "adaptive_head_delta": delta_logits,
+            "attention_aux_logits": attention_aux_logits,
             "stream_logits": sl,
             "fusion_weights": fusion,
             "router_weights": router_weights,
