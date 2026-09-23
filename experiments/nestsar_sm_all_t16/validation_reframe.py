@@ -371,7 +371,12 @@ def launch(settings: dict) -> dict:
             logfile = (out / protocol / "worker.log").open("w")
             logs.append(logfile)
             cmd = [*command, "--protocol", protocol] + (["--allow-cpu"] if allow_cpu else [])
-            children.append(subprocess.Popen(cmd, env=env, stdout=logfile, stderr=subprocess.STDOUT))
+            # Kaggle kernels can start in /kaggle/working, which may contain an
+            # unrelated `experiments` package. Python searches the working
+            # directory before PYTHONPATH, so launch from this checkout.
+            children.append(subprocess.Popen(
+                cmd, cwd=str(root), env=env, stdout=logfile, stderr=subprocess.STDOUT,
+            ))
         while any(child.poll() is None for child in children):
             for protocol, bar in zip(("xsub", "xset"), bars):
                 path = out / protocol / "status.json"
