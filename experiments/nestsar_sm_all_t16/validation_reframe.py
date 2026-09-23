@@ -1,4 +1,4 @@
-"""Paired, inference-only centered-window audit of an existing P2 or G4 checkpoint.
+"""Paired, inference-only 24/32 raw-frame audit of a frozen P2 or G4 model.
 
 Run this file through runpy.run_path with NESTSAR_REFRAME_SETTINGS in Kaggle, or
 use --worker for a single isolated protocol/GPU. Never initializes an optimizer.
@@ -20,7 +20,8 @@ import numpy as np
 from . import preprocessing_corrected as pp
 from .streaming.io_utils import Reporter, atomic_json
 
-MODES = ("original", "center64", "center32", "center16")
+WINDOWS = (24, 32)
+MODES = ("original", *(f"center{window}" for window in WINDOWS))
 MODEL_PARAMS = {
     "NestSAR-SM-ALL-T16-v1": 1_826_556,
     "NestSAR-SM-ALL-T16-TRAIN-ATTN-v1": 1_826_556,
@@ -28,7 +29,7 @@ MODEL_PARAMS = {
 }
 DEFAULT_CHECKPOINTS = "/kaggle/working/NestSAR_G4_TEMPORAL_MOMENTS_T16_FULL_OFFICIAL"
 DEFAULT_CACHE = "/kaggle/working/NestSAR_G4_TEMPORAL_MOMENTS_T16_CACHE"
-DEFAULT_OUT = "/kaggle/working/NestSAR_G4_VALIDATION_REFRAME_v1"
+DEFAULT_OUT = "/kaggle/working/NestSAR_G4_VALIDATION_REFRAME_24_32_v1"
 
 
 class FrozenCache:
@@ -70,31 +71,40 @@ def _mounted_file_candidates(filename: str):
             yield from sorted(base.rglob(filename))
 
 
-def checkpoint_location(preferred: Path) -> tuple[Path, str]:
-    """Find both frozen protocol weights before doing any cache work."""
-    roots = [preferred]
+def _valid_checkpoint_pair(root: Path) -> str | None:
+    if not all((root / p / "best.msgpack").is_file() for p in ("xsub", "xset")):
+        return None
+    meta = [root / p / "best.json" for p in ("xsub", "xset")]
+    if not all(path.is_file() for path in meta):
+        return None
+    try:
+        values = [json.loads(path.read_text()) for path in meta]
+    except (OSError, ValueError):
+        return None
+    model_name = values[0].get("model")
+    if model_name not in MODEL_PARAMS or values[1].get("model") != model_name:
+        return None
+    if any(value.get("params") != MODEL_PARAMS[model_name] for value in values):
+        return None
+    if any(value.get("preprocessing_version") != pp.VERSION for value in values):
+        return None
+    versions = [value.get("pipeline_version") for value in values]
+    if versions[0] is None or versions[0] != versions[1]:
+        return None
+    return versions[0]
+
+
+def checkpoint_pairs(preferred: Path | None = None) -> list[tuple[Path, str]]:
+    roots = [preferred] if preferred is not None else []
     roots.extend(path.parent.parent for path in _mounted_file_candidates("best.msgpack")
                  if path.parent.name == "xsub")
-    candidates = []
-    for root in dict.fromkeys(roots):
-        if not all((root / p / "best.msgpack").is_file() for p in ("xsub", "xset")):
-            continue
-        meta = [root / p / "best.json" for p in ("xsub", "xset")]
-        if not all(path.is_file() for path in meta):
-            continue
-        values = [json.loads(path.read_text()) for path in meta]
-        if values[0].get("model") not in MODEL_PARAMS:
-            continue
-        if values[0].get("model") != values[1].get("model"):
-            continue
-        if any(value.get("params") != MODEL_PARAMS[values[0]["model"]] for value in values):
-            continue
-        if any(value.get("preprocessing_version") != pp.VERSION for value in values):
-            continue
-        versions = [value.get("pipeline_version") for value in values]
-        if versions[0] is None or versions[0] != versions[1]:
-            continue
-        candidates.append((root, versions[0]))
+    return [(root, version) for root in dict.fromkeys(roots)
+            if (version := _valid_checkpoint_pair(root)) is not None]
+
+
+def checkpoint_location(preferred: Path) -> tuple[Path, str]:
+    """Find both frozen protocol weights before doing any cache work."""
+    candidates = checkpoint_pairs(preferred)
     if preferred in (root for root, _ in candidates):
         return next(pair for pair in candidates if pair[0] == preferred)
     if len(candidates) == 1:
@@ -105,6 +115,37 @@ def checkpoint_location(preferred: Path) -> tuple[Path, str]:
         "Attach the saved Kaggle output containing both protocol checkpoints, "
         "then set checkpoint_root to that directory. Candidate roots:\n" + found
     )
+
+
+def launch_all(settings: dict) -> dict:
+    """Evaluate all available, paired P2 / attention-trained P2 / G4 checkpoints.
+
+    Each pair runs the two protocols in parallel with the same two tqdm bars.
+    Distinct checkpoint roots get distinct output directories to retain scores.
+    """
+    allowed = {"cache", "checkpoint_root", "dataset", "outdir", "batch_size", "max_val_samples", "allow_cpu"}
+    unknown = set(settings) - allowed
+    if unknown:
+        raise ValueError(f"Unknown settings: {sorted(unknown)}")
+    preferred = Path(settings.get("checkpoint_root", DEFAULT_CHECKPOINTS))
+    pairs = checkpoint_pairs(preferred)
+    if not pairs:
+        raise FileNotFoundError("No compatible XSUB/XSET best.msgpack + best.json pairs found")
+    output = Path(settings.get("outdir", DEFAULT_OUT))
+    results = {}
+    for number, (checkpoint_root, _) in enumerate(pairs, start=1):
+        model_name = json.loads((checkpoint_root / "xsub" / "best.json").read_text())["model"]
+        key = f"{number:02d}_{model_name}_{checkpoint_root.name}"
+        print(f"\n[{number}/{len(pairs)}] Frozen {model_name}: {checkpoint_root}", flush=True)
+        run_settings = dict(settings, checkpoint_root=str(checkpoint_root), outdir=str(output / key))
+        results[key] = launch(run_settings)
+    print("\nFrozen validation accuracy (percent):")
+    for key, scores in results.items():
+        for protocol in ("xsub", "xset"):
+            row = scores[protocol]["scores"]
+            print(f"{key} {protocol.upper()} " + " | ".join(
+                f"{mode}: {row[mode]['accuracy'] * 100:.4f}" for mode in MODES))
+    return results
 
 
 def cache_location(preferred: Path, pipeline_version: str) -> Path | None:
@@ -140,16 +181,24 @@ def dataset_location(explicit: str | None) -> Path:
 
 
 def centered(x: np.ndarray, window: int) -> np.ndarray:
-    """CD-Former-style temporal crop; preserve original actor order and padding."""
-    if len(x) <= window:
-        return x
-    start = (len(x) - window) // 2
-    return x[start:start + window]
+    """Match the attached notebook's center crop/tail repeat for raw frames.
+
+    Keep the two-person raw skeleton and validity mask intact: NestSAR's own
+    preprocessing, rather than the notebook's frame-wise z-score, builds T16.
+    """
+    if window < 1 or len(x) < 1:
+        raise ValueError("Window and raw clip must both contain frames")
+    if len(x) > window:
+        start = (len(x) - window) // 2
+        return x[start:start + window]
+    if len(x) < window:
+        return np.concatenate((x, np.repeat(x[-1:], window - len(x), axis=0)), axis=0)
+    return x
 
 
 def variants(raw: np.ndarray, original: np.ndarray) -> dict[str, np.ndarray]:
     result = {"original": np.asarray(original, np.float32)}
-    for window in (64, 32, 16):
+    for window in WINDOWS:
         result[f"center{window}"] = pp.features(centered(raw, window))
     if any(value.shape != (16, 750) or not np.isfinite(value).all() for value in result.values()):
         raise ValueError("Invalid reframed feature shape or nonfinite values")
@@ -218,6 +267,7 @@ def worker(protocol: str, cache: str, checkpoint_root: str, outdir: str,
     support = np.zeros(120, np.int64)
     flips = {mode: {"fixed": 0, "broken": 0, "different": 0} for mode in MODES[1:]}
     shortened = {mode: 0 for mode in MODES[1:]}
+    padded = {mode: 0 for mode in MODES[1:]}
     ids = json.loads((Path(cache) / "ids.json").read_text())
     if len(ids) != dataset.meta["samples"]:
         raise ValueError("Sample IDs do not match the canonical cache")
@@ -231,8 +281,9 @@ def worker(protocol: str, cache: str, checkpoint_root: str, outdir: str,
             built = variants(raw, dataset.canonical[index])
             for mode in MODES:
                 data[mode][position] = built[mode]
-            for window in (64, 32, 16):
+            for window in WINDOWS:
                 shortened[f"center{window}"] += int(len(raw) > window)
+                padded[f"center{window}"] += int(len(raw) < window)
         y = np.asarray(dataset.labels[ix], dtype=np.int64)
         np.add.at(support, y, 1)
         pred = {}
@@ -276,7 +327,7 @@ def worker(protocol: str, cache: str, checkpoint_root: str, outdir: str,
                                 "top5": float(top5[mode] / len(indices))} for mode in MODES},
               "delta_pp": {mode: 100 * (correct[mode].sum() - correct["original"].sum()) / len(indices)
                            for mode in MODES[1:]},
-              "paired_flips": flips, "clips_cropped": shortened,
+              "paired_flips": flips, "clips_cropped": shortened, "clips_padded": padded,
               "note": "A validation-only distribution-shift diagnostic; reframe training effect is unmeasured."}
     if not max_val_samples and saved.get("val_accuracy") is not None:
         if abs(result["scores"]["original"]["accuracy"] - float(saved["val_accuracy"])) > 1e-3:
