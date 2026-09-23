@@ -1,13 +1,49 @@
 """CPU checks for the validation-only framing intervention."""
 import unittest
+import json
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
 from . import preprocessing_corrected as pp
-from .validation_reframe import centered, variants
+from .validation_reframe import cache_location, centered, checkpoint_location, variants
 
 
 class CenteredWindowTest(unittest.TestCase):
+    def test_checkpoint_pair_is_checked_before_any_missing_cache_is_built(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("experiments.nestsar_sm_all_t16.validation_reframe._mounted_file_candidates",
+                       return_value=iter(())):
+                with self.assertRaisesRegex(FileNotFoundError, "Attach the saved Kaggle output"):
+                    checkpoint_location(root)
+            for protocol in ("xsub", "xset"):
+                target = root / protocol
+                target.mkdir()
+                (target / "best.msgpack").write_bytes(b"frozen-checkpoint")
+                (target / "best.json").write_text(json.dumps({
+                    "model": "NestSAR-SM-ALL-T16-v1", "pipeline_version": "p2-v3"}))
+            with patch("experiments.nestsar_sm_all_t16.validation_reframe._mounted_file_candidates",
+                       return_value=iter(())):
+                self.assertEqual(checkpoint_location(root), (root, "p2-v3"))
+
+    def test_only_matching_preprocessing_and_pipeline_cache_is_reused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "splits.json").write_text("{}")
+            (root / "manifest.json").write_text(json.dumps({"signature": {
+                "preprocessing": pp.VERSION, "cache_version": "other-pipeline"}}))
+            with patch("experiments.nestsar_sm_all_t16.validation_reframe._mounted_file_candidates",
+                       return_value=iter(())):
+                self.assertIsNone(cache_location(root, "p2-v3"))
+            (root / "manifest.json").write_text(json.dumps({"signature": {
+                "preprocessing": pp.VERSION, "cache_version": "p2-v3"}}))
+            with patch("experiments.nestsar_sm_all_t16.validation_reframe._mounted_file_candidates",
+                       return_value=iter(())):
+                self.assertEqual(cache_location(root, "p2-v3"), root)
+
     def test_short_clip_reuses_original_tokens_and_keeps_missing_actor_zero(self):
         raw = np.zeros((12, 2, 25, 3), np.float32)
         raw[:, 0, :, :] = [1.0, 2.0, 3.0]
