@@ -16,6 +16,7 @@ DEFAULTS = dict(
     consistency_weight=0.08, consistency_temperature=1.0,
     spatial_dim=24, model_dim=112, controller_dim=16, fast_rank=2, head_rank=2,
     sm_residual_scale=0.08, head_residual_scale=0.15,
+    attention_heads=4, attention_dropout=0.10, attention_aux_weight=0.20,
     fresh_augmentation=True, rotation_degrees=8.0, jitter_shift=1,
     min_delta=1e-6, progress_every=5, max_train_samples=0, max_val_samples=0,
     prefetch_batches=2,
@@ -33,7 +34,7 @@ def validate_config(config):
     for k in ("seed", "jitter_shift", "max_train_samples", "max_val_samples"):
         if not isinstance(c[k], int) or c[k] < 0:
             raise ValueError(f"{k} must be a nonnegative integer")
-    for k in ("dropout", "label_smoothing", "ema_decay"):
+    for k in ("dropout", "label_smoothing", "ema_decay", "attention_dropout"):
         if not 0 <= c[k] < 1:
             raise ValueError(f"Invalid {k}")
     if not 0 < c["warmup_fraction"] < 1 or c["consistency_temperature"] <= 0:
@@ -43,13 +44,15 @@ def validate_config(config):
     if not 0 <= c["rotation_degrees"] <= 20:
         raise ValueError("Keep yaw augmentation within 0..20 degrees")
     if any(c[k] < 0 for k in ("weight_decay", "stream_aux_weight", "consistency_weight",
-                              "min_delta", "sm_residual_scale", "head_residual_scale")):
+                              "attention_aux_weight", "min_delta", "sm_residual_scale",
+                              "head_residual_scale")):
         raise ValueError("Loss weights/weight decay/min_delta must be nonnegative")
     if c["prefetch_batches"] not in (1, 2):
         raise ValueError("prefetch_batches must be 1 or 2 to bound host memory")
-    for k in ("spatial_dim", "model_dim", "controller_dim", "fast_rank", "head_rank"):
+    for k in ("spatial_dim", "model_dim", "controller_dim", "fast_rank", "head_rank",
+              "attention_heads"):
         if c[k] != DEFAULTS[k]:
-            raise ValueError(f"Keep {k}={DEFAULTS[k]} for the unchanged SM-ALL experiment")
+            raise ValueError(f"Keep {k}={DEFAULTS[k]} for the fixed attention-supervisor experiment")
     return c
 
 
