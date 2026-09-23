@@ -23,13 +23,15 @@ from ..model import NestSARSMAllT16
 from ..preprocessing_corrected import FRAMES, FEATURES, VERSION as PREPROCESSING_VERSION
 from . import VERSION
 
-EXPECTED_PARAMS = 1_826_556
+EXPECTED_DEPLOY_PARAMS = 1_826_556
+EXPECTED_TRAIN_PARAMS = 1_893_428
 
 
 def make_model(config):
     return NestSARSMAllT16(**{k: config[k] for k in (
         "spatial_dim", "model_dim", "dropout", "controller_dim", "fast_rank",
-        "head_rank", "sm_residual_scale", "head_residual_scale")})
+        "head_rank", "sm_residual_scale", "head_residual_scale",
+        "attention_heads", "attention_dropout")})
 
 
 class State(train_state.TrainState):
@@ -51,16 +53,28 @@ def build_steps(model, config):
         main = (ce(out["logits"], y, smooth) + ce(aug["logits"], y, smooth)) / 2
         aux = (ce(out["stream_logits"], y[:, None], smooth).mean(1) +
                ce(aug["stream_logits"], y[:, None], smooth).mean(1)) / 2
+        attention_aux = (
+            ce(out["attention_aux_logits"], y, smooth)
+            + ce(aug["attention_aux_logits"], y, smooth)
+        ) / 2
         temperature = config["consistency_temperature"]
         logp = jax.nn.log_softmax(out["logits"] / temperature)
         logq = jax.nn.log_softmax(aug["logits"] / temperature)
         kl = 0.5 * temperature ** 2 * jnp.sum((jnp.exp(logp) - jnp.exp(logq)) * (logp - logq), -1)
-        loss = main + config["stream_aux_weight"] * aux + config["consistency_weight"] * kl
+        loss = (
+            main
+            + config["stream_aux_weight"] * aux
+            + config["consistency_weight"] * kl
+            + config["attention_aux_weight"] * attention_aux
+        )
         acc = (out["logits"].argmax(-1) == y).astype(jnp.float32)
         aug_acc = (aug["logits"].argmax(-1) == y).astype(jnp.float32)
         agreement = (out["logits"].argmax(-1) == aug["logits"].argmax(-1)).astype(jnp.float32)
-        return jnp.stack([loss, main, aux, kl, acc, aug_acc, agreement,
-                          out["sm_eta_mean"], out["sm_alpha_mean"]], axis=-1)
+        return jnp.stack(
+            [loss, main, aux, kl, attention_aux, acc, aug_acc, agreement,
+             out["sm_eta_mean"], out["sm_alpha_mean"]],
+            axis=-1,
+        )
 
     @jax.jit
     def train_step(state, key, batch):
@@ -84,7 +98,7 @@ def build_steps(model, config):
             (_, totals), gradients = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
             return (jax.tree.map(lambda a, b: a + b, gradient_sum, gradients), metric_sum + totals), None
 
-        (grads, metrics), _ = jax.lax.scan(accumulate, (zero, jnp.zeros(9)), (micros, drop_keys))
+        (grads, metrics), _ = jax.lax.scan(accumulate, (zero, jnp.zeros(10)), (micros, drop_keys))
         norm = optax.global_norm(grads)
         state = state.apply_gradients(grads=grads)
         ema = jax.tree.map(lambda e, p: config["ema_decay"] * e + (1 - config["ema_decay"]) * p,
@@ -117,10 +131,18 @@ def create_state(config, steps_per_epoch):
                            optax.adamw(schedule, weight_decay=config["weight_decay"]))
     model = make_model(config)
     key, init = jax.random.split(jax.random.PRNGKey(config["seed"]))
-    params = model.init({"params": init, "dropout": init}, jnp.zeros((1, FRAMES, FEATURES)), training=False)["params"]
+    # Initialize with training=True so the auxiliary attention parameters exist.
+    # Evaluation/deployment calls training=False, which skips the attention branch entirely.
+    params = model.init(
+        {"params": init, "dropout": init},
+        jnp.zeros((1, FRAMES, FEATURES)),
+        training=True,
+    )["params"]
     count = sum(x.size for x in jax.tree.leaves(params))
-    if count != EXPECTED_PARAMS:
-        raise RuntimeError(f"Model parameter mismatch: {count} != {EXPECTED_PARAMS}")
+    if count != EXPECTED_TRAIN_PARAMS:
+        raise RuntimeError(
+            f"Training-model parameter mismatch: {count} != {EXPECTED_TRAIN_PARAMS}"
+        )
     state = State.create(apply_fn=model.apply, params=params, tx=optimizer, ema_params=params)
     return model, state, key, schedule, int(math.ceil(warm / steps_per_epoch))
 
@@ -180,17 +202,28 @@ def publish_best(out, metadata):
         raise ValueError("Invalid best-checkpoint filename")
     payload = (out / name).read_bytes()
     atomic_bytes(out / "best.msgpack", payload)
-    atomic_json(out / "best.json", dict(model="NestSAR-SM-ALL-T16-v1",
-        epoch=metadata["best_epoch"], val_accuracy=metadata["best"], params=EXPECTED_PARAMS,
-        preprocessing_version=PREPROCESSING_VERSION, pipeline_version=VERSION,
-        config_hash=metadata["config_hash"]))
+    atomic_json(out / "best.json", dict(
+        model="NestSAR-SM-ALL-T16-TRAIN-ATTN-v1",
+        epoch=metadata["best_epoch"],
+        val_accuracy=metadata["best"],
+        deploy_params=EXPECTED_DEPLOY_PARAMS,
+        training_params=EXPECTED_TRAIN_PARAMS,
+        attention_training_only=True,
+        preprocessing_version=PREPROCESSING_VERSION,
+        pipeline_version=VERSION,
+        config_hash=metadata["config_hash"],
+    ))
 
 
 def write_result(out, protocol, metadata, digest, resumed=False):
-    result = {"model": "NestSAR-SM-ALL-T16-v1", "protocol": protocol,
+    result = {"model": "NestSAR-SM-ALL-T16-TRAIN-ATTN-v1", "protocol": protocol,
               "best_val_accuracy": metadata["best"], "best_accuracy": metadata["best"],
               "best_epoch": metadata["best_epoch"], "last_epoch": metadata["epoch"],
-              "epochs_run": metadata["epoch"], "params": EXPECTED_PARAMS,
+              "epochs_run": metadata["epoch"],
+              "params": EXPECTED_DEPLOY_PARAMS,
+              "deploy_params": EXPECTED_DEPLOY_PARAMS,
+              "training_params": EXPECTED_TRAIN_PARAMS,
+              "attention_training_only": True,
               "backend": jax.default_backend(), "devices": [str(d) for d in jax.local_devices()],
               "config_hash": digest, "checkpoint": str(out / "best.msgpack"),
               "preprocessing_version": PREPROCESSING_VERSION, "pipeline_version": VERSION,
@@ -223,8 +256,14 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
         raise ValueError("Empty train/validation split")
     batch_size = config["micro_batch"] * config["accumulation_steps"]
     steps = math.ceil(len(train_ids) / batch_size)
-    signature = {"config": config, "protocol": protocol, "cache": dataset.meta["signature"],
-                 "parameters": EXPECTED_PARAMS, "pipeline_version": VERSION}
+    signature = {
+        "config": config,
+        "protocol": protocol,
+        "cache": dataset.meta["signature"],
+        "deploy_parameters": EXPECTED_DEPLOY_PARAMS,
+        "training_parameters": EXPECTED_TRAIN_PARAMS,
+        "pipeline_version": VERSION,
+    }
     digest = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
     previous = read_json(out / "run_config.json")
     if previous is not None and previous != signature:
@@ -254,7 +293,8 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
         epoch_t0 = time.perf_counter()
         report(phase="Train", epoch=epoch, current=0, total=steps, val_acc=None,
                best=metadata["best"] if metadata["best_epoch"] else None, best_epoch=metadata["best_epoch"])
-        train_sum = np.zeros(10, np.float64)
+        # 10 per-sample metrics + sample-count denominator.
+        train_sum = np.zeros(11, np.float64)
         timing = {"prepare_service_s": 0.0, "data_wait_s": 0.0, "h2d_s": 0.0,
                   "gpu_train_s": 0.0, "gpu_eval_s": 0.0, "compile_train_s": 0.0,
                   "compile_eval_s": 0.0, "warmup_train_s": 0.0, "warmup_eval_s": 0.0}
@@ -284,12 +324,21 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
                 values = np.asarray(metrics)
                 if not np.isfinite(values).all():
                     raise FloatingPointError(f"Nonfinite training values at epoch {epoch}, batch {index + 1}")
-                train_sum += values[:10]
+                train_sum += values[:11]
                 if index % config["progress_every"] == 0 or index + 1 == steps:
-                    report(phase="Train", current=index+1, total=steps, loss=float(train_sum[0] / train_sum[9]),
-                           train_acc=float(train_sum[4] / train_sum[9]), **memory_snapshot(),
-                           lr=float(schedule(state.step)), wait_s=timing["data_wait_s"], gpu_s=timing["gpu_train_s"])
-        if int(train_sum[9]) != len(train_ids):
+                    report(
+                        phase="Train",
+                        current=index + 1,
+                        total=steps,
+                        loss=float(train_sum[0] / train_sum[10]),
+                        train_acc=float(train_sum[5] / train_sum[10]),
+                        attention_aux=float(train_sum[4] / train_sum[10]),
+                        **memory_snapshot(),
+                        lr=float(schedule(state.step)),
+                        wait_s=timing["data_wait_s"],
+                        gpu_s=timing["gpu_train_s"],
+                    )
+        if int(train_sum[10]) != len(train_ids):
             raise RuntimeError("Training sample accounting mismatch")
         eval_sum = np.zeros(7, np.float64)
         val_steps = math.ceil(len(val_ids) / config["eval_batch"])
@@ -324,8 +373,16 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
         val = float(eval_sum[1] / eval_sum[6])
         best, bad, improved = stopping_update(metadata["best"], metadata["bad_epochs"], val, epoch,
                                              warmup_epochs, config["min_delta"])
-        row = {"epoch": epoch, "train_loss": float(train_sum[0]/train_sum[9]),
-               "train_acc": float(train_sum[4]/train_sum[9]), "augmented_train_acc": float(train_sum[5]/train_sum[9]),
+        row = {
+               "epoch": epoch,
+               "train_loss": float(train_sum[0] / train_sum[10]),
+               "train_main_loss": float(train_sum[1] / train_sum[10]),
+               "train_stream_aux_loss": float(train_sum[2] / train_sum[10]),
+               "train_consistency_loss": float(train_sum[3] / train_sum[10]),
+               "train_attention_aux_loss": float(train_sum[4] / train_sum[10]),
+               "train_acc": float(train_sum[5] / train_sum[10]),
+               "augmented_train_acc": float(train_sum[6] / train_sum[10]),
+               "train_view_agreement": float(train_sum[7] / train_sum[10]),
                "val_loss": float(eval_sum[0]/eval_sum[6]), "val_acc": val,
                "val_main_acc": float(eval_sum[2]/eval_sum[6]), "val_top5": float(eval_sum[3]/eval_sum[6]),
                "eta": float(eval_sum[4]/eval_sum[6]), "alpha": float(eval_sum[5]/eval_sum[6]),
@@ -336,8 +393,15 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
         report(phase="Save checkpoint", current=1, total=1)
         if improved:
             metadata.update(best_epoch=epoch, best_checkpoint=f"best_epoch_{epoch:04d}.msgpack")
-            best_payload = {"model": "NestSAR-SM-ALL-T16-v1", "protocol": protocol, "epoch": epoch,
-                            "val_accuracy": val, "ema_params": jax.device_get(state.ema_params),
+            best_payload = {
+                            "model": "NestSAR-SM-ALL-T16-TRAIN-ATTN-v1",
+                            "protocol": protocol,
+                            "epoch": epoch,
+                            "val_accuracy": val,
+                            "ema_params": jax.device_get(state.ema_params),
+                            "deploy_params": EXPECTED_DEPLOY_PARAMS,
+                            "training_params": EXPECTED_TRAIN_PARAMS,
+                            "attention_training_only": True,
                             "config": config, "preprocessing_version": PREPROCESSING_VERSION,
                             "pipeline_version": VERSION, "cache_signature": dataset.meta["signature"],
                             "train_samples": len(train_ids), "val_samples": len(val_ids)}
