@@ -11,7 +11,7 @@ from ..compute_unrolled_audit import UnrolledGatedSweep, UnrolledFastWeightDelta
 from experiments.m4_motionpreserve_t16 import train_m4_motionpreserve_t16_tpu as base
 from .io_utils import atomic_json
 from .launch import validate_config
-from .worker import make_model, EXPECTED_PARAMS
+from .worker import make_model, EXPECTED_DEPLOY_PARAMS
 
 
 def audit_model(model, params):
@@ -48,8 +48,10 @@ def main():
     model = make_model(config)
     params = model.init({"params": jax.random.PRNGKey(128)}, jnp.zeros((1,16,750)), training=False)["params"]
     result = audit_model(model, params)
-    if result["params"] != EXPECTED_PARAMS:
-        raise RuntimeError("SM-ALL parameter count changed")
+    if result["params"] != EXPECTED_DEPLOY_PARAMS:
+        raise RuntimeError(
+            f"Deploy parameter count changed: {result['params']} != {EXPECTED_DEPLOY_PARAMS}"
+        )
     atomic_json(args.output, result)
 
 
