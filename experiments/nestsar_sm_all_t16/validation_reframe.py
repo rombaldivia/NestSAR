@@ -1,4 +1,4 @@
-"""Paired, inference-only centered-window audit of an existing P2 checkpoint.
+"""Paired, inference-only centered-window audit of an existing P2 or G4 checkpoint.
 
 Run this file through runpy.run_path with NESTSAR_REFRAME_SETTINGS in Kaggle, or
 use --worker for a single isolated protocol/GPU. Never initializes an optimizer.
@@ -21,10 +21,14 @@ from . import preprocessing_corrected as pp
 from .streaming.io_utils import Reporter, atomic_json
 
 MODES = ("original", "center64", "center32", "center16")
-EXPECTED_PARAMS = 1_826_556
-DEFAULT_CHECKPOINTS = "/kaggle/working/NestSAR_SM_ALL_T16_PERSON_AWARE_P2_v3"
-DEFAULT_CACHE = "/kaggle/working/NestSAR_SM_ALL_PERSON_AWARE_P2_CACHE_v3"
-DEFAULT_OUT = "/kaggle/working/NestSAR_P2_VALIDATION_REFRAME_v1"
+MODEL_PARAMS = {
+    "NestSAR-SM-ALL-T16-v1": 1_826_556,
+    "NestSAR-SM-ALL-T16-TRAIN-ATTN-v1": 1_826_556,
+    "NestSAR-SM-ALL-T16-G4-MOMENTS-v1": 1_827_452,
+}
+DEFAULT_CHECKPOINTS = "/kaggle/working/NestSAR_G4_TEMPORAL_MOMENTS_T16_FULL_OFFICIAL"
+DEFAULT_CACHE = "/kaggle/working/NestSAR_G4_TEMPORAL_MOMENTS_T16_CACHE"
+DEFAULT_OUT = "/kaggle/working/NestSAR_G4_VALIDATION_REFRAME_v1"
 
 
 class FrozenCache:
@@ -45,7 +49,7 @@ class FrozenCache:
         self.labels = np.load(path / "labels.npy", mmap_mode="r")
         self.splits = json.loads((path / "splits.json").read_text())
         if len(self.labels) != self.meta["samples"] or self.canonical.shape != (len(self.labels), 16, 750):
-            raise ValueError("Cache shape does not match P2 token contract")
+            raise ValueError("Cache shape does not match T16 token contract")
 
     def sample(self, index: int) -> np.ndarray:
         frames, people = map(int, self.shape[index])
@@ -79,10 +83,13 @@ def checkpoint_location(preferred: Path) -> tuple[Path, str]:
         if not all(path.is_file() for path in meta):
             continue
         values = [json.loads(path.read_text()) for path in meta]
-        if (values[0].get("model") not in
-                ("NestSAR-SM-ALL-T16-v1", "NestSAR-SM-ALL-T16-TRAIN-ATTN-v1")):
+        if values[0].get("model") not in MODEL_PARAMS:
             continue
         if values[0].get("model") != values[1].get("model"):
+            continue
+        if any(value.get("params") != MODEL_PARAMS[values[0]["model"]] for value in values):
+            continue
+        if any(value.get("preprocessing_version") != pp.VERSION for value in values):
             continue
         versions = [value.get("pipeline_version") for value in values]
         if versions[0] is None or versions[0] != versions[1]:
@@ -94,7 +101,7 @@ def checkpoint_location(preferred: Path) -> tuple[Path, str]:
         return candidates[0]
     found = "\n".join(f"  {root}" for root, _ in candidates) or "  none"
     raise FileNotFoundError(
-        "Frozen P2 XSUB and XSET best.msgpack + best.json were not found as a pair. "
+        "Frozen compatible XSUB and XSET best.msgpack + best.json were not found as a pair. "
         "Attach the saved Kaggle output containing both protocol checkpoints, "
         "then set checkpoint_root to that directory. Candidate roots:\n" + found
     )
@@ -156,7 +163,6 @@ def worker(protocol: str, cache: str, checkpoint_root: str, outdir: str,
     import jax.numpy as jnp
     from flax import serialization
 
-    from .model import NestSARSMAllT16
     if not allow_cpu and (jax.default_backend() != "gpu" or jax.local_device_count() != 1):
         raise RuntimeError(f"Expected one isolated GPU for {protocol}: {jax.devices()}")
     dataset = FrozenCache(cache)
@@ -167,14 +173,26 @@ def worker(protocol: str, cache: str, checkpoint_root: str, outdir: str,
         raise RuntimeError(f"No validation samples for {protocol}")
     checkpoint = Path(checkpoint_root) / protocol / "best.msgpack"
     if not checkpoint.is_file():
-        raise FileNotFoundError(f"Existing P2 EMA checkpoint required: {checkpoint}")
+        raise FileNotFoundError(f"Existing EMA checkpoint required: {checkpoint}")
     payload = serialization.msgpack_restore(checkpoint.read_bytes())
-    if payload.get("model") not in ("NestSAR-SM-ALL-T16-v1", "NestSAR-SM-ALL-T16-TRAIN-ATTN-v1"):
-        raise ValueError(f"Expected P2/P2 attention-supervised checkpoint, got {payload.get('model')!r}")
+    model_name = payload.get("model")
+    if model_name not in MODEL_PARAMS:
+        raise ValueError(f"Unsupported checkpoint model: {model_name!r}")
     if payload.get("protocol") != protocol or payload.get("preprocessing_version") != pp.VERSION:
         raise ValueError("Checkpoint protocol/preprocessing does not match this audit")
     if payload.get("cache_signature") != dataset.meta["signature"]:
         raise ValueError("Checkpoint was trained on a different raw/cache representation")
+    saved_meta = json.loads((checkpoint.parent / "best.json").read_text())
+    if (saved_meta.get("model") != model_name
+            or saved_meta.get("pipeline_version") != payload.get("pipeline_version")
+            or saved_meta.get("params") != MODEL_PARAMS[model_name]):
+        raise ValueError("Checkpoint and best.json model/pipeline/parameter identity differ")
+    if model_name == "NestSAR-SM-ALL-T16-G4-MOMENTS-v1":
+        # Exact source from experiment/nestsar-g4-temporal-moments-t16; keep the
+        # trained G4 chunker/parameter names, without touching the P2 model.
+        from .model_g4_moments import NestSARSMAllT16
+    else:
+        from .model import NestSARSMAllT16
     config = payload["config"]
     model = NestSARSMAllT16(**{k: config[k] for k in (
         "spatial_dim", "model_dim", "dropout", "controller_dim", "fast_rank",
@@ -186,13 +204,13 @@ def worker(protocol: str, cache: str, checkpoint_root: str, outdir: str,
         if "training_attention_supervisor" not in params:
             raise ValueError("Attention-trained checkpoint lacks its training-only parameter subtree")
         del params["training_attention_supervisor"]
-    if sum(int(x.size) for x in jax.tree.leaves(params)) != EXPECTED_PARAMS:
-        raise ValueError("This audit accepts only the verified P2 deploy graph")
+    if sum(int(x.size) for x in jax.tree.leaves(params)) != MODEL_PARAMS[model_name]:
+        raise ValueError(f"Parameter count does not match {model_name}")
 
     out = Path(outdir) / protocol
     out.mkdir(parents=True, exist_ok=True)
     report = Reporter(out / "status.json")
-    report(phase="Validating frozen P2", current=0, total=len(indices), checkpoint=str(checkpoint))
+    report(phase="Validating frozen model", current=0, total=len(indices), checkpoint=str(checkpoint))
     infer = jax.jit(lambda p, x: model.apply({"params": p}, x, training=False)["logits"])
     params = jax.device_put(params)
     correct = {mode: np.zeros(120, np.int64) for mode in MODES}
@@ -251,7 +269,7 @@ def worker(protocol: str, cache: str, checkpoint_root: str, outdir: str,
 
     baseline = Path(checkpoint_root) / protocol / "best.json"
     saved = json.loads(baseline.read_text()) if baseline.is_file() else {}
-    result = {"protocol": protocol, "count": len(indices), "checkpoint": str(checkpoint),
+    result = {"protocol": protocol, "model": model_name, "count": len(indices), "checkpoint": str(checkpoint),
               "epoch": int(payload["epoch"]), "frozen": True, "training": False,
               "best_json_accuracy": saved.get("val_accuracy"),
               "scores": {mode: {"accuracy": float(correct[mode].sum() / len(indices)),
@@ -284,6 +302,7 @@ def launch(settings: dict) -> dict:
     if batch_size < 1 or max_val_samples < 0:
         raise ValueError("Invalid batch size or validation cap")
     checkpoint_root, pipeline_version = checkpoint_location(requested_checkpoints)
+    model_name = json.loads((checkpoint_root / "xsub" / "best.json").read_text())["model"]
     cache = cache_location(requested_cache, pipeline_version)
     if cache is None and str(requested_cache).startswith("/kaggle/input/"):
         raise ValueError("Cache is absent and /kaggle/input is read-only; use a /kaggle/working cache path")
@@ -335,9 +354,9 @@ def launch(settings: dict) -> dict:
             total = max_val_samples or len(splits[f"{protocol}_val"])
             if i < len(bars):
                 bars[i].reset(total=total)
-                bars[i].set_description_str(f"{protocol.upper()} GPU{i} frozen P2", refresh=False)
+                bars[i].set_description_str(f"{protocol.upper()} GPU{i} frozen {model_name}", refresh=False)
             else:
-                bars.append(tqdm(total=total, desc=f"{protocol.upper()} GPU{i} frozen P2",
+                bars.append(tqdm(total=total, desc=f"{protocol.upper()} GPU{i} frozen {model_name}",
                                  position=i, leave=True))
         root = Path(__file__).resolve().parents[2]
         command = [sys.executable, "-u", "-m", "experiments.nestsar_sm_all_t16.validation_reframe",
