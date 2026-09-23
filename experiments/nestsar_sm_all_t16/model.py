@@ -13,7 +13,9 @@ problems without changing the parameter count:
     presence indicators.
 
 The proven J/B/JM/BM -> M4 -> cross-stream router -> G4 topology is retained.
-No attention, GCN, TCN, Transformer, or T x T operation is introduced.
+G4 now receives a motion-preserving T16->T4 chunk representation (mean + temporal
+trend + curvature) instead of a plain four-frame mean. No attention, GCN, TCN,
+Transformer, or T x T operation is introduced.
 """
 
 from typing import Mapping
@@ -331,6 +333,79 @@ class SelfModBiMemory(nn.Module):
         )
 
 
+class MotionPreservingChunker(nn.Module):
+    """Compress each four-frame M4 group without discarding temporal direction.
+
+    The historical G4 input was a plain four-frame mean.  The causal audit showed
+    that this preserves pose/bone streams well but discards substantially more
+    within-chunk variation from the two motion streams.  This replacement keeps
+    the same T4 x D G4 contract and augments the mean with two fixed orthogonal
+    temporal moments:
+
+      mean  = (x0 + x1 + x2 + x3) / 4
+      trend = (-3*x0 - x1 + x2 + 3*x3) / sqrt(20)
+      curve = (x0 - x1 - x2 + x3) / 2
+
+    Two bounded learned per-channel gates control the trend and curvature terms.
+    For D=112 this adds only 224 parameters per stream (896 total).
+    """
+
+    dim: int = 112
+    trend_max: float = 0.50
+    curve_max: float = 0.25
+
+    @nn.compact
+    def __call__(self, frame_h: jnp.ndarray) -> jnp.ndarray:
+        if frame_h.ndim != 3:
+            raise ValueError(f"Expected [B,T,D], got {frame_h.shape}")
+        if frame_h.shape[1] != FRAMES:
+            raise ValueError(f"Expected T={FRAMES}, got {frame_h.shape}")
+        if frame_h.shape[-1] != self.dim:
+            raise ValueError(f"Expected D={self.dim}, got {frame_h.shape}")
+
+        x = frame_h.reshape(
+            frame_h.shape[0],
+            4,
+            FRAMES // 4,
+            self.dim,
+        )
+        x0, x1, x2, x3 = x[:, :, 0], x[:, :, 1], x[:, :, 2], x[:, :, 3]
+
+        mean = 0.25 * (x0 + x1 + x2 + x3)
+        trend = (-3.0 * x0 - x1 + x2 + 3.0 * x3) / jnp.sqrt(
+            jnp.asarray(20.0, dtype=frame_h.dtype)
+        )
+        curve = 0.5 * (x0 - x1 - x2 + x3)
+
+        trend_logit = self.param(
+            "trend_logit",
+            nn.initializers.zeros,
+            (self.dim,),
+        )
+        curve_logit = self.param(
+            "curve_logit",
+            nn.initializers.zeros,
+            (self.dim,),
+        )
+
+        # Non-zero initialization avoids another controller-style bootstrap delay.
+        trend_gain = self.trend_max * jax.nn.sigmoid(trend_logit)
+        curve_gain = self.curve_max * jax.nn.sigmoid(curve_logit)
+
+        chunks = (
+            mean
+            + trend_gain[None, None, :] * trend
+            + curve_gain[None, None, :] * curve
+        )
+
+        # Parameter-free normalization preserves the original G4 scale contract.
+        return nn.LayerNorm(
+            use_scale=False,
+            use_bias=False,
+            name="chunk_norm",
+        )(chunks)
+
+
 class SelfModDescriptorHead(nn.Module):
     dim: int = 112
     dropout: float = 0.10
@@ -348,12 +423,10 @@ class SelfModDescriptorHead(nn.Module):
         if frame_h.shape[1] != FRAMES:
             raise ValueError(f"Expected T={FRAMES}, got {frame_h.shape}")
 
-        chunks = frame_h.reshape(
-            frame_h.shape[0],
-            4,
-            FRAMES // 4,
-            self.dim,
-        ).mean(axis=2)
+        chunks = MotionPreservingChunker(
+            dim=self.dim,
+            name="motion_preserving_chunker",
+        )(frame_h)
 
         chunks = SelfModBiMemory(
             self.dim,
