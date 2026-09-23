@@ -23,7 +23,7 @@ from ..model import NestSARSMAllT16
 from ..preprocessing_corrected import FRAMES, FEATURES, VERSION as PREPROCESSING_VERSION
 from . import VERSION
 
-EXPECTED_PARAMS = 1_826_556
+EXPECTED_PARAMS = 1_827_452
 
 
 def make_model(config):
@@ -180,14 +180,14 @@ def publish_best(out, metadata):
         raise ValueError("Invalid best-checkpoint filename")
     payload = (out / name).read_bytes()
     atomic_bytes(out / "best.msgpack", payload)
-    atomic_json(out / "best.json", dict(model="NestSAR-SM-ALL-T16-v1",
+    atomic_json(out / "best.json", dict(model="NestSAR-SM-ALL-T16-G4-MOMENTS-v1",
         epoch=metadata["best_epoch"], val_accuracy=metadata["best"], params=EXPECTED_PARAMS,
         preprocessing_version=PREPROCESSING_VERSION, pipeline_version=VERSION,
         config_hash=metadata["config_hash"]))
 
 
 def write_result(out, protocol, metadata, digest, resumed=False):
-    result = {"model": "NestSAR-SM-ALL-T16-v1", "protocol": protocol,
+    result = {"model": "NestSAR-SM-ALL-T16-G4-MOMENTS-v1", "protocol": protocol,
               "best_val_accuracy": metadata["best"], "best_accuracy": metadata["best"],
               "best_epoch": metadata["best_epoch"], "last_epoch": metadata["epoch"],
               "epochs_run": metadata["epoch"], "params": EXPECTED_PARAMS,
@@ -336,7 +336,7 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
         report(phase="Save checkpoint", current=1, total=1)
         if improved:
             metadata.update(best_epoch=epoch, best_checkpoint=f"best_epoch_{epoch:04d}.msgpack")
-            best_payload = {"model": "NestSAR-SM-ALL-T16-v1", "protocol": protocol, "epoch": epoch,
+            best_payload = {"model": "NestSAR-SM-ALL-T16-G4-MOMENTS-v1", "protocol": protocol, "epoch": epoch,
                             "val_accuracy": val, "ema_params": jax.device_get(state.ema_params),
                             "config": config, "preprocessing_version": PREPROCESSING_VERSION,
                             "pipeline_version": VERSION, "cache_signature": dataset.meta["signature"],
