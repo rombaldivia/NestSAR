@@ -1,6 +1,9 @@
 """CPU checks for the validation-only framing intervention."""
 import unittest
 import json
+import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -12,6 +15,19 @@ from .validation_reframe import cache_location, centered, checkpoint_location, v
 
 
 class CenteredWindowTest(unittest.TestCase):
+    def test_worker_import_ignores_shadow_package_in_notebook_directory(self):
+        checkout = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            fake = Path(directory) / "experiments"
+            fake.mkdir()
+            (fake / "__init__.py").write_text("")
+            env = dict(os.environ, PYTHONPATH=str(checkout))
+            command = [sys.executable, "-m", "experiments.nestsar_sm_all_t16.validation_reframe", "--help"]
+            shadowed = subprocess.run(command, cwd=directory, env=env, capture_output=True, text=True)
+            self.assertNotEqual(shadowed.returncode, 0)
+            resolved = subprocess.run(command, cwd=checkout, env=env, capture_output=True, text=True)
+            self.assertEqual(resolved.returncode, 0, resolved.stderr)
+
     def test_checkpoint_pair_is_checked_before_any_missing_cache_is_built(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
