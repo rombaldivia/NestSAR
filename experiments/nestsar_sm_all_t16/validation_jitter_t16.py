@@ -16,13 +16,98 @@ import numpy as np
 from . import preprocessing_corrected as pp
 from .streaming.io_utils import Reporter, atomic_json
 from .validation_reframe import (FrozenCache, MODEL_PARAMS, cache_location,
-                                 checkpoint_location, dataset_location)
+                                 dataset_location)
 
 PROTOCOLS = ("xsub", "xset")
 VIEWS = ("original", "early", "late")
 MODES = (*VIEWS, "mean3", "anchored")
 DEFAULT_CHECKPOINTS = "/kaggle/working/NestSAR_SM_ALL_T16_PREPROCESS_V2"
 DEFAULT_OUT = "/kaggle/working/NestSAR_T16_WHOLE_CLIP_JITTER_AUDIT"
+
+
+def checkpoint_file(root: Path, protocol: str) -> Path | None:
+    """Use the public best alias, or its exact saved epoch if the alias is absent."""
+    folder = root / protocol
+    public = folder / "best.msgpack"
+    if public.is_file():
+        return public
+    sidecar = folder / "best.json"
+    if sidecar.is_file():
+        try:
+            epoch = int(json.loads(sidecar.read_text())["epoch"])
+        except (ValueError, TypeError, KeyError):
+            return None
+        if epoch >= 0:
+            candidate = folder / f"best_epoch_{epoch:04d}.msgpack"
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def _checkpoint_payload(path: Path) -> dict:
+    from flax import serialization
+    return serialization.msgpack_restore(path.read_bytes())
+
+
+def checkpoint_location(preferred: Path) -> tuple[Path, str]:
+    """Find frozen weights by their payload even when best.json is absent."""
+    roots = [preferred]
+    seen = []
+    for base in (Path("/kaggle/working"), Path("/kaggle/input")):
+        if base.exists():
+            for pattern in ("best.msgpack", "best_epoch_*.msgpack"):
+                for path in base.rglob(pattern):
+                    seen.append(path)
+                    if path.parent.name in PROTOCOLS:
+                        roots.append(path.parent.parent)
+    candidates = []
+    rejected = []
+    for root in dict.fromkeys(roots):
+        pair = [checkpoint_file(root, protocol) for protocol in PROTOCOLS]
+        if not all(pair):
+            if root == preferred or any((root / p).exists() for p in PROTOCOLS):
+                rejected.append(f"{root}: missing " + ", ".join(
+                    p for p, path in zip(PROTOCOLS, pair) if path is None))
+            continue
+        try:
+            payloads = [_checkpoint_payload(path) for path in pair]
+            names = [item.get("model") for item in payloads]
+            versions = [item.get("pipeline_version") for item in payloads]
+            if (names[0] not in MODEL_PARAMS or names[1] != names[0]
+                    or versions[0] is None or versions[1] != versions[0]
+                    or any(item.get("protocol") != protocol for item, protocol in zip(payloads, PROTOCOLS))
+                    or any(item.get("preprocessing_version") != pp.VERSION for item in payloads)):
+                raise ValueError("checkpoint payloads disagree on model, protocol, or preprocessing")
+            for path, payload in zip(pair, payloads):
+                sidecar = path.parent / "best.json"
+                if sidecar.is_file():
+                    meta = json.loads(sidecar.read_text())
+                    for key in ("model", "pipeline_version", "preprocessing_version"):
+                        if key in meta and meta[key] != payload.get(key):
+                            raise ValueError(f"{sidecar}: {key} disagrees with weights")
+                    if "params" in meta and meta["params"] != MODEL_PARAMS[names[0]]:
+                        raise ValueError(f"{sidecar}: parameter count disagrees with model")
+            candidates.append((root, versions[0]))
+        except (OSError, ValueError, KeyError) as exc:
+            rejected.append(f"{root}: {exc}")
+    for root, version in candidates:
+        if root == preferred:
+            return root, version
+    if len(candidates) == 1:
+        return candidates[0]
+    summary = "\n".join(f"  {path}" for path in seen[:24]) or "  none"
+    why = "\n".join(f"  {reason}" for reason in rejected[:12]) or "  none"
+    valid = "\n".join(f"  {root}" for root, _ in candidates) or "  none"
+    raise FileNotFoundError(
+        "No unique compatible XSUB/XSET frozen checkpoint pair is available in this "
+        "Kaggle session. Earlier /kaggle/working sessions are not mounted automatically. "
+        "If the checkpoint files are absent, attach the saved training notebook "
+        "output using Add Input; then set checkpoint_root to its parent directory."
+        f"\nRequested root: {preferred}"
+        f"\nVisible weight files:\n{summary}"
+        f"\nRejected roots:\n{why}"
+        f"\nCompatible roots:\n{valid}"
+    )
 
 
 class FixedBoundaryShift:
@@ -82,15 +167,19 @@ def evaluate(protocol: str, checkpoint_root: Path, cache: Path | None,
 
     if not allow_cpu and (jax.default_backend() != "gpu" or jax.local_device_count() != 1):
         raise RuntimeError(f"Expected one isolated GPU for {protocol}; got {jax.devices()}")
-    checkpoint = checkpoint_root / protocol / "best.msgpack"
+    checkpoint = checkpoint_file(checkpoint_root, protocol)
+    if checkpoint is None:
+        raise FileNotFoundError(f"No saved best checkpoint for {protocol} in {checkpoint_root}")
     payload = serialization.msgpack_restore(checkpoint.read_bytes())
-    meta = json.loads((checkpoint_root / protocol / "best.json").read_text())
+    sidecar = checkpoint.parent / "best.json"
+    meta = json.loads(sidecar.read_text()) if sidecar.is_file() else {}
     name = payload.get("model")
     if name not in MODEL_PARAMS:
         raise ValueError(f"Unsupported model: {name!r}")
     if (payload.get("protocol") != protocol or payload.get("preprocessing_version") != pp.VERSION
-            or meta.get("model") != name or meta.get("params") != MODEL_PARAMS[name]
-            or meta.get("pipeline_version") != payload.get("pipeline_version")):
+            or meta.get("model", name) != name
+            or meta.get("params", MODEL_PARAMS[name]) != MODEL_PARAMS[name]
+            or meta.get("pipeline_version", payload.get("pipeline_version")) != payload.get("pipeline_version")):
         raise ValueError("Checkpoint protocol, preprocessing, model, or parameters do not match")
     if cache is not None:
         dataset = FrozenCache(str(cache))
@@ -158,9 +247,10 @@ def evaluate(protocol: str, checkpoint_root: Path, cache: Path | None,
         report(phase="Frozen whole-clip T16 inference", current=offset + n, total=len(indices),
                scores={mode: float(correct[mode].sum() / (offset + n)) for mode in MODES})
     baseline = float(correct["original"].sum() / len(indices))
-    if meta.get("val_accuracy") is not None and abs(baseline - float(meta["val_accuracy"])) > 0.001:
+    saved_accuracy = meta.get("val_accuracy", payload.get("val_accuracy"))
+    if saved_accuracy is not None and abs(baseline - float(saved_accuracy)) > 0.001:
         raise RuntimeError(f"Baseline {baseline:.6f} differs from checkpoint score "
-                           f"{meta['val_accuracy']:.6f}; check data and checkpoint identity")
+                           f"{saved_accuracy:.6f}; check data and checkpoint identity")
     with (target / "sample_predictions.csv").open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["sample_id", "label", *(f"pred_{mode}" for mode in MODES)])
