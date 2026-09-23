@@ -6,6 +6,7 @@ use --worker for a single isolated protocol/GPU. Never initializes an optimizer.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import os
@@ -56,6 +57,79 @@ class FrozenCache:
         result = np.zeros((frames, 2, 25, 3), np.float32)
         result[:, 0] = raw[:, 0]
         return result
+
+
+def _mounted_file_candidates(filename: str):
+    """Search current Kaggle attachments and working files without loading them."""
+    for base in (Path("/kaggle/input"), Path("/kaggle/working")):
+        if base.exists():
+            yield from sorted(base.rglob(filename))
+
+
+def checkpoint_location(preferred: Path) -> tuple[Path, str]:
+    """Find both frozen protocol weights before doing any cache work."""
+    roots = [preferred]
+    roots.extend(path.parent.parent for path in _mounted_file_candidates("best.msgpack")
+                 if path.parent.name == "xsub")
+    candidates = []
+    for root in dict.fromkeys(roots):
+        if not all((root / p / "best.msgpack").is_file() for p in ("xsub", "xset")):
+            continue
+        meta = [root / p / "best.json" for p in ("xsub", "xset")]
+        if not all(path.is_file() for path in meta):
+            continue
+        values = [json.loads(path.read_text()) for path in meta]
+        if (values[0].get("model") not in
+                ("NestSAR-SM-ALL-T16-v1", "NestSAR-SM-ALL-T16-TRAIN-ATTN-v1")):
+            continue
+        if values[0].get("model") != values[1].get("model"):
+            continue
+        versions = [value.get("pipeline_version") for value in values]
+        if versions[0] is None or versions[0] != versions[1]:
+            continue
+        candidates.append((root, versions[0]))
+    if preferred in (root for root, _ in candidates):
+        return next(pair for pair in candidates if pair[0] == preferred)
+    if len(candidates) == 1:
+        return candidates[0]
+    found = "\n".join(f"  {root}" for root, _ in candidates) or "  none"
+    raise FileNotFoundError(
+        "Frozen P2 XSUB and XSET best.msgpack + best.json were not found as a pair. "
+        "Attach the saved Kaggle output containing both protocol checkpoints, "
+        "then set checkpoint_root to that directory. Candidate roots:\n" + found
+    )
+
+
+def cache_location(preferred: Path, pipeline_version: str) -> Path | None:
+    roots = [preferred]
+    roots.extend(path.parent for path in _mounted_file_candidates("manifest.json"))
+    for root in dict.fromkeys(roots):
+        marker = root / "manifest.json"
+        if not marker.is_file() or not (root / "splits.json").is_file():
+            continue
+        try:
+            signature = json.loads(marker.read_text())["signature"]
+        except (ValueError, KeyError):
+            continue
+        if (signature.get("preprocessing") == pp.VERSION
+                and signature.get("cache_version") == pipeline_version):
+            return root
+    return None
+
+
+def dataset_location(explicit: str | None) -> Path:
+    if explicit:
+        path = Path(explicit)
+        if not path.is_file():
+            raise FileNotFoundError(f"NTU120 pickle not found: {path}")
+        return path
+    matches = list(_mounted_file_candidates("ntu120_3danno.pkl"))
+    if len(matches) != 1:
+        raise FileNotFoundError(
+            f"Compatible cache absent and found {len(matches)} NTU120 pickles. "
+            "Attach the dataset or set dataset to its exact path."
+        )
+    return matches[0]
 
 
 def centered(x: np.ndarray, window: int) -> np.ndarray:
@@ -197,36 +271,79 @@ def worker(protocol: str, cache: str, checkpoint_root: str, outdir: str,
 def launch(settings: dict) -> dict:
     from tqdm.auto import tqdm
 
-    allowed = {"cache", "checkpoint_root", "outdir", "batch_size", "max_val_samples", "allow_cpu"}
+    allowed = {"cache", "checkpoint_root", "dataset", "outdir", "batch_size", "max_val_samples", "allow_cpu"}
     unknown = set(settings) - allowed
     if unknown:
         raise ValueError(f"Unknown settings: {sorted(unknown)}")
-    cache = Path(settings.get("cache", DEFAULT_CACHE))
-    checkpoint_root = Path(settings.get("checkpoint_root", DEFAULT_CHECKPOINTS))
+    requested_cache = Path(settings.get("cache", DEFAULT_CACHE))
+    requested_checkpoints = Path(settings.get("checkpoint_root", DEFAULT_CHECKPOINTS))
     out = Path(settings.get("outdir", DEFAULT_OUT))
     batch_size = int(settings.get("batch_size", 128))
     max_val_samples = int(settings.get("max_val_samples", 0))
     allow_cpu = bool(settings.get("allow_cpu", False))
     if batch_size < 1 or max_val_samples < 0:
         raise ValueError("Invalid batch size or validation cap")
-    if not (cache / "manifest.json").is_file():
-        raise FileNotFoundError(f"Existing P2 cache required: {cache}")
-    splits = json.loads((cache / "splits.json").read_text())
-    for protocol in ("xsub", "xset"):
-        if not (checkpoint_root / protocol / "best.msgpack").is_file():
-            raise FileNotFoundError(f"Missing {protocol} P2 checkpoint in {checkpoint_root}")
-        if len(splits[f"{protocol}_val"]) not in (50919, 59477):
-            raise ValueError(f"Unexpected official validation count for {protocol}")
-    if len(splits["xsub_val"]) != 50919 or len(splits["xset_val"]) != 59477:
-        raise ValueError("Require official NTU120 protocol splits")
+    checkpoint_root, pipeline_version = checkpoint_location(requested_checkpoints)
+    cache = cache_location(requested_cache, pipeline_version)
+    if cache is None and str(requested_cache).startswith("/kaggle/input/"):
+        raise ValueError("Cache is absent and /kaggle/input is read-only; use a /kaggle/working cache path")
     out.mkdir(parents=True, exist_ok=True)
-    root = Path(__file__).resolve().parents[2]
-    command = [sys.executable, "-u", "-m", "experiments.nestsar_sm_all_t16.validation_reframe",
-               "--worker", "--cache", str(cache), "--checkpoint-root", str(checkpoint_root),
-               "--outdir", str(out), "--batch-size", str(batch_size),
-               "--max-val-samples", str(max_val_samples)]
     bars, children, logs = [], [], []
     try:
+        if cache is None:
+            source = dataset_location(settings.get("dataset"))
+            cache = requested_cache
+            if (cache / "manifest.json").is_file():
+                # Preserve a complete cache from another experiment/version.
+                cache = cache.with_name(cache.name + "__" + pipeline_version)
+            print(f"Compatible cache absent; preparing it from {source} (no model training).")
+            bars = [tqdm(total=1, desc=f"{p.upper()} prepare cache", position=i, leave=True)
+                    for i, p in enumerate(("xsub", "xset"))]
+            status_path = out / "cache_prepare_status.json"
+            from .streaming import data as cache_builder
+            previous_version = cache_builder.VERSION
+            cache_builder.VERSION = pipeline_version
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(cache_builder.prepare, source, cache, status_path, "MTVC")
+                    while not future.done():
+                        if status_path.is_file():
+                            try:
+                                status = json.loads(status_path.read_text())
+                            except json.JSONDecodeError:
+                                status = {}
+                            for bar in bars:
+                                total = max(int(status.get("total", 1)), 1)
+                                if bar.total != total:
+                                    bar.reset(total=total)
+                                bar.n = min(int(status.get("current", 0)), total)
+                                bar.set_description_str(f"{bar.desc.split()[0]} {status.get('phase', 'Prepare cache')}",
+                                                        refresh=False)
+                                bar.refresh()
+                        time.sleep(0.5)
+                    future.result()
+            finally:
+                cache_builder.VERSION = previous_version
+            print(f"Prepared cache: {cache}")
+        else:
+            print(f"Reusing compatible cache: {cache}")
+        print(f"Frozen checkpoint root: {checkpoint_root}")
+        splits = json.loads((cache / "splits.json").read_text())
+        if len(splits["xsub_val"]) != 50919 or len(splits["xset_val"]) != 59477:
+            raise ValueError("Require complete official NTU120 validation splits")
+        for i, protocol in enumerate(("xsub", "xset")):
+            total = max_val_samples or len(splits[f"{protocol}_val"])
+            if i < len(bars):
+                bars[i].reset(total=total)
+                bars[i].set_description_str(f"{protocol.upper()} GPU{i} frozen P2", refresh=False)
+            else:
+                bars.append(tqdm(total=total, desc=f"{protocol.upper()} GPU{i} frozen P2",
+                                 position=i, leave=True))
+        root = Path(__file__).resolve().parents[2]
+        command = [sys.executable, "-u", "-m", "experiments.nestsar_sm_all_t16.validation_reframe",
+                   "--worker", "--cache", str(cache), "--checkpoint-root", str(checkpoint_root),
+                   "--outdir", str(out), "--batch-size", str(batch_size),
+                   "--max-val-samples", str(max_val_samples)]
         for gpu, protocol in enumerate(("xsub", "xset")):
             (out / protocol).mkdir(exist_ok=True)
             env = dict(os.environ, PYTHONPATH=str(root), CUDA_VISIBLE_DEVICES=str(gpu),
@@ -236,8 +353,6 @@ def launch(settings: dict) -> dict:
             logs.append(logfile)
             cmd = [*command, "--protocol", protocol] + (["--allow-cpu"] if allow_cpu else [])
             children.append(subprocess.Popen(cmd, env=env, stdout=logfile, stderr=subprocess.STDOUT))
-            bars.append(tqdm(total=max_val_samples or len(splits[f"{protocol}_val"]),
-                             desc=f"{protocol.upper()} GPU{gpu} frozen P2", position=gpu, leave=True))
         while any(child.poll() is None for child in children):
             for protocol, bar in zip(("xsub", "xset"), bars):
                 path = out / protocol / "status.json"
@@ -290,6 +405,7 @@ def main() -> None:
     parser.add_argument("--protocol", choices=("xsub", "xset"))
     parser.add_argument("--cache", default=DEFAULT_CACHE)
     parser.add_argument("--checkpoint-root", default=DEFAULT_CHECKPOINTS)
+    parser.add_argument("--dataset", default=None)
     parser.add_argument("--outdir", default=DEFAULT_OUT)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--max-val-samples", type=int, default=0)
@@ -301,7 +417,7 @@ def main() -> None:
         worker(args.protocol, args.cache, args.checkpoint_root, args.outdir,
                args.batch_size, args.max_val_samples, args.allow_cpu)
     else:
-        launch({k: getattr(args, k) for k in ("cache", "checkpoint_root", "outdir",
+        launch({k: getattr(args, k) for k in ("cache", "checkpoint_root", "dataset", "outdir",
                                                 "batch_size", "max_val_samples", "allow_cpu")})
 
 
