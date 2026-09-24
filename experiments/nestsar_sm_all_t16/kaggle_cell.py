@@ -40,7 +40,7 @@ if settings.get("smoke_test", False):
 
 nestsar_results = run(
     dataset=settings.get("dataset"), outdir=outdir,
-    cache_dir=settings.get("cache_dir", "/kaggle/working/NestSAR_SM_ALL_PERSON_AWARE_P2_R4_CACHE_v1"),
+    cache_dir=settings.get("cache_dir", "/kaggle/working/NestSAR_SM_ALL_PERSON_AWARE_P2_CACHE_v3"),
     config=config, raw_layout=settings.get("raw_layout", "MTVC"),
     audit_first=settings.get("audit_first", True),
 )
