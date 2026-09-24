@@ -74,7 +74,7 @@ def verify_full_official_cache(cache: Path) -> dict:
 def run_full_official(
     dataset=None,
     outdir="/kaggle/working/NestSAR_SM_ALL_T16_PERSON_AWARE_P2_R4_FULL_OFFICIAL",
-    cache="/kaggle/working/NestSAR_SM_ALL_PERSON_AWARE_P2_R4_CACHE_FULL_OFFICIAL",
+    cache="/kaggle/working/NestSAR_SM_ALL_PERSON_AWARE_P2_CACHE_FULL_OFFICIAL",
     epochs=60,
     patience=5,
     audit_first=True,
@@ -144,7 +144,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--cache",
-        default="/kaggle/working/NestSAR_SM_ALL_PERSON_AWARE_P2_R4_CACHE_FULL_OFFICIAL",
+        default="/kaggle/working/NestSAR_SM_ALL_PERSON_AWARE_P2_CACHE_FULL_OFFICIAL",
     )
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--patience", type=int, default=5)
