@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-from tqdm.auto import tqdm
+from experiments.nestsar_sm_all_t16.streaming.notebook_progress import make_bars, update_bar
 
 
 def parse_args():
@@ -93,26 +93,6 @@ def launch_worker(args, protocol, gpu, outdir, log):
     return proc, stream
 
 
-def update_bar(bar, protocol, gpu, status):
-    if not status:
-        bar.set_description_str(f"{protocol.upper()} G{gpu} waiting")
-        bar.refresh()
-        return
-    phase = status.get("phase", "working")
-    total = max(int(status.get("total", 1)), 1)
-    tag = (phase, total)
-    if getattr(bar, "_audit_tag", None) != tag:
-        bar.reset(total=total)
-        bar._audit_tag = tag
-    bar.n = min(int(status.get("current", 0)), total)
-    bar.set_description_str(f"{protocol.upper()} G{gpu} {phase}", refresh=False)
-    postfix = {}
-    if status.get("model_val") is not None:
-        postfix["val"] = f"{100*float(status['model_val']):.4f}%"
-    bar.set_postfix(postfix, refresh=False)
-    bar.refresh()
-
-
 def compact_summary(report):
     c = report["fast_weight_counterfactual_val_accuracy"]
     stages = report["stage_frozen_probes"]
@@ -167,10 +147,7 @@ def main():
     print("GPU map  : XSUB -> GPU0 | XSET -> GPU1")
     print("=" * 120)
 
-    bars = [
-        tqdm(total=1, desc="XSUB G0 setup", position=0, leave=True, dynamic_ncols=True),
-        tqdm(total=1, desc="XSET G1 setup", position=1, leave=True, dynamic_ncols=True),
-    ]
+    bars = make_bars()
     processes = []
     streams = []
     protocols = ("xsub", "xset")
