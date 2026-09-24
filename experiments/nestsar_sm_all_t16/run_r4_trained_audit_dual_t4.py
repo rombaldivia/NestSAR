@@ -164,12 +164,14 @@ def main():
         while any(p.poll() is None for p in processes):
             for i, protocol in enumerate(protocols):
                 status = read_json(root / protocol / "status.json")
-                update_bar(bars[i], protocol, i, status)
+                if status is not None:
+                    update_bar(bars[i], protocol, i, status)
             time.sleep(0.5)
 
         for i, protocol in enumerate(protocols):
             status = read_json(root / protocol / "status.json")
-            update_bar(bars[i], protocol, i, status)
+            if status is not None:
+                update_bar(bars[i], protocol, i, status)
 
         failures = []
         for protocol, proc in zip(protocols, processes):
