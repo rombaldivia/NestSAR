@@ -14,7 +14,7 @@ DEFAULTS = dict(
     weight_decay=0.03, label_smoothing=0.05, grad_clip=1.0, ema_decay=0.995,
     dropout=0.10, stream_aux_weight=0.15,
     consistency_weight=0.08, consistency_temperature=1.0,
-    spatial_dim=24, model_dim=112, controller_dim=16, fast_rank=2, head_rank=2,
+    spatial_dim=24, model_dim=112, controller_dim=16, fast_rank=4, head_rank=2,
     sm_residual_scale=0.08, head_residual_scale=0.15,
     fresh_augmentation=True, rotation_degrees=8.0, jitter_shift=1,
     min_delta=1e-6, progress_every=5, max_train_samples=0, max_val_samples=0,
