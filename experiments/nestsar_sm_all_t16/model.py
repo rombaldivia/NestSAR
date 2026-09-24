@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-"""NestSAR-SM-ALL-T16, person-aware P2 revision.
+"""NestSAR-SM-ALL-T16, person-aware P2 revision with rank-4 fast memory.
 
 The neural input stays exactly [B,16,750]. The update fixes three representation
 problems without changing the parameter count:
@@ -93,7 +93,7 @@ class SharedSMController(nn.Module):
     """Tiny person-aware controller shared by every adaptive stage."""
 
     controller_dim: int = 16
-    head_rank: int = 2
+    head_rank: int = 4
     eta_max: float = 0.20
     alpha_min: float = 0.90
     alpha_max: float = 0.999
@@ -241,7 +241,7 @@ class FastWeightDeltaResidual(nn.Module):
     """Low-rank self-modifying fast-weight memory."""
 
     dim: int
-    rank: int = 2
+    rank: int = 4
 
     @nn.compact
     def __call__(
@@ -310,7 +310,7 @@ class SelfModBiMemory(nn.Module):
     """Original NestSAR BiMemory plus a cheap self-modifying residual."""
 
     dim: int
-    rank: int = 2
+    rank: int = 4
     residual_scale: float = 0.08
 
     @nn.compact
@@ -334,7 +334,7 @@ class SelfModBiMemory(nn.Module):
 class SelfModDescriptorHead(nn.Module):
     dim: int = 112
     dropout: float = 0.10
-    rank: int = 2
+    rank: int = 4
     residual_scale: float = 0.08
 
     @nn.compact
@@ -381,8 +381,8 @@ class NestSARSMAllT16(nn.Module):
     dropout: float = 0.10
 
     controller_dim: int = 16
-    fast_rank: int = 2
-    head_rank: int = 2
+    fast_rank: int = 4
+    head_rank: int = 4
     sm_residual_scale: float = 0.08
     head_residual_scale: float = 0.15
 
