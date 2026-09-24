@@ -93,7 +93,7 @@ class SharedSMController(nn.Module):
     """Tiny person-aware controller shared by every adaptive stage."""
 
     controller_dim: int = 16
-    head_rank: int = 4
+    head_rank: int = 2
     eta_max: float = 0.20
     alpha_min: float = 0.90
     alpha_max: float = 0.999
@@ -382,7 +382,7 @@ class NestSARSMAllT16(nn.Module):
 
     controller_dim: int = 16
     fast_rank: int = 4
-    head_rank: int = 4
+    head_rank: int = 2
     sm_residual_scale: float = 0.08
     head_residual_scale: float = 0.15
 
