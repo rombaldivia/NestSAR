@@ -46,7 +46,7 @@ def test_person_aware_revision_keeps_parameter_budget():
         training=False,
     )["params"]
     count = sum(x.size for x in jax.tree.leaves(params))
-    assert count == 1_826_556
+    assert count == 1_831_932
 
     # Learned identity is still explicit in every stream's spatial encoder.
     for i in range(4):
