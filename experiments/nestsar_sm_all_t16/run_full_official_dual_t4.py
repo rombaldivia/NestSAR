@@ -73,8 +73,8 @@ def verify_full_official_cache(cache: Path) -> dict:
 
 def run_full_official(
     dataset=None,
-    outdir="/kaggle/working/NestSAR_SM_ALL_T16_PERSON_AWARE_P2_FULL_OFFICIAL",
-    cache="/kaggle/working/NestSAR_SM_ALL_PERSON_AWARE_P2_CACHE_FULL_OFFICIAL",
+    outdir="/kaggle/working/NestSAR_SM_ALL_T16_PERSON_AWARE_P2_R4_FULL_OFFICIAL",
+    cache="/kaggle/working/NestSAR_SM_ALL_PERSON_AWARE_P2_R4_CACHE_FULL_OFFICIAL",
     epochs=60,
     patience=5,
     audit_first=True,
@@ -97,7 +97,7 @@ def run_full_official(
     audit = verify_full_official_cache(cache)
 
     print("=" * 110)
-    print("NESTSAR PERSON-AWARE P2 — FULL OFFICIAL NTU120")
+    print("NESTSAR PERSON-AWARE P2 RANK-4 — FULL OFFICIAL NTU120")
     print("=" * 110)
     print(f"Dataset: {dataset}")
     print(f"Samples: {audit['samples']}")
@@ -140,11 +140,11 @@ def main() -> None:
     parser.add_argument("--dataset", default=None)
     parser.add_argument(
         "--outdir",
-        default="/kaggle/working/NestSAR_SM_ALL_T16_PERSON_AWARE_P2_FULL_OFFICIAL",
+        default="/kaggle/working/NestSAR_SM_ALL_T16_PERSON_AWARE_P2_R4_FULL_OFFICIAL",
     )
     parser.add_argument(
         "--cache",
-        default="/kaggle/working/NestSAR_SM_ALL_PERSON_AWARE_P2_CACHE_FULL_OFFICIAL",
+        default="/kaggle/working/NestSAR_SM_ALL_PERSON_AWARE_P2_R4_CACHE_FULL_OFFICIAL",
     )
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--patience", type=int, default=5)
