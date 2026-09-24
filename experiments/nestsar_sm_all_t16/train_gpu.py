@@ -87,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model-dim", type=int, default=112)
     p.add_argument("--dropout", type=float, default=0.10)
     p.add_argument("--controller-dim", type=int, default=16)
-    p.add_argument("--fast-rank", type=int, default=2)
+    p.add_argument("--fast-rank", type=int, default=4)
     p.add_argument("--head-rank", type=int, default=2)
     p.add_argument("--sm-residual-scale", type=float, default=0.08)
     p.add_argument("--head-residual-scale", type=float, default=0.15)
@@ -561,7 +561,7 @@ def train_protocol(args, annotations, split, protocol: str):
                 state,
             )
             payload = {
-                "model": "NestSAR-SM-ALL-T16-v1",
+                "model": "NestSAR-SM-ALL-T16-R4-v1",
                 "protocol": protocol,
                 "epoch": epoch,
                 "val_accuracy": val_acc,
@@ -598,7 +598,7 @@ def train_protocol(args, annotations, split, protocol: str):
             (outdir / "best.json").write_text(
                 json.dumps(
                     {
-                        "model": "NestSAR-SM-ALL-T16-v1",
+                        "model": "NestSAR-SM-ALL-T16-R4-v1",
                         "epoch": epoch,
                         "val_accuracy": val_acc,
                         "params": nparams,
@@ -641,7 +641,7 @@ def train_protocol(args, annotations, split, protocol: str):
             break
 
     result = {
-        "model": "NestSAR-SM-ALL-T16-v1",
+        "model": "NestSAR-SM-ALL-T16-R4-v1",
         "protocol": protocol,
         "best_val_accuracy": best,
         "best_epoch": best_epoch,
