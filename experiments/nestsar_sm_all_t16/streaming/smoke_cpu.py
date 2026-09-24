@@ -66,7 +66,7 @@ def main():
             assert all(row['train_samples'] == 3 and row['val_samples'] == 2 for row in history)
             assert (out/'best.msgpack').exists()
         atomic_json(root/'smoke_report.json', dict(
-            backend='cpu', real_model_params=1826556, protocols=['xsub', 'xset'],
+            backend='cpu', real_model_params=1831932, protocols=['xsub', 'xset'],
             concurrent_workers=True, epochs_per_protocol=2, train_samples_per_protocol=3,
             val_samples_per_protocol=2, resume_and_alias_repair_passed=True,
             real_ntu_accuracy_measured=False, dual_t4_executed=False))
