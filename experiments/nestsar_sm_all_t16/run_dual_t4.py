@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset", required=True)
     p.add_argument(
         "--outdir",
-        default="/kaggle/working/NestSAR_SM_ALL_T16_DualT4",
+        default="/kaggle/working/NestSAR_SM_ALL_T16_R4_DualT4",
     )
 
     p.add_argument("--epochs", type=int, default=60)
@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model-dim", type=int, default=112)
     p.add_argument("--dropout", type=float, default=0.10)
     p.add_argument("--controller-dim", type=int, default=16)
-    p.add_argument("--fast-rank", type=int, default=2)
+    p.add_argument("--fast-rank", type=int, default=4)
     p.add_argument("--head-rank", type=int, default=2)
     p.add_argument("--sm-residual-scale", type=float, default=0.08)
     p.add_argument("--head-residual-scale", type=float, default=0.15)
