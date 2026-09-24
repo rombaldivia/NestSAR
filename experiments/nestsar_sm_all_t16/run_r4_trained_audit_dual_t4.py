@@ -70,6 +70,8 @@ def launch_worker(args, protocol, gpu, outdir, log):
         "--ridge", str(args.ridge),
     ]
     env = dict(os.environ)
+    repo_root = Path(__file__).resolve().parents[2]
+    env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
     env.update(
         CUDA_VISIBLE_DEVICES=str(gpu),
         CUDA_DEVICE_ORDER="PCI_BUS_ID",
