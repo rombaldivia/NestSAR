@@ -680,6 +680,28 @@ def run_location(
     output,
     status,
 ):
+    result_path = output / f"{location}_crossfit_result.json"
+    if result_path.is_file():
+        try:
+            cached = json.loads(result_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            cached = None
+        if (
+            isinstance(cached, dict)
+            and cached.get("location") == location
+            and int(cached.get("fixed_training_epochs", -1)) == int(args.epochs)
+            and int(cached.get("adapter_rank", args.adapter_rank)) == int(args.adapter_rank)
+        ):
+            report(
+                status,
+                protocol,
+                f"{location}: reuse completed result",
+                1,
+                1,
+                epoch=int(args.epochs),
+                best=float(cached.get("crossfit_accuracy", 0.0)),
+            )
+            return cached
     report(
         status,
         protocol,
