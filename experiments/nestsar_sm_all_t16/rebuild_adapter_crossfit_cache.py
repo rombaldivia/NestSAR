@@ -201,10 +201,18 @@ def build(args) -> Path:
             print("✅ Full adapter cross-fit cache already ready; reusing it.")
             return output
 
-        if (output / "manifest.json").exists():
-            raise ValueError(
-                f"{output} has an invalid completion manifest. "
-                "Choose a fresh output directory."
+        stale_manifest = output / "manifest.json"
+        had_invalid_manifest = stale_manifest.exists()
+        if had_invalid_manifest:
+            quarantine = output / "manifest.invalid.json"
+            suffix = 1
+            while quarantine.exists():
+                quarantine = output / f"manifest.invalid.{suffix}.json"
+                suffix += 1
+            os.replace(stale_manifest, quarantine)
+            print(
+                "⚠️ Existing completion manifest failed validation; "
+                f"quarantined as {quarantine.name}."
             )
 
         shape = np.load(metadata_cache / "shape.npy", mmap_mode="r")
@@ -226,6 +234,8 @@ def build(args) -> Path:
                 f"plus reserve; only {free / 2**30:.2f} GiB available."
             )
 
+        recover_completed_raw = False
+
         if progress_path.exists():
             progress = json.loads(progress_path.read_text())
             if progress.get("dataset_sha256") != dataset_sha:
@@ -236,7 +246,47 @@ def build(args) -> Path:
             raw = np.load(raw_path, mmap_mode="r+")
             if raw.shape != raw_shape or raw.dtype != np.float32:
                 raise ValueError(f"Partial raw layout mismatch: {raw.shape}, {raw.dtype}")
+            if not 0 <= start <= EXPECTED_SAMPLES:
+                raise ValueError(f"Invalid raw progress index: {start}")
             print(f"Resuming raw rebuild at sample {start:,}/{EXPECTED_SAMPLES:,}.")
+        elif had_invalid_manifest and raw_path.is_file():
+            try:
+                raw = np.load(raw_path, mmap_mode="r+")
+                recover_completed_raw = (
+                    raw.shape == raw_shape
+                    and raw.dtype == np.float32
+                    and raw_path.stat().st_size == expected_raw_bytes + 128
+                )
+            except Exception:
+                recover_completed_raw = False
+
+            if recover_completed_raw:
+                start = EXPECTED_SAMPLES
+                print(
+                    "✅ Existing raw.npy has the exact completed layout/size; "
+                    "reusing it and regenerating metadata/manifest."
+                )
+            else:
+                try:
+                    del raw
+                except Exception:
+                    pass
+                if raw_path.exists():
+                    raw_path.unlink()
+                raw = np.lib.format.open_memmap(
+                    raw_path, mode="w+", dtype=np.float32, shape=raw_shape
+                )
+                start = 0
+                atomic_json(
+                    progress_path,
+                    {
+                        "next_index": 0,
+                        "dataset_sha256": dataset_sha,
+                        "preprocessing": pp.VERSION,
+                        "cache_version": CACHE_VERSION,
+                    },
+                )
+                print("⚠️ Existing raw.npy was not safely reusable; rebuilding it.")
         else:
             if raw_path.exists():
                 raw_path.unlink()
