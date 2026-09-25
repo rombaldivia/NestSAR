@@ -26,7 +26,7 @@ EXPECTED_PARAMS = 1_831_932
 CLASSES, STREAMS, DIM = 120, 4, 112
 VARIANTS = ("A_control", "B_descriptor", "C_temporal")
 PREPROCESSING = "sm-all-personaware-p2-segmentpose-v2"
-CACHE_VERSION = "sm-all-shared-cache-personaware-p2-v3"
+CACHE_VERSION = "sm-all-shared-cache-personaware-p2-r4-v1"
 MODEL_KEYS = ("spatial_dim", "model_dim", "dropout", "controller_dim",
               "fast_rank", "head_rank", "sm_residual_scale", "head_residual_scale")
 LIMITATION = (
