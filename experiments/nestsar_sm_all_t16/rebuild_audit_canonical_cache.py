@@ -147,7 +147,7 @@ def validate_source_cache(source: Path) -> dict:
     return meta
 
 
-def completed_cache_ok(output: Path, source_meta: dict) -> bool:
+def completed_cache_ok(output: Path, source: Path, source_meta: dict) -> bool:
     manifest = output / "manifest.json"
     if not manifest.is_file():
         return False
@@ -173,10 +173,9 @@ def completed_cache_ok(output: Path, source_meta: dict) -> bool:
         if labels.shape != (EXPECTED_SAMPLES,) or labels.dtype != np.int32:
             return False
 
-        if json.loads((output / "ids.json").read_text()) != json.loads(
-            (output / "ids.json").read_text()
-        ):
-            return False
+        for name in META_FILES:
+            if sha256(output / name) != sha256(source / name):
+                return False
     except Exception:
         return False
 
@@ -225,7 +224,7 @@ def build(args) -> Path:
         raise RuntimeError("This audit-cache build is already running.")
 
     try:
-        if completed_cache_ok(output, source_meta):
+        if completed_cache_ok(output, source, source_meta):
             print("✅ Completed audit cache already exists; reusing it.")
             return output
 
