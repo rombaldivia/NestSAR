@@ -835,10 +835,152 @@ def run_location(
     best_b_epoch = 0
     best_for_b = jax.device_get(init_params)
 
+    history_path = output / f"{location}_history.json"
+    resume_path = output / f"{location}_resume.msgpack"
     history = []
     train_steps = math.ceil(len(train_ids) / batch_size)
+    start_epoch = 1
 
-    for epoch in range(1, args.epochs + 1):
+    if resume_path.is_file():
+        saved = serialization.msgpack_restore(resume_path.read_bytes())
+        if (
+            saved.get("protocol") != protocol
+            or saved.get("location") != location
+            or int(saved.get("epochs", -1)) != int(args.epochs)
+            or int(saved.get("adapter_rank", -1)) != int(args.adapter_rank)
+        ):
+            raise RuntimeError(
+                f"{location}: resume checkpoint identity mismatch; "
+                f"remove only {resume_path} if you intentionally changed settings."
+            )
+        state = serialization.from_state_dict(state, saved["state"])
+        key = jnp.asarray(saved["key"], dtype=jnp.uint32)
+        best_a_score = float(saved["best_a_score"])
+        best_a_epoch = int(saved["best_a_epoch"])
+        best_for_a = saved["best_for_a"]
+        best_b_score = float(saved["best_b_score"])
+        best_b_epoch = int(saved["best_b_epoch"])
+        best_for_b = saved["best_for_b"]
+        history = list(saved.get("history", []))
+        completed_epoch = int(saved["completed_epoch"])
+        start_epoch = completed_epoch + 1
+        report(
+            status,
+            protocol,
+            f"{location}: resume from checkpoint",
+            completed_epoch,
+            args.epochs,
+            epoch=completed_epoch,
+            best=max(best_a_score, best_b_score),
+            best_epoch=max(best_a_epoch, best_b_epoch),
+        )
+
+    elif history_path.is_file():
+        # Older audit revisions wrote metrics each completed epoch but did not
+        # serialize optimizer/model state. Reconstruct that state deterministically
+        # by replaying only the completed training epochs, without repeating the
+        # expensive fold evaluations. All augmentation, dropout, ordering and PRNG
+        # streams are epoch/seed deterministic.
+        old_history = json.loads(history_path.read_text())
+        if old_history:
+            completed_epoch = int(old_history[-1]["epoch"])
+            expected_epochs = list(range(1, completed_epoch + 1))
+            actual_epochs = [int(row["epoch"]) for row in old_history]
+            if actual_epochs != expected_epochs:
+                raise RuntimeError(
+                    f"{location}: non-contiguous history cannot be safely replayed: "
+                    f"{actual_epochs[:3]} ... {actual_epochs[-3:]}"
+                )
+
+            target_best_a_score = float(
+                old_history[-1]["best_fold_a_selection_accuracy"]
+            )
+            target_best_a_epoch = int(
+                old_history[-1]["best_fold_a_epoch"]
+            )
+            target_best_b_score = float(
+                old_history[-1]["best_fold_b_selection_accuracy"]
+            )
+            target_best_b_epoch = int(
+                old_history[-1]["best_fold_b_epoch"]
+            )
+
+            print(
+                f"{protocol.upper()} {location}: reconstructing state through "
+                f"E{completed_epoch:02d} from deterministic history..."
+            )
+
+            for replay_epoch in range(1, completed_epoch + 1):
+                with closing(
+                    dataset.batches(
+                        train_ids,
+                        batch_size,
+                        train_config,
+                        epoch=replay_epoch,
+                        training=True,
+                        protocol=protocol,
+                    )
+                ) as batches:
+                    for bi in range(train_steps):
+                        batch, _ = next(batches)
+                        state, key, _ = jax.block_until_ready(
+                            train_step(
+                                state,
+                                base_params,
+                                key,
+                                jax.device_put(batch),
+                            )
+                        )
+
+                if replay_epoch == target_best_a_epoch:
+                    best_for_a = jax.device_get(state.ema_params)
+                if replay_epoch == target_best_b_epoch:
+                    best_for_b = jax.device_get(state.ema_params)
+
+                report(
+                    status,
+                    protocol,
+                    f"{location}: deterministic replay",
+                    replay_epoch,
+                    completed_epoch,
+                    epoch=replay_epoch,
+                    best=max(target_best_a_score, target_best_b_score),
+                    best_epoch=max(target_best_a_epoch, target_best_b_epoch),
+                )
+
+            best_a_score = target_best_a_score
+            best_a_epoch = target_best_a_epoch
+            best_b_score = target_best_b_score
+            best_b_epoch = target_best_b_epoch
+            history = old_history
+            start_epoch = completed_epoch + 1
+
+            replay_payload = {
+                "protocol": protocol,
+                "location": location,
+                "epochs": int(args.epochs),
+                "adapter_rank": int(args.adapter_rank),
+                "completed_epoch": completed_epoch,
+                "state": serialization.to_state_dict(jax.device_get(state)),
+                "key": np.asarray(jax.device_get(key)),
+                "best_a_score": best_a_score,
+                "best_a_epoch": best_a_epoch,
+                "best_for_a": jax.device_get(best_for_a),
+                "best_b_score": best_b_score,
+                "best_b_epoch": best_b_epoch,
+                "best_for_b": jax.device_get(best_for_b),
+                "history": history,
+            }
+            atomic_bytes(
+                resume_path,
+                serialization.msgpack_serialize(replay_payload),
+            )
+            print(
+                f"{protocol.upper()} {location}: recovery checkpoint written; "
+                f"continuing at E{start_epoch:02d}."
+            )
+
+    for epoch in range(start_epoch, args.epochs + 1):
         start_time = time.perf_counter()
         sums = np.zeros(8, np.float64)
 
@@ -960,8 +1102,29 @@ def run_location(
         history.append(row)
 
         atomic_json(
-            output / f"{location}_history.json",
+            history_path,
             history,
+        )
+
+        resume_payload = {
+            "protocol": protocol,
+            "location": location,
+            "epochs": int(args.epochs),
+            "adapter_rank": int(args.adapter_rank),
+            "completed_epoch": int(epoch),
+            "state": serialization.to_state_dict(jax.device_get(state)),
+            "key": np.asarray(jax.device_get(key)),
+            "best_a_score": float(best_a_score),
+            "best_a_epoch": int(best_a_epoch),
+            "best_for_a": jax.device_get(best_for_a),
+            "best_b_score": float(best_b_score),
+            "best_b_epoch": int(best_b_epoch),
+            "best_for_b": jax.device_get(best_for_b),
+            "history": history,
+        }
+        atomic_bytes(
+            resume_path,
+            serialization.msgpack_serialize(resume_payload),
         )
 
         report(
