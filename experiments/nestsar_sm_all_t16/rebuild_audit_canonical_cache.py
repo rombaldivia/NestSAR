@@ -29,6 +29,7 @@ from . import preprocessing_corrected as pp
 CACHE_VERSION = "sm-all-shared-cache-personaware-p2-r4-v1"
 EXPECTED_SAMPLES = 113_945
 EXPECTED_SHAPE = (EXPECTED_SAMPLES, pp.FRAMES, pp.FEATURES)
+AUDIT_RESERVE_BYTES = int(3.5 * (2**30))  # feature banks + probe outputs/headroom
 META_FILES = ("labels.npy", "ids.json", "splits.json")
 
 
@@ -242,10 +243,11 @@ def build(args) -> Path:
 
         partial_size = partial.stat().st_size if partial.exists() else 0
         free = shutil.disk_usage(output).free + partial_size
-        if free < target_bytes + (768 << 20):
+        if free < target_bytes + AUDIT_RESERVE_BYTES:
             raise RuntimeError(
-                f"Canonical audit cache needs about {target_bytes / 2**30:.2f} GiB "
-                f"plus reserve; only {free / 2**30:.2f} GiB is available."
+                f"Canonical rebuild needs {target_bytes / 2**30:.2f} GiB and this audit "
+                f"reserves another {AUDIT_RESERVE_BYTES / 2**30:.2f} GiB for extracted "
+                f"feature banks/probe outputs; only {free / 2**30:.2f} GiB is available."
             )
 
         if progress_path.exists():
