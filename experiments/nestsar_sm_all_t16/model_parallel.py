@@ -50,6 +50,36 @@ NUM_CLASSES = r4.NUM_CLASSES
 NUM_STREAMS = r4.NUM_STREAMS
 
 
+def _half_life_bias_init(half_lives):
+    """Create a channel-wise forget-bias initializer from target half-lives.
+
+    The same channel schedule is used independently in every vmapped stream.
+    For h_t = a*h_(t-1)+..., a**H=0.5 gives a target half-life H.
+    """
+    half_lives = tuple(float(h) for h in half_lives)
+    if not half_lives or any(h <= 0 for h in half_lives):
+        raise ValueError(f"Invalid half-lives: {half_lives}")
+
+    def init(key, shape, dtype=jnp.float32):
+        del key
+        if len(shape) != 1:
+            raise ValueError(f"Forget bias must be rank-1, got {shape}")
+        dim = int(shape[0])
+        if dim % len(half_lives):
+            raise ValueError(
+                f"dim={dim} must be divisible by {len(half_lives)} timescales"
+            )
+        per = dim // len(half_lives)
+        values = []
+        for h in half_lives:
+            retention = 0.5 ** (1.0 / h)
+            bias = jnp.log(retention / (1.0 - retention))
+            values.append(jnp.full((per,), bias, dtype=dtype))
+        return jnp.concatenate(values, axis=0)
+
+    return init
+
+
 def _affine_compose(left, right):
     """Compose diagonal affine maps in temporal order.
 
@@ -85,6 +115,7 @@ class ParallelAffineSweep(nn.Module):
     dim: int
     reverse: bool = False
     parallel: bool = True
+    half_lives: tuple[float, ...] | None = None
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -97,14 +128,19 @@ class ParallelAffineSweep(nn.Module):
 
         init = nn.initializers.xavier_uniform()
 
-        # A positive forget bias gives the affine state a useful long-memory
-        # timescale at initialization (sigmoid(1.5) ~= 0.82) instead of
-        # collapsing to a ~1-token half-life.
+        # v2 used a scalar +1.5 bias for every channel.  D128-MTS optionally
+        # assigns short/medium/long half-lives across CHANNELS inside EACH
+        # semantic stream, without adding parameters or operators.
+        forget_bias_init = (
+            nn.initializers.constant(1.5)
+            if self.half_lives is None
+            else _half_life_bias_init(self.half_lives)
+        )
         a = jax.nn.sigmoid(
             nn.Dense(
                 self.dim,
                 kernel_init=init,
-                bias_init=nn.initializers.constant(1.5),
+                bias_init=forget_bias_init,
                 name="forget",
             )(seq)
         )
@@ -152,6 +188,7 @@ class ParallelBiMemory(nn.Module):
 
     dim: int
     parallel: bool = True
+    half_lives: tuple[float, ...] | None = None
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -159,12 +196,14 @@ class ParallelBiMemory(nn.Module):
             self.dim,
             reverse=False,
             parallel=self.parallel,
+            half_lives=self.half_lives,
             name="fwd",
         )(x)
         b = ParallelAffineSweep(
             self.dim,
             reverse=True,
             parallel=self.parallel,
+            half_lives=self.half_lives,
             name="bwd",
         )(x)
         y = nn.Dense(
@@ -321,6 +360,7 @@ class ParallelSelfModBiMemory(nn.Module):
     rank: int = 4
     residual_scale: float = 0.08
     parallel: bool = True
+    half_lives: tuple[float, ...] | None = None
 
     @nn.compact
     def __call__(
@@ -332,6 +372,7 @@ class ParallelSelfModBiMemory(nn.Module):
         base_y = ParallelBiMemory(
             self.dim,
             parallel=self.parallel,
+            half_lives=self.half_lives,
             name="base_memory",
         )(x)
         delta = ParallelFastWeightDeltaResidual(
@@ -492,6 +533,7 @@ class ParallelSelfModDescriptorHead(nn.Module):
     rank: int = 4
     residual_scale: float = 0.08
     parallel: bool = True
+    half_lives: tuple[float, ...] | None = None
 
     @nn.compact
     def __call__(
@@ -518,6 +560,7 @@ class ParallelSelfModDescriptorHead(nn.Module):
             self.rank,
             self.residual_scale,
             parallel=self.parallel,
+            half_lives=self.half_lives,
             name="chunk_memory",
         )(
             chunks,
@@ -601,6 +644,8 @@ class NestSARParallelT16(nn.Module):
     sm_residual_scale: float = 0.08
     head_residual_scale: float = 0.15
     parallel: bool = True
+    m4_half_lives: tuple[float, ...] | None = None
+    g4_half_lives: tuple[float, ...] | None = None
 
     @nn.compact
     def __call__(
@@ -805,6 +850,7 @@ class NestSARParallelT16(nn.Module):
             rank=self.fast_rank,
             residual_scale=self.sm_residual_scale,
             parallel=self.parallel,
+            half_lives=self.m4_half_lives,
             name="frame_memory_group",
         )(
             spatial_stack,
@@ -841,6 +887,7 @@ class NestSARParallelT16(nn.Module):
             rank=self.fast_rank,
             residual_scale=self.sm_residual_scale,
             parallel=self.parallel,
+            half_lives=self.g4_half_lives,
             name="descriptor_group",
         )(
             mixed,
