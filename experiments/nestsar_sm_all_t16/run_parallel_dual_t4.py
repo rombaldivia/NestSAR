@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-"""Dual-T4 launcher for NestSAR-FULL-PARALLEL-T16-v1."""
+"""Dual-T4 launcher for NestSAR-FULL-PARALLEL-T16-v2."""
 
 import fcntl
 import subprocess
@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from experiments.nestsar_sm_all_t16.streaming import launch as base
+from experiments.nestsar_sm_all_t16.parallel_config import MODEL_NAME, implementation_identity
 from experiments.nestsar_sm_all_t16.streaming.io_utils import (
     atomic_json,
     read_json,
@@ -23,7 +24,7 @@ DATA_MODULE = "experiments.nestsar_sm_all_t16.streaming.data"
 
 def run(
     dataset=None,
-    outdir="/kaggle/working/NestSAR_FULL_PARALLEL_T16_v1",
+    outdir="/kaggle/working/NestSAR_FULL_PARALLEL_T16_v2",
     cache_dir="/kaggle/working/NestSAR_FULL_PARALLEL_CACHE_v1",
     config=None,
     raw_layout="MTVC",
@@ -53,6 +54,14 @@ def run(
     streams = []
 
     try:
+        identity = dict(model=MODEL_NAME, implementation=implementation_identity(), config=c)
+        identity_path = out / "model_config.json"
+        previous_identity = read_json(identity_path)
+        if previous_identity is not None and previous_identity != identity:
+            raise ValueError("OUT_DIR belongs to another model/implementation/config; use a fresh OUT_DIR")
+        if previous_identity is None and any((out / p / 'run_config.json').exists() for p in ('xsub', 'xset')):
+            raise ValueError("Legacy output has no model identity; use a fresh v2 OUT_DIR")
+        atomic_json(identity_path, identity)
         gpus, jax_devices = base.discover_gpus(
             sys.executable,
             out / "gpu_discovery.log",
@@ -70,7 +79,7 @@ def run(
                         gpus,
                     )
                 ),
-                "model": "NestSAR-FULL-PARALLEL-T16-v1",
+                "model": MODEL_NAME,
             },
         )
 
@@ -116,8 +125,8 @@ def run(
                     source.stdout.strip()
                     if source.returncode == 0
                     else None,
-                "model":
-                    "NestSAR-FULL-PARALLEL-T16-v1",
+                "model": MODEL_NAME,
+                "implementation": implementation_identity(),
             },
         )
 
@@ -225,6 +234,8 @@ def run(
                     "-u",
                     "-m",
                     AUDIT_MODULE,
+                    "--output",
+                    str(out / "parallel_audit.json"),
                 ],
                 out / "parallel_audit.log",
                 base.isolated_env(gpus[0]),

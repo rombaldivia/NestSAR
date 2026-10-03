@@ -84,6 +84,7 @@ class ParallelAffineSweep(nn.Module):
 
     dim: int
     reverse: bool = False
+    parallel: bool = True
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -132,11 +133,16 @@ class ParallelAffineSweep(nn.Module):
         # Convex gated update: h_t = a_t h_{t-1} + (1-a_t)c_t.
         b = (1.0 - a) * candidate
 
-        _, h = jax.lax.associative_scan(
-            _affine_compose,
-            (a, b),
-            axis=1,
-        )
+        if self.parallel:
+            _, h = jax.lax.associative_scan(_affine_compose, (a, b), axis=1)
+        else:
+            # Numerical/performance control: identical parameters and equations.
+            def step(state, ab):
+                state = ab[0] * state + ab[1]
+                return state, state
+            _, h = jax.lax.scan(step, jnp.zeros_like(x[:, 0]),
+                               (jnp.swapaxes(a, 0, 1), jnp.swapaxes(b, 0, 1)))
+            h = jnp.swapaxes(h, 0, 1)
 
         return jnp.flip(h, axis=1) if self.reverse else h
 
@@ -145,17 +151,20 @@ class ParallelBiMemory(nn.Module):
     """Bidirectional parallel memory with the same topology as R4 BiMemory."""
 
     dim: int
+    parallel: bool = True
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         f = ParallelAffineSweep(
             self.dim,
             reverse=False,
+            parallel=self.parallel,
             name="fwd",
         )(x)
         b = ParallelAffineSweep(
             self.dim,
             reverse=True,
+            parallel=self.parallel,
             name="bwd",
         )(x)
         y = nn.Dense(
@@ -172,6 +181,8 @@ def associative_fast_weight_reads(
     eta: jnp.ndarray,
     alpha: jnp.ndarray,
     memory0: jnp.ndarray,
+    *,
+    parallel: bool = True,
 ) -> jnp.ndarray:
     """Exact associative form of the R4 fast-weight recurrence.
 
@@ -223,16 +234,17 @@ def associative_fast_weight_reads(
             jnp.matmul(a_r, b_l) + b_r,
         )
 
-    a_prefix, b_prefix = jax.lax.associative_scan(
-        compose,
-        (a, b),
-        axis=1,
-    )
-
-    memory = jnp.matmul(
-        a_prefix,
-        memory0,
-    ) + b_prefix
+    if parallel:
+        a_prefix, b_prefix = jax.lax.associative_scan(compose, (a, b), axis=1)
+        memory = jnp.matmul(a_prefix, memory0) + b_prefix
+    else:
+        def step(state, ab):
+            state = ab[0] @ state + ab[1]
+            return state, state
+        initial = jnp.broadcast_to(memory0, (k.shape[0], *memory0.shape))
+        _, memory = jax.lax.scan(step, initial,
+                                (jnp.swapaxes(a, 0, 1), jnp.swapaxes(b, 0, 1)))
+        memory = jnp.swapaxes(memory, 0, 1)
 
     return jnp.einsum(
         "btr,btrd->btd",
@@ -246,6 +258,7 @@ class ParallelFastWeightDeltaResidual(nn.Module):
 
     dim: int
     rank: int = 4
+    parallel: bool = True
 
     @nn.compact
     def __call__(
@@ -281,14 +294,8 @@ class ParallelFastWeightDeltaResidual(nn.Module):
 
         k = jnp.tanh(k)
         q = jnp.tanh(q)
-        k = k / jnp.maximum(
-            jnp.linalg.norm(k, axis=-1, keepdims=True),
-            1e-6,
-        )
-        q = q / jnp.maximum(
-            jnp.linalg.norm(q, axis=-1, keepdims=True),
-            1e-6,
-        )
+        k = r4.safe_unit_normalize(k)
+        q = r4.safe_unit_normalize(q)
 
         memory0 = self.param(
             "memory0",
@@ -303,6 +310,7 @@ class ParallelFastWeightDeltaResidual(nn.Module):
             eta,
             alpha,
             memory0,
+            parallel=self.parallel,
         )
 
 
@@ -312,6 +320,7 @@ class ParallelSelfModBiMemory(nn.Module):
     dim: int
     rank: int = 4
     residual_scale: float = 0.08
+    parallel: bool = True
 
     @nn.compact
     def __call__(
@@ -322,11 +331,13 @@ class ParallelSelfModBiMemory(nn.Module):
     ) -> jnp.ndarray:
         base_y = ParallelBiMemory(
             self.dim,
+            parallel=self.parallel,
             name="base_memory",
         )(x)
         delta = ParallelFastWeightDeltaResidual(
             self.dim,
             self.rank,
+            parallel=self.parallel,
             name="fast_weight",
         )(base_y, eta, alpha)
         return nn.LayerNorm(name="sm_norm")(
@@ -340,6 +351,7 @@ class ParallelMaskSafeSpatialEncoder(nn.Module):
     spatial_dim: int = 24
     model_dim: int = 112
     dropout: float = 0.10
+    parallel: bool = True
 
     @nn.compact
     def __call__(
@@ -395,6 +407,7 @@ class ParallelMaskSafeSpatialEncoder(nn.Module):
         mem = ParallelAffineSweep(
             self.spatial_dim,
             reverse=False,
+            parallel=self.parallel,
             name="joint_memory",
         )(h)
 
@@ -478,6 +491,7 @@ class ParallelSelfModDescriptorHead(nn.Module):
     dropout: float = 0.10
     rank: int = 4
     residual_scale: float = 0.08
+    parallel: bool = True
 
     @nn.compact
     def __call__(
@@ -503,6 +517,7 @@ class ParallelSelfModDescriptorHead(nn.Module):
             self.dim,
             self.rank,
             self.residual_scale,
+            parallel=self.parallel,
             name="chunk_memory",
         )(
             chunks,
@@ -585,6 +600,7 @@ class NestSARParallelT16(nn.Module):
     head_rank: int = 2
     sm_residual_scale: float = 0.08
     head_residual_scale: float = 0.15
+    parallel: bool = True
 
     @nn.compact
     def __call__(
@@ -745,6 +761,7 @@ class NestSARParallelT16(nn.Module):
             self.spatial_dim,
             self.model_dim,
             self.dropout,
+            parallel=self.parallel,
             name="spatial_pose_pair",
         )(
             pose_pair,
@@ -756,6 +773,7 @@ class NestSARParallelT16(nn.Module):
             self.spatial_dim,
             self.model_dim,
             self.dropout,
+            parallel=self.parallel,
             name="spatial_motion_pair",
         )(
             motion_pair,
@@ -786,6 +804,7 @@ class NestSARParallelT16(nn.Module):
             dim=self.model_dim,
             rank=self.fast_rank,
             residual_scale=self.sm_residual_scale,
+            parallel=self.parallel,
             name="frame_memory_group",
         )(
             spatial_stack,
@@ -821,6 +840,7 @@ class NestSARParallelT16(nn.Module):
             dropout=self.dropout,
             rank=self.fast_rank,
             residual_scale=self.sm_residual_scale,
+            parallel=self.parallel,
             name="descriptor_group",
         )(
             mixed,

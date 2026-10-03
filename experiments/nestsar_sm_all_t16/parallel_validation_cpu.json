@@ -1,0 +1,98 @@
+{
+  "date_utc": "2026-10-03",
+  "scope": "CPU correctness and synthetic execution; no NTU120 accuracy or GPU throughput measured",
+  "implementation": {
+    "version": "NestSAR-FULL-PARALLEL-T16-v2",
+    "source_sha256": "316278b65eb5548d2c353bd202b44a27a749d73258423e7e1c2dae01ced66656"
+  },
+  "regression_tests": {
+    "passed": 37,
+    "failed": 0,
+    "suites": [
+      "test_parallel.py",
+      "streaming/tests/test_training.py",
+      "streaming/tests/test_launcher.py",
+      "test_preprocessing_corrected.py"
+    ]
+  },
+  "integration": {
+    "backend": "cpu",
+    "model": "parallel",
+    "real_model_params": 1831932,
+    "protocols": [
+      "xsub",
+      "xset"
+    ],
+    "concurrent_workers": true,
+    "epochs_per_protocol": 2,
+    "train_samples_per_protocol": 3,
+    "val_samples_per_protocol": 2,
+    "resume_and_alias_repair_passed": true,
+    "real_ntu_accuracy_measured": false,
+    "dual_t4_executed": false
+  },
+  "cpu_audit": {
+    "backend": "cpu",
+    "devices": [
+      "TFRT_CPU_0"
+    ],
+    "jax": "0.7.2",
+    "source_commit": "6c7166e6fc649e3624a0310c9f5738a20425ac0b",
+    "source_tree_dirty": true,
+    "implementation": {
+      "version": "NestSAR-FULL-PARALLEL-T16-v2",
+      "source_sha256": "316278b65eb5548d2c353bd202b44a27a749d73258423e7e1c2dae01ced66656"
+    },
+    "real_ntu_accuracy_measured": false,
+    "gpu_speed_measured": false,
+    "timings_exclude_compile_preprocessing_and_transfer": true,
+    "fast_weight_max_abs": 1.7881393432617188e-07,
+    "graph": {
+      "params": 1831932,
+      "scan_count": 0,
+      "while_count": 0,
+      "serial_control_scan_count": 8,
+      "same_equation_forward_max_abs": 2.980232238769531e-07
+    },
+    "training": {
+      "padded_training_steps": 2,
+      "finite_optimizer_and_ema": true
+    },
+    "compute": {
+      "r4_gflops": 0.069916688,
+      "parallel_gflops": 0.069913904,
+      "delta_percent": -0.003981881979309154,
+      "convention": "XLA forward estimate; R4 scans unrolled and verified; 1 MAC=2 FLOPs"
+    },
+    "inference": {
+      "1": {
+        "r4": {
+          "median_ms": 2.9219309999461984,
+          "mean_ms": 2.9642252000030567,
+          "p95_ms": 3.136459200095487,
+          "clips_per_s": 342.23943002706534
+        },
+        "same_equation_serial": {
+          "median_ms": 2.125630999898931,
+          "mean_ms": 2.31663340000523,
+          "p95_ms": 2.8992057999403187,
+          "clips_per_s": 470.44853977362385
+        },
+        "parallel": {
+          "median_ms": 3.6595019998912903,
+          "mean_ms": 3.716216999964672,
+          "p95_ms": 4.4655256000169175,
+          "clips_per_s": 273.2612251693553
+        },
+        "same_equation_speedup": 0.5808525312903436,
+        "vs_r4_speedup": 0.7984504449056177
+      }
+    }
+  },
+  "timing_settings": {
+    "batch": 1,
+    "warmup": 2,
+    "repeats": 5,
+    "interpretation": "Short synthetic CPU timings; not evidence of a T4 or phone speedup"
+  }
+}

@@ -18,6 +18,7 @@ from .launch import validate_config
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--outdir", required=True)
+    parser.add_argument("--model", choices=("r4", "parallel"), default="r4")
     args = parser.parse_args()
     root = Path(args.outdir)
     root.mkdir(parents=True, exist_ok=True)
@@ -38,10 +39,13 @@ def main():
                OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1')
     env['PYTHONPATH'] = str(Path(__file__).resolve().parents[3])
     commands = {}
+    worker_module = 'experiments.nestsar_sm_all_t16.streaming.worker'
+    if args.model == 'parallel':
+        worker_module += '_parallel'
     processes, streams = [], []
     try:
         for protocol in ('xsub', 'xset'):
-            cmd = [sys.executable, '-m', 'experiments.nestsar_sm_all_t16.streaming.worker',
+            cmd = [sys.executable, '-m', worker_module,
                    '--protocol', protocol, '--cache', str(root/'cache'), '--outdir', str(root/'run'),
                    '--config', str(root/'config.json'), '--allow-cpu']
             commands[protocol] = cmd
@@ -65,8 +69,20 @@ def main():
             assert status['best_epoch'] > 0 and len(history) == 2
             assert all(row['train_samples'] == 3 and row['val_samples'] == 2 for row in history)
             assert (out/'best.msgpack').exists()
+            if args.model == 'parallel':
+                from flax import serialization
+                from ..parallel_config import MODEL_NAME, implementation_identity
+                best = serialization.msgpack_restore((out/'best.msgpack').read_bytes())
+                result = json.loads((out/'result.json').read_text())
+                assert best['model'] == result['model'] == MODEL_NAME
+                assert best['model_identity'] == result['model_identity'] == implementation_identity()
+                assert result['resumed_completed']
+                # Same dimensions/config/cache must not permit an R4 resume.
+                wrong_cmd = [s.replace('streaming.worker_parallel', 'streaming.worker') for s in cmd]
+                wrong = subprocess.run(wrong_cmd, env=env, capture_output=True, text=True)
+                assert wrong.returncode and 'another model' in wrong.stderr
         atomic_json(root/'smoke_report.json', dict(
-            backend='cpu', real_model_params=1831932, protocols=['xsub', 'xset'],
+            backend='cpu', model=args.model, real_model_params=1831932, protocols=['xsub', 'xset'],
             concurrent_workers=True, epochs_per_protocol=2, train_samples_per_protocol=3,
             val_samples_per_protocol=2, resume_and_alias_repair_passed=True,
             real_ntu_accuracy_measured=False, dual_t4_executed=False))

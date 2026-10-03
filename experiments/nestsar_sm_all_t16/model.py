@@ -33,6 +33,17 @@ FEATURES = ju.FEATURES
 NUM_CLASSES = ju.NUM_CLASSES
 NUM_STREAMS = ju.NUM_STREAMS
 
+
+def safe_unit_normalize(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
+    """Normalize keys/queries with a finite derivative at the zero vector.
+
+    Clipping norm(x) after sqrt leaves sqrt's undefined derivative at zero
+    in the backward graph; a masked sample can still inject NaN gradients.
+    This has the same forward denominator, with the clamp before sqrt.
+    """
+    squared_norm = jnp.sum(jnp.square(x), axis=-1, keepdims=True)
+    return x / jnp.sqrt(jnp.maximum(squared_norm, eps * eps))
+
 if FRAMES != 16 or PERSONS != 2 or TOKEN_CHANNELS != 15:
     raise RuntimeError(
         f"Person-aware SM-ALL requires T16/M2/C15, got T{FRAMES}/M{PERSONS}/C{TOKEN_CHANNELS}"
@@ -274,8 +285,8 @@ class FastWeightDeltaResidual(nn.Module):
 
         k = jnp.tanh(k)
         q = jnp.tanh(q)
-        k = k / jnp.maximum(jnp.linalg.norm(k, axis=-1, keepdims=True), 1e-6)
-        q = q / jnp.maximum(jnp.linalg.norm(q, axis=-1, keepdims=True), 1e-6)
+        k = safe_unit_normalize(k)
+        q = safe_unit_normalize(q)
 
         memory0 = self.param(
             "memory0",

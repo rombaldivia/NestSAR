@@ -168,7 +168,8 @@ def test_worker_failure_is_reported_with_log(tmp_path):
         check_worker_finished(Process(), "xset", tmp_path, {})
 
 
-def test_parent_launches_both_isolated_protocols_and_keeps_two_bars(tmp_path, monkeypatch):
+@pytest.mark.parametrize("variant", ["r4", "parallel"])
+def test_parent_launches_both_isolated_protocols_and_keeps_two_bars(tmp_path, monkeypatch, variant):
     dataset = tmp_path / "ntu.pkl"
     dataset.write_bytes(b"fixture; preparation tested separately")
     out = tmp_path / "out"
@@ -211,7 +212,8 @@ def test_parent_launches_both_isolated_protocols_and_keeps_two_bars(tmp_path, mo
         assert Path(kwargs["env"]["PYTHONPATH"]).joinpath(
             "experiments/nestsar_sm_all_t16/model.py"
         ).is_file()
-        assert cmd[cmd.index("-m") + 1] == "experiments.nestsar_sm_all_t16.streaming.worker"
+        expected = "experiments.nestsar_sm_all_t16.streaming.worker"
+        assert cmd[cmd.index("-m") + 1] == expected + ("_parallel" if variant == "parallel" else "")
 
         best = .76 if protocol == "xsub" else .78
         atomic_json(
@@ -226,7 +228,11 @@ def test_parent_launches_both_isolated_protocols_and_keeps_two_bars(tmp_path, mo
 
     monkeypatch.setattr(launch.subprocess, "Popen", spawn)
 
-    results = launch.run(dataset=dataset, outdir=out, cache_dir=tmp_path / "cache")
+    if variant == 'parallel':
+        from experiments.nestsar_sm_all_t16.run_parallel_dual_t4 import run
+    else:
+        run = launch.run
+    results = run(dataset=dataset, outdir=out, cache_dir=tmp_path / "cache")
 
     assert started == [("xsub", "0"), ("xset", "1")]
     assert results["xsub"]["best_val_accuracy"] == .76

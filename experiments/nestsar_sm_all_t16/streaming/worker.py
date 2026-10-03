@@ -24,6 +24,7 @@ from ..preprocessing_corrected import FRAMES, FEATURES, VERSION as PREPROCESSING
 from . import VERSION
 
 EXPECTED_PARAMS = 1_831_932
+MODEL_NAME = "NestSAR-SM-ALL-T16-R4-v1"
 
 
 def make_model(config):
@@ -106,7 +107,7 @@ def build_steps(model, config):
     return train_step, eval_step
 
 
-def create_state(config, steps_per_epoch):
+def create_state(config, steps_per_epoch, model_factory=None):
     total = config["epochs"] * steps_per_epoch
     warm = max(1, int(total * config["warmup_fraction"]))
     # A one-epoch smoke run still has a well-defined schedule.
@@ -115,7 +116,7 @@ def create_state(config, steps_per_epoch):
                                                 max(total, warm + 1), end_value=config["min_learning_rate"])
     optimizer = optax.chain(optax.clip_by_global_norm(config["grad_clip"]),
                            optax.adamw(schedule, weight_decay=config["weight_decay"]))
-    model = make_model(config)
+    model = (model_factory or make_model)(config)
     key, init = jax.random.split(jax.random.PRNGKey(config["seed"]))
     params = model.init({"params": init, "dropout": init}, jnp.zeros((1, FRAMES, FEATURES)), training=False)["params"]
     count = sum(x.size for x in jax.tree.leaves(params))
@@ -180,36 +181,45 @@ def publish_best(out, metadata):
         raise ValueError("Invalid best-checkpoint filename")
     payload = (out / name).read_bytes()
     atomic_bytes(out / "best.msgpack", payload)
-    atomic_json(out / "best.json", dict(model="NestSAR-SM-ALL-T16-R4-v1",
+    atomic_json(out / "best.json", dict(model=metadata.get("model", MODEL_NAME),
         epoch=metadata["best_epoch"], val_accuracy=metadata["best"], params=EXPECTED_PARAMS,
         preprocessing_version=PREPROCESSING_VERSION, pipeline_version=VERSION,
-        config_hash=metadata["config_hash"]))
+        config_hash=metadata["config_hash"], model_identity=metadata.get("model_identity")))
 
 
 def write_result(out, protocol, metadata, digest, resumed=False):
-    result = {"model": "NestSAR-SM-ALL-T16-R4-v1", "protocol": protocol,
+    result = {"model": metadata.get("model", MODEL_NAME), "protocol": protocol,
               "best_val_accuracy": metadata["best"], "best_accuracy": metadata["best"],
               "best_epoch": metadata["best_epoch"], "last_epoch": metadata["epoch"],
               "epochs_run": metadata["epoch"], "params": EXPECTED_PARAMS,
               "backend": jax.default_backend(), "devices": [str(d) for d in jax.local_devices()],
               "config_hash": digest, "checkpoint": str(out / "best.msgpack"),
               "preprocessing_version": PREPROCESSING_VERSION, "pipeline_version": VERSION,
-              "stopped_early": metadata["stopped_early"], "resumed_completed": resumed}
+              "stopped_early": metadata["stopped_early"], "resumed_completed": resumed,
+              "model_identity": metadata.get("model_identity")}
     atomic_json(out / "result.json", result)
     atomic_json(out.parent / f"result_{protocol}.json", result)
     return result
 
 
-def run(config, protocol, cache, outdir, allow_cpu=False):
+def run_signature(config, protocol, cache_signature, model_name=MODEL_NAME, model_identity=None):
+    signature = {"config": config, "protocol": protocol, "cache": cache_signature,
+                 "parameters": EXPECTED_PARAMS, "pipeline_version": VERSION}
+    # Preserve historical R4 resume signatures while distinguishing the new
+    # architecture even though it has the same parameter count.
+    if model_name != MODEL_NAME or model_identity is not None:
+        signature.update(model=model_name, model_identity=model_identity)
+    return signature
+
+
+def run(config, protocol, cache, outdir, allow_cpu=False, *, model_factory=None,
+        model_name=MODEL_NAME, model_identity=None):
     from .launch import validate_config
     config = validate_config(config)
     if protocol not in ("xsub", "xset"):
         raise ValueError("Expected xsub or xset")
     out = Path(outdir) / protocol
     out.mkdir(parents=True, exist_ok=True)
-    report = Reporter(out / "status.json")
-    report(phase="JAX startup", current=0, total=1, protocol=protocol, epoch=0,
-           best=None, best_epoch=0, completed_epoch=0)
     if not allow_cpu and (jax.default_backend() != "gpu" or len(jax.local_devices()) != 1):
         raise RuntimeError(f"Expected one isolated GPU; backend={jax.default_backend()}, devices={jax.local_devices()}")
     dataset = Dataset(cache)
@@ -223,16 +233,19 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
         raise ValueError("Empty train/validation split")
     batch_size = config["micro_batch"] * config["accumulation_steps"]
     steps = math.ceil(len(train_ids) / batch_size)
-    signature = {"config": config, "protocol": protocol, "cache": dataset.meta["signature"],
-                 "parameters": EXPECTED_PARAMS, "pipeline_version": VERSION}
+    signature = run_signature(config, protocol, dataset.meta["signature"], model_name, model_identity)
     digest = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
     previous = read_json(out / "run_config.json")
     if previous is not None and previous != signature:
-        raise ValueError("OUT_DIR contains another run's config/data. Choose a new OUT_DIR.")
+        raise ValueError("OUT_DIR contains another model, implementation, or config/data. Choose a new OUT_DIR.")
     atomic_json(out / "run_config.json", signature)
+    report = Reporter(out / "status.json")
+    report(phase="JAX startup", current=0, total=1, protocol=protocol, epoch=0,
+           best=None, best_epoch=0, completed_epoch=0)
     report(phase="Initialize SM-ALL", train_samples=len(train_ids), val_samples=len(val_ids))
-    model, state, key, schedule, warmup_epochs = create_state(config, steps)
+    model, state, key, schedule, warmup_epochs = create_state(config, steps, model_factory)
     metadata = {"config_hash": digest, "epoch": 0, "best": -1.0, "best_epoch": 0,
+                "model": model_name, "model_identity": model_identity,
                 "bad_epochs": 0, "history": [], "warmup_epochs": warmup_epochs,
                 "best_checkpoint": None, "stopped_early": False}
     last = out / "last.msgpack"
@@ -336,7 +349,8 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
         report(phase="Save checkpoint", current=1, total=1)
         if improved:
             metadata.update(best_epoch=epoch, best_checkpoint=f"best_epoch_{epoch:04d}.msgpack")
-            best_payload = {"model": "NestSAR-SM-ALL-T16-R4-v1", "protocol": protocol, "epoch": epoch,
+            best_payload = {"model": model_name, "model_identity": model_identity,
+                            "protocol": protocol, "epoch": epoch,
                             "val_accuracy": val, "ema_params": jax.device_get(state.ema_params),
                             "config": config, "preprocessing_version": PREPROCESSING_VERSION,
                             "pipeline_version": VERSION, "cache_signature": dataset.meta["signature"],
@@ -363,7 +377,7 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
     return result
 
 
-def main():
+def main(run_fn=run):
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True)
     p.add_argument("--protocol", required=True, choices=("xsub", "xset"))
@@ -371,7 +385,7 @@ def main():
     p.add_argument("--outdir", required=True)
     p.add_argument("--allow-cpu", action="store_true", help="Synthetic validation only")
     a = p.parse_args()
-    run(json.loads(Path(a.config).read_text()), a.protocol, a.cache, a.outdir, a.allow_cpu)
+    run_fn(json.loads(Path(a.config).read_text()), a.protocol, a.cache, a.outdir, a.allow_cpu)
 
 
 if __name__ == "__main__":
