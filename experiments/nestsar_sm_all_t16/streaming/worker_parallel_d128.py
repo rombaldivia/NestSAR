@@ -7,6 +7,7 @@ from experiments.nestsar_sm_all_t16.parallel_d128_config import (
     M4_HALF_LIVES,
     G4_HALF_LIVES,
     implementation_identity,
+    validate_d128_config,
 )
 from experiments.nestsar_sm_all_t16.streaming import worker as base
 
@@ -43,6 +44,7 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
         model_factory=make_model,
         model_name=MODEL_NAME,
         model_identity=implementation_identity(),
+        config_validator=validate_d128_config,
     )
 
 
