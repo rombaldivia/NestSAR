@@ -94,21 +94,37 @@ class ParallelAffineSweep(nn.Module):
 
         seq = jnp.flip(x, axis=1) if self.reverse else x
 
+        init = nn.initializers.xavier_uniform()
+
+        # A positive forget bias gives the affine state a useful long-memory
+        # timescale at initialization (sigmoid(1.5) ~= 0.82) instead of
+        # collapsing to a ~1-token half-life.
         a = jax.nn.sigmoid(
-            nn.Dense(self.dim, name="forget")(seq)
+            nn.Dense(
+                self.dim,
+                kernel_init=init,
+                bias_init=nn.initializers.constant(1.5),
+                name="forget",
+            )(seq)
         )
 
         hidden = nn.gelu(
-            nn.Dense(2 * self.dim, name="candidate_in")(seq)
+            nn.Dense(
+                2 * self.dim,
+                kernel_init=init,
+                name="candidate_in",
+            )(seq)
         )
         candidate = nn.Dense(
             self.dim,
             use_bias=False,
+            kernel_init=init,
             name="candidate_out",
         )(hidden)
         candidate = candidate + nn.Dense(
             self.dim,
             use_bias=False,
+            kernel_init=init,
             name="skip",
         )(seq)
         candidate = jnp.tanh(candidate)
