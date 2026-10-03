@@ -15,6 +15,7 @@ from experiments.nestsar_sm_all_t16.parallel_d128_config import (
     EXPECTED_PARAMS,
     MODEL_DIM,
     implementation_identity,
+    validate_d128_config,
 )
 from experiments.nestsar_sm_all_t16.streaming.io_utils import atomic_json, read_json
 
@@ -22,66 +23,6 @@ from experiments.nestsar_sm_all_t16.streaming.io_utils import atomic_json, read_
 WORKER_MODULE = "experiments.nestsar_sm_all_t16.streaming.worker_parallel_d128"
 AUDIT_MODULE = "experiments.nestsar_sm_all_t16.audit_parallel_d128"
 DATA_MODULE = "experiments.nestsar_sm_all_t16.streaming.data"
-
-
-def validate_d128_config(config):
-    """Same safety contract as the R4 launcher, except model_dim is fixed at 128."""
-    unknown = set(config) - set(base.DEFAULTS)
-    if unknown:
-        raise ValueError(f"Unknown config keys: {sorted(unknown)}")
-
-    c = dict(base.DEFAULTS, **config)
-    c["model_dim"] = MODEL_DIM
-
-    for k in (
-        "epochs", "patience", "micro_batch", "accumulation_steps",
-        "eval_batch", "progress_every",
-    ):
-        if not isinstance(c[k], int) or c[k] < 1:
-            raise ValueError(f"{k} must be a positive integer")
-
-    for k in ("seed", "jitter_shift", "max_train_samples", "max_val_samples"):
-        if not isinstance(c[k], int) or c[k] < 0:
-            raise ValueError(f"{k} must be a nonnegative integer")
-
-    for k in ("dropout", "label_smoothing", "ema_decay"):
-        if not 0 <= c[k] < 1:
-            raise ValueError(f"Invalid {k}")
-
-    if not 0 < c["warmup_fraction"] < 1 or c["consistency_temperature"] <= 0:
-        raise ValueError("Invalid warmup/temperature")
-
-    if not 0 < c["min_learning_rate"] <= c["learning_rate"] or c["grad_clip"] <= 0:
-        raise ValueError("Invalid learning rate/gradient clipping")
-
-    if not 0 <= c["rotation_degrees"] <= 20:
-        raise ValueError("Keep yaw augmentation within 0..20 degrees")
-
-    if any(
-        c[k] < 0
-        for k in (
-            "weight_decay", "stream_aux_weight", "consistency_weight",
-            "min_delta", "sm_residual_scale", "head_residual_scale",
-        )
-    ):
-        raise ValueError("Loss weights/weight decay/min_delta must be nonnegative")
-
-    if c["prefetch_batches"] not in (1, 2):
-        raise ValueError("prefetch_batches must be 1 or 2 to bound host memory")
-
-    # This is a controlled width experiment. Keep every other architecture
-    # dimension identical to Parallel-v2/R4.
-    locked = ("spatial_dim", "controller_dim", "fast_rank", "head_rank")
-    for k in locked:
-        if c[k] != base.DEFAULTS[k]:
-            raise ValueError(
-                f"Keep {k}={base.DEFAULTS[k]} for the controlled D128 experiment"
-            )
-
-    if c["model_dim"] != MODEL_DIM:
-        raise ValueError(f"Keep model_dim={MODEL_DIM} for this experiment")
-
-    return c
 
 
 def run(
