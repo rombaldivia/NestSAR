@@ -213,9 +213,10 @@ def run_signature(config, protocol, cache_signature, model_name=MODEL_NAME, mode
 
 
 def run(config, protocol, cache, outdir, allow_cpu=False, *, model_factory=None,
-        model_name=MODEL_NAME, model_identity=None):
-    from .launch import validate_config
-    config = validate_config(config)
+        model_name=MODEL_NAME, model_identity=None, config_validator=None):
+    if config_validator is None:
+        from .launch import validate_config as config_validator
+    config = config_validator(config)
     if protocol not in ("xsub", "xset"):
         raise ValueError("Expected xsub or xset")
     out = Path(outdir) / protocol
