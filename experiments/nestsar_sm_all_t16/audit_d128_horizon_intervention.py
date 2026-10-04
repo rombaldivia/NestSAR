@@ -209,14 +209,12 @@ def build_variants():
     ]
 
 
-def infer_predictions(model, params, canonical, batch_size):
-    apply_logits = jax.jit(
-        lambda p, x: model.apply({"params": p}, x, training=False)["logits"]
-    )
+def infer_predictions(apply_logits, params, dataset, val_ids, batch_size):
     parts = []
-    for start in range(0, len(canonical), batch_size):
-        x = jax.device_put(canonical[start:start + batch_size])
-        logits = jax.device_get(apply_logits(params, x))
+    for start in range(0, len(val_ids), batch_size):
+        idx = val_ids[start:start + batch_size]
+        x = np.asarray(dataset.canonical[idx], np.float32)
+        logits = jax.device_get(apply_logits(params, jax.device_put(x)))
         parts.append(np.asarray(logits).argmax(axis=1))
     return np.concatenate(parts)
 
@@ -227,6 +225,7 @@ def main():
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--cache", required=True)
     ap.add_argument("--output", required=True)
+    ap.add_argument("--status", default=None)
     ap.add_argument("--batch-size", type=int, default=256)
     args = ap.parse_args()
 
@@ -251,10 +250,12 @@ def main():
 
     dataset = Dataset(args.cache)
     val_ids = np.asarray(dataset.splits[f"{args.protocol}_val"], np.int64)
-    canonical = np.asarray(dataset.canonical[val_ids], np.float32)
     labels = np.asarray(dataset.labels[val_ids], np.int32)
 
     model = make_model(config)
+    apply_logits = jax.jit(
+        lambda p, x: model.apply({"params": p}, x, training=False)["logits"]
+    )
     variants = build_variants()
 
     results = {}
@@ -273,13 +274,28 @@ def main():
 
     for i, (name, spec) in enumerate(variants, 1):
         p = apply_combo(params, spec)
-        pred = infer_predictions(model, p, canonical, args.batch_size)
+        pred = infer_predictions(
+            apply_logits, p, dataset, val_ids, args.batch_size
+        )
         predictions[name] = pred
         acc = float(np.mean(pred == labels))
         results[name] = {
             "accuracy": acc,
             "spec": spec,
         }
+        if args.status:
+            atomic_json(
+                args.status,
+                {
+                    "protocol": args.protocol,
+                    "phase": "Horizon intervention",
+                    "current": i,
+                    "total": len(variants),
+                    "variant": name,
+                    "accuracy": acc,
+                    "done": False,
+                },
+            )
         print(
             f"[{i:02d}/{len(variants):02d}] "
             f"{name:34s} acc={100*acc:8.4f}%"
@@ -406,6 +422,21 @@ def main():
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     atomic_json(out, result)
+    if args.status:
+        atomic_json(
+            args.status,
+            {
+                "protocol": args.protocol,
+                "phase": "Done",
+                "current": len(variants),
+                "total": len(variants),
+                "variant": best_name,
+                "accuracy": base_acc,
+                "best_variant": best_name,
+                "best_delta_pp": float(best_delta),
+                "done": True,
+            },
+        )
 
     print()
     print("=" * 122)
