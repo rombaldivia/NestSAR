@@ -657,6 +657,7 @@ class NestSARParallelT16(nn.Module):
         self,
         x: jnp.ndarray,
         training: bool = False,
+        m4_audit_scales: jnp.ndarray | None = None,
     ) -> Mapping[str, jnp.ndarray]:
         if x.shape[1] != FRAMES or x.shape[2] != FEATURES:
             raise ValueError(
@@ -873,7 +874,22 @@ class NestSARParallelT16(nn.Module):
         # Skip the arithmetic entirely at the canonical setting so exact
         # checkpoint reproduction is preserved.
         # --------------------------------------------------------------
-        if self.m4_stream_scales is not None:
+        if m4_audit_scales is not None:
+            # Dynamic [4] scale vector used by the causal audit. Because the
+            # shape is fixed, all intervention values reuse one compiled graph.
+            scales = jnp.asarray(
+                m4_audit_scales,
+                dtype=frame_stack.dtype,
+            )
+            if scales.shape != (NUM_STREAMS,):
+                raise ValueError(
+                    f"m4_audit_scales must be [{NUM_STREAMS}], got {scales.shape}"
+                )
+            frame_stack = spatial_stack + scales[
+                None, None, :, None
+            ] * (frame_stack - spatial_stack)
+
+        elif self.m4_stream_scales is not None:
             if len(self.m4_stream_scales) != NUM_STREAMS:
                 raise ValueError(
                     f"m4_stream_scales must have {NUM_STREAMS} values, "
