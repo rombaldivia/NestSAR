@@ -245,6 +245,7 @@ def margin_pass(
     status,
     cache_path,
     include_model_predictions,
+    leave_one_out_true=False,
 ):
     if cache_path.is_file():
         return json.loads(cache_path.read_text())
@@ -312,14 +313,36 @@ def margin_pass(
             tc = train_centroids[stage]
 
             sims = z @ tc.T
-            true_sim = sims[np.arange(n), y].copy()
+
+            if leave_one_out_true:
+                # Remove the sample itself from its training-class centroid.
+                # This avoids optimistic train margins caused by centroid
+                # self-inclusion and makes train-vs-validation transfer cleaner.
+                counts_y = train_stats[stage]["counts"][y].astype(np.float64)
+                if np.any(counts_y <= 1):
+                    raise RuntimeError(
+                        f"Cannot form leave-one-out centroid at stage {stage}"
+                    )
+                sums_y = train_stats[stage]["sums"][y]
+                loo = (
+                    sums_y - z
+                ) / (counts_y[:, None] - 1.0)
+                loo = normalize_rows(
+                    loo.astype(np.float32)
+                ).astype(np.float64)
+                true_sim = np.sum(z * loo, axis=1)
+
+                own_split = loo
+            else:
+                true_sim = sims[np.arange(n), y].copy()
+                own_split = split_centroids[stage][y]
+
             sims[np.arange(n), y] = -np.inf
             rival = np.argmax(sims, axis=1)
             rival_sim = sims[np.arange(n), rival]
             margin = true_sim - rival_sim
             positive = margin > 0
 
-            own_split = split_centroids[stage][y]
             within_dist = 1.0 - np.sum(z * own_split, axis=1)
 
             a = acc[stage]
@@ -581,6 +604,7 @@ def main():
         status=status,
         cache_path=work / "train_margins.json",
         include_model_predictions=False,
+        leave_one_out_true=True,
     )
 
     val_margin = margin_pass(
@@ -596,6 +620,7 @@ def main():
         status=status,
         cache_path=work / "val_margins.json",
         include_model_predictions=True,
+        leave_one_out_true=False,
     )
 
     verified = float(val_margin["model"]["accuracy"])
