@@ -647,6 +647,11 @@ class NestSARParallelT16(nn.Module):
     m4_half_lives: tuple[float, ...] | None = None
     g4_half_lives: tuple[float, ...] | None = None
 
+    # Audit-only M4 interpolation controls. Defaults preserve the exact
+    # trained architecture and parameter tree.
+    m4_mix_scale: float = 1.0
+    m4_stream_scales: tuple[float, float, float, float] | None = None
+
     @nn.compact
     def __call__(
         self,
@@ -857,6 +862,35 @@ class NestSARParallelT16(nn.Module):
             controller["eta"],
             controller["alpha"],
         )
+
+        # --------------------------------------------------------------
+        # AUDIT-ONLY CAUSAL INTERPOLATION
+        #
+        # lambda = 0 -> Spatial bypass
+        # lambda = 1 -> exact trained D128-MTS
+        # lambda > 1 -> strengthen M4 transformation
+        #
+        # Skip the arithmetic entirely at the canonical setting so exact
+        # checkpoint reproduction is preserved.
+        # --------------------------------------------------------------
+        if self.m4_stream_scales is not None:
+            if len(self.m4_stream_scales) != NUM_STREAMS:
+                raise ValueError(
+                    f"m4_stream_scales must have {NUM_STREAMS} values, "
+                    f"got {self.m4_stream_scales}"
+                )
+            scales = jnp.asarray(
+                self.m4_stream_scales,
+                dtype=frame_stack.dtype,
+            )[None, None, :, None]
+            if tuple(float(v) for v in self.m4_stream_scales) != (1.0, 1.0, 1.0, 1.0):
+                frame_stack = spatial_stack + scales * (
+                    frame_stack - spatial_stack
+                )
+        elif float(self.m4_mix_scale) != 1.0:
+            frame_stack = spatial_stack + float(self.m4_mix_scale) * (
+                frame_stack - spatial_stack
+            )
 
         mixed, router_weights = r4.base.CrossStreamRouter(
             self.model_dim,
