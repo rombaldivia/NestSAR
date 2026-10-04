@@ -21,6 +21,7 @@ No checkpoint is written or modified.
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import jax
@@ -258,6 +259,35 @@ def main():
     )
     variants = build_variants()
 
+    # ------------------------------------------------------------------
+    # Per-variant resume cache.
+    # If Kaggle stops, already completed variant predictions are reused.
+    # Predictions are tiny (~100 KB/protocol/variant as int16) compared with
+    # the skeleton cache and let us preserve exact fixed/broken statistics.
+    # ------------------------------------------------------------------
+    out = Path(args.output)
+    resume_dir = Path(str(out) + ".resume")
+    resume_dir.mkdir(parents=True, exist_ok=True)
+    resume_meta = {
+        "model": MODEL_NAME,
+        "protocol": args.protocol,
+        "checkpoint_epoch": int(payload["epoch"]),
+        "checkpoint_val_accuracy": float(payload["val_accuracy"]),
+        "params": count_params(params),
+        "val_samples": int(len(val_ids)),
+        "variants": [name for name, _ in variants],
+    }
+    meta_path = resume_dir / "meta.json"
+    if meta_path.is_file():
+        previous_meta = json.loads(meta_path.read_text())
+        if previous_meta != resume_meta:
+            raise RuntimeError(
+                f"Resume cache identity mismatch at {resume_dir}. "
+                "Use a fresh --output path for a different checkpoint/model."
+            )
+    else:
+        atomic_json(meta_path, resume_meta)
+
     results = {}
     predictions = {}
 
@@ -273,22 +303,47 @@ def main():
     print()
 
     for i, (name, spec) in enumerate(variants, 1):
-        p = apply_combo(params, spec)
-        pred = infer_predictions(
-            apply_logits, p, dataset, val_ids, args.batch_size
-        )
+        pred_path = resume_dir / f"{i:02d}_{name}.npy"
+        reused = False
+
+        if pred_path.is_file():
+            try:
+                pred = np.load(pred_path, allow_pickle=False)
+                if pred.shape != (len(val_ids),):
+                    raise ValueError(f"bad shape {pred.shape}")
+                pred = pred.astype(np.int32, copy=False)
+                reused = True
+            except Exception:
+                pred_path.unlink(missing_ok=True)
+                reused = False
+
+        if not reused:
+            p = apply_combo(params, spec)
+            pred = infer_predictions(
+                apply_logits, p, dataset, val_ids, args.batch_size
+            ).astype(np.int16, copy=False)
+            tmp = pred_path.with_suffix(".tmp.npy")
+            np.save(tmp, pred, allow_pickle=False)
+            os.replace(tmp, pred_path)
+            pred = pred.astype(np.int32, copy=False)
+
         predictions[name] = pred
         acc = float(np.mean(pred == labels))
         results[name] = {
             "accuracy": acc,
             "spec": spec,
+            "reused_from_resume_cache": reused,
         }
         if args.status:
             atomic_json(
                 args.status,
                 {
                     "protocol": args.protocol,
-                    "phase": "Horizon intervention",
+                    "phase": (
+                        "Horizon intervention (resume)"
+                        if reused else
+                        "Horizon intervention"
+                    ),
                     "current": i,
                     "total": len(variants),
                     "variant": name,
@@ -299,6 +354,7 @@ def main():
         print(
             f"[{i:02d}/{len(variants):02d}] "
             f"{name:34s} acc={100*acc:8.4f}%"
+            + (" [reused]" if reused else "")
         )
 
     base_pred = predictions["canonical"]
@@ -419,7 +475,6 @@ def main():
         },
     }
 
-    out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     atomic_json(out, result)
     if args.status:
