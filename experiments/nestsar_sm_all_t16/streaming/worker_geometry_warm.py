@@ -62,9 +62,10 @@ from experiments.nestsar_sm_all_t16.streaming import launch as launch_base
 from experiments.nestsar_sm_all_t16.streaming import worker as base
 
 
-EXPERIMENT_NAME = "NestSAR-D128-TRANSFERABLE-GEOMETRY-WARM-v1"
+EXPERIMENT_NAME = "NestSAR-D128-TRANSFERABLE-GEOMETRY-WARM-v2"
 TRAINABLE_ROOTS = (
-    "descriptor_group",
+    "descriptor_group/hier_fuse",
+    "descriptor_group/hier_norm",
     "classifier_group",
     "adaptive_head_u",
     "adaptive_head_v",
@@ -191,8 +192,14 @@ def _trainable_mask(params):
     mask_flat = {}
 
     for path in flat:
-        root = str(path[0])
-        mask_flat[path] = root in TRAINABLE_ROOTS
+        text = "/".join(map(str, path))
+        mask_flat[path] = (
+            text.startswith("descriptor_group/hier_fuse/")
+            or text.startswith("descriptor_group/hier_norm/")
+            or text.startswith("classifier_group/")
+            or text.startswith("adaptive_head_u/")
+            or text.startswith("adaptive_head_v/")
+        )
 
     mask = unflatten_dict(mask_flat)
 
@@ -606,8 +613,55 @@ def _identity(config):
         ],
         "descriptor_margin": config["descriptor_margin"],
         "trainable_roots": list(TRAINABLE_ROOTS),
+        "warm_start_baseline_is_epoch0_best": True,
+        "g4_frozen": True,
         "source_sha256": code.hexdigest(),
     }
+
+
+def _source_baseline(path):
+    payload = serialization.msgpack_restore(Path(path).read_bytes())
+    if payload.get("model") != MODEL_NAME:
+        raise ValueError(
+            f"Warm-start source must be {MODEL_NAME}, "
+            f"got {payload.get('model')!r}"
+        )
+    return float(payload["val_accuracy"]), int(payload.get("epoch", -1))
+
+
+def _seed_public_baseline(config, protocol, outdir):
+    """Make the source EMA checkpoint the immutable epoch-0 fallback best.
+
+    This fixes warm-start bookkeeping: a continuation epoch is only considered
+    best if it actually beats the source checkpoint.
+    """
+    out = Path(outdir) / protocol
+    out.mkdir(parents=True, exist_ok=True)
+    last = out / "last.msgpack"
+
+    baseline, source_epoch = _source_baseline(config["source_checkpoint"])
+
+    # Only seed on a fresh continuation. Resume must preserve any later winner.
+    if not last.exists():
+        source_bytes = Path(config["source_checkpoint"]).read_bytes()
+        from experiments.nestsar_sm_all_t16.streaming.io_utils import (
+            atomic_bytes,
+            atomic_json,
+        )
+        atomic_bytes(out / "best.msgpack", source_bytes)
+        atomic_json(
+            out / "best.json",
+            {
+                "model": MODEL_NAME,
+                "epoch": 0,
+                "source_epoch": source_epoch,
+                "val_accuracy": baseline,
+                "params": EXPECTED_PARAMS,
+                "warm_start_baseline": True,
+            },
+        )
+
+    return baseline
 
 
 def run(config, protocol, cache, outdir, allow_cpu=False):
@@ -617,11 +671,35 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
     # this isolated worker process.
     base.EXPECTED_PARAMS = EXPECTED_PARAMS
 
+    baseline = _seed_public_baseline(config, protocol, outdir)
+
     original_create_state = base.create_state
     original_build_steps = base.build_steps
+    original_stopping_update = base.stopping_update
+
+    def stopping_update_from_source(
+        best,
+        bad_epochs,
+        val_acc,
+        epoch,
+        warmup_epochs,
+        min_delta,
+    ):
+        # base.run initializes best=-1. For warm continuation the real epoch-0
+        # best is the source checkpoint, not the first continuation epoch.
+        effective_best = baseline if best < 0 else best
+        improved = val_acc > effective_best + min_delta
+        new_best = val_acc if improved else effective_best
+        bad = (
+            0
+            if improved or epoch <= warmup_epochs
+            else bad_epochs + 1
+        )
+        return new_best, bad, improved
 
     base.create_state = create_state_geometry
     base.build_steps = build_steps_geometry
+    base.stopping_update = stopping_update_from_source
 
     try:
         return base.run(
@@ -638,6 +716,7 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
     finally:
         base.create_state = original_create_state
         base.build_steps = original_build_steps
+        base.stopping_update = original_stopping_update
 
 
 if __name__ == "__main__":
