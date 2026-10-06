@@ -238,8 +238,8 @@ def run(
             "assert s2.proto_g4.shape==(120,2,112),s2.proto_g4.shape; "
             "assert met.shape==(20,),met.shape; "
             "assert finite,diag; "
-            "assert dcount>0.0,diag; "
-            "assert gcount>0.0,diag; "
+            "assert abs(dcount-1.0)<1e-6,diag; "
+            "assert abs(gcount-1.0)<1e-6,diag; "
             "print('GEOMETRY_PREFLIGHT=PASS',flush=True)"
         )
 
