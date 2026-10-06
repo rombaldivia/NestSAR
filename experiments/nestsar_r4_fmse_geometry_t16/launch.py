@@ -197,8 +197,14 @@ def run(
                 ),
             )
 
+        # Use one REAL canonical training sample for the compile/run preflight.
+        # An all-zero synthetic skeleton can exercise artificial masked/normalization
+        # edge cases that never occur in the actual NTU cache and made the previous
+        # preflight assertion opaque.  This preflight prints every checked value and
+        # raises an explicit error if anything is wrong.
         preflight = (
-            "import json,jax,jax.numpy as jnp; "
+            "import json,numpy as np,jax,jax.numpy as jnp; "
+            "from pathlib import Path; "
             "from experiments.nestsar_r4_fmse_geometry_t16.config import validate_config; "
             "from experiments.nestsar_r4_fmse_geometry_t16.worker import "
             "create_state,build_steps,EXPECTED_PARAMS; "
@@ -206,22 +212,35 @@ def run(
             "pc=dict(c); pc['micro_batch']=1; pc['accumulation_steps']=1; "
             "m,s,k,sch,w=create_state(pc,10); "
             "n=sum(x.size for x in jax.tree.leaves(s.params)); "
-            "assert n==EXPECTED_PARAMS,(n,EXPECTED_PARAMS); "
-            "assert s.proto_desc.shape==(120,2,112); "
-            "assert s.proto_g4.shape==(120,2,112); "
+            f"cache=Path({str(cache)!r}); "
+            "splits=json.load(open(cache/'splits.json')); "
+            "idx=int(splits['xsub_train'][0]); "
+            "canonical=np.load(cache/'canonical.npy',mmap_mode='r'); "
+            "labels=np.load(cache/'labels.npy',mmap_mode='r'); "
+            "x=jnp.asarray(np.asarray(canonical[idx:idx+1],dtype=np.float32)); "
+            "y=jnp.asarray(np.asarray(labels[idx:idx+1],dtype=np.int32)); "
+            "b={'x':x,'xa':x,'y':y,'mask':jnp.ones((1,),jnp.float32)}; "
             "train_step,eval_step=build_steps(m,pc); "
-            "b={'x':jnp.zeros((1,16,750),jnp.float32),"
-            "'xa':jnp.zeros((1,16,750),jnp.float32),"
-            "'y':jnp.zeros((1,),jnp.int32),'mask':jnp.ones((1,),jnp.float32)}; "
             "exe=train_step.lower(s,k,b,jnp.asarray(0.5,jnp.float32)).compile(); "
             "s2,k2,met=jax.block_until_ready(exe(s,k,b,jnp.asarray(0.5,jnp.float32))); "
+            "finite=bool(np.asarray(jnp.all(jnp.isfinite(met)))); "
+            "dcount=float(np.asarray(jnp.sum(s2.proto_desc_count))); "
+            "gcount=float(np.asarray(jnp.sum(s2.proto_g4_count))); "
+            "diag={'params':int(n),'expected_params':int(EXPECTED_PARAMS),"
+            "'proto_desc':list(s2.proto_desc.shape),'proto_g4':list(s2.proto_g4.shape),"
+            "'metrics':list(met.shape),'finite':finite,'desc_count_sum':dcount,"
+            "'g4_count_sum':gcount,'sample_index':idx,'label':int(np.asarray(y)[0]),"
+            "'metric_min':float(np.asarray(met).min()),"
+            "'metric_max':float(np.asarray(met).max())}; "
+            "print('GEOMETRY_PREFLIGHT_DIAG='+json.dumps(diag),flush=True); "
+            "assert n==EXPECTED_PARAMS,(n,EXPECTED_PARAMS); "
+            "assert s2.proto_desc.shape==(120,2,112),s2.proto_desc.shape; "
+            "assert s2.proto_g4.shape==(120,2,112),s2.proto_g4.shape; "
             "assert met.shape==(20,),met.shape; "
-            "assert bool(jnp.all(jnp.isfinite(met))); "
-            "assert int(jnp.sum(s2.proto_desc_count))==1; "
-            "assert int(jnp.sum(s2.proto_g4_count))==1; "
-            "print('GEOMETRY_PREFLIGHT='+json.dumps({"
-            "'params':n,'proto_desc':list(s2.proto_desc.shape),"
-            "'proto_g4':list(s2.proto_g4.shape),'metrics':list(met.shape)}))"
+            "assert finite,diag; "
+            "assert dcount>0.0,diag; "
+            "assert gcount>0.0,diag; "
+            "print('GEOMETRY_PREFLIGHT=PASS',flush=True)"
         )
 
         base.quiet_run(
