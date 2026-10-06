@@ -10,7 +10,10 @@ def l2_normalize(x, eps=1e-6):
     return x / jnp.maximum(jnp.linalg.norm(x, axis=-1, keepdims=True), eps)
 
 def fused_representations(out):
-    # Geometry should improve G4/descriptor features, not solve the loss by\n    # moving the already-audited fusion controller.\n    fusion = jax.lax.stop_gradient(out["fusion_weights"])\n    desc = jnp.einsum("bs,bsd->bd", fusion, out["descriptors"])
+    # Geometry should improve G4/descriptor features, not solve the loss by
+    # moving the already-audited fusion controller.
+    fusion = jax.lax.stop_gradient(out["fusion_weights"])
+    desc = jnp.einsum("bs,bsd->bd", fusion, out["descriptors"])
     chunks = out["chunk_states"]
     g4_stream = jnp.mean(chunks, axis=2)
     g4 = jnp.einsum("bs,bsd->bd", fusion, g4_stream)
