@@ -838,12 +838,19 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
 
         val = float(eval_sum[1] / eval_sum[6])
 
+        # Do not let patience terminate the run before the geometry ramp has
+        # actually reached full strength.  After that point, preserve the exact
+        # historical R4 early-stopping rule.
+        early_stop_guard_epoch = max(
+            warmup_epochs,
+            config["geometry_full_epoch"],
+        )
         best, bad, improved = r4_worker.stopping_update(
             metadata["best"],
             metadata["bad_epochs"],
             val,
             epoch,
-            warmup_epochs,
+            early_stop_guard_epoch,
             config["min_delta"],
         )
 
