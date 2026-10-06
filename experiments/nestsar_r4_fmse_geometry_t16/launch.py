@@ -198,18 +198,30 @@ def run(
             )
 
         preflight = (
-            "import json,jax; "
+            "import json,jax,jax.numpy as jnp; "
             "from experiments.nestsar_r4_fmse_geometry_t16.config import validate_config; "
-            "from experiments.nestsar_r4_fmse_geometry_t16.worker import create_state,EXPECTED_PARAMS; "
+            "from experiments.nestsar_r4_fmse_geometry_t16.worker import "
+            "create_state,build_steps,EXPECTED_PARAMS; "
             f"c=validate_config(json.load(open({str(cfg_path)!r}))); "
-            "m,s,k,sch,w=create_state(c,10); "
+            "pc=dict(c); pc['micro_batch']=1; pc['accumulation_steps']=1; "
+            "m,s,k,sch,w=create_state(pc,10); "
             "n=sum(x.size for x in jax.tree.leaves(s.params)); "
             "assert n==EXPECTED_PARAMS,(n,EXPECTED_PARAMS); "
             "assert s.proto_desc.shape==(120,2,112); "
             "assert s.proto_g4.shape==(120,2,112); "
+            "train_step,eval_step=build_steps(m,pc); "
+            "b={'x':jnp.zeros((1,16,750),jnp.float32),"
+            "'xa':jnp.zeros((1,16,750),jnp.float32),"
+            "'y':jnp.zeros((1,),jnp.int32),'mask':jnp.ones((1,),jnp.float32)}; "
+            "exe=train_step.lower(s,k,b,jnp.asarray(0.5,jnp.float32)).compile(); "
+            "s2,k2,met=jax.block_until_ready(exe(s,k,b,jnp.asarray(0.5,jnp.float32))); "
+            "assert met.shape==(20,),met.shape; "
+            "assert bool(jnp.all(jnp.isfinite(met))); "
+            "assert int(jnp.sum(s2.proto_desc_count))==1; "
+            "assert int(jnp.sum(s2.proto_g4_count))==1; "
             "print('GEOMETRY_PREFLIGHT='+json.dumps({"
-            "'params':n,'proto_desc':list(s.proto_desc.shape),"
-            "'proto_g4':list(s.proto_g4.shape)}))"
+            "'params':n,'proto_desc':list(s2.proto_desc.shape),"
+            "'proto_g4':list(s2.proto_g4.shape),'metrics':list(met.shape)}))"
         )
 
         base.quiet_run(
