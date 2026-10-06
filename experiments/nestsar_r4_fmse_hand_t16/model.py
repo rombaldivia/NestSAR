@@ -166,6 +166,14 @@ class HandRelationFMSESpatialEncoder(nn.Module):
             name="hand_relation_up",
         )(rel_h)
 
+        # Never create a learned relation signal when none of the required
+        # distal-to-wrist pairs is actually present in this person/frame.
+        rel_present = jnp.any(
+            pair_valid[..., 0] > 0,
+            axis=-1,
+        ).astype(x.dtype)[..., None]
+        rel_h = rel_h * rel_present
+
         distal_mask = jnp.zeros(
             (JOINTS,),
             dtype=x.dtype,
