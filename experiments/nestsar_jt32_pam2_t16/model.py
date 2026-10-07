@@ -155,11 +155,24 @@ class FactorizedJointEncoder(nn.Module):
         path = actor_group(12, 15, absolute_rel=True)
 
         # Bone geometry and bone displacement retain local anatomical changes.
+        #
+        # p1/p2 are [B,T,J,C], so the joint axis is 2 (not 3).  Keep the
+        # parent/child validity mask explicit as in historical R4 so a missing
+        # parent cannot create a false bone vector against padded zeroes.
+        p1_parent_valid = jnp.take(v1, parents, axis=2)
+        p2_parent_valid = jnp.take(v2, parents, axis=2)
+        p1_bone_valid = (v1 & p1_parent_valid)[..., None].astype(tok.dtype)
+        p2_bone_valid = (v2 & p2_parent_valid)[..., None].astype(tok.dtype)
+
         p1_parent_pose = jnp.take(p1[..., 0:3], parents, axis=2)
         p2_parent_pose = jnp.take(p2[..., 0:3], parents, axis=2)
-        p1_bone = p1[..., 0:3] - p1_parent_pose
-        p2_bone = p2[..., 0:3] - p2_parent_pose
-        bone_rel = (p2_bone - p1_bone) * pair
+        p1_bone = (p1[..., 0:3] - p1_parent_pose) * p1_bone_valid
+        p2_bone = (p2[..., 0:3] - p2_parent_pose) * p2_bone_valid
+        bone_pair = (
+            (v1 & p1_parent_valid & v2 & p2_parent_valid)[..., None]
+            .astype(tok.dtype)
+        )
+        bone_rel = (p2_bone - p1_bone) * bone_pair
         bone_pose = jnp.concatenate(
             [p1_bone, p2_bone, bone_rel],
             axis=-1,
@@ -167,9 +180,9 @@ class FactorizedJointEncoder(nn.Module):
 
         p1_parent_full = jnp.take(p1[..., 3:6], parents, axis=2)
         p2_parent_full = jnp.take(p2[..., 3:6], parents, axis=2)
-        p1_bm = p1[..., 3:6] - p1_parent_full
-        p2_bm = p2[..., 3:6] - p2_parent_full
-        bm_rel = (p2_bm - p1_bm) * pair
+        p1_bm = (p1[..., 3:6] - p1_parent_full) * p1_bone_valid
+        p2_bm = (p2[..., 3:6] - p2_parent_full) * p2_bone_valid
+        bm_rel = (p2_bm - p1_bm) * bone_pair
         bone_motion = jnp.concatenate(
             [p1_bm, p2_bm, bm_rel],
             axis=-1,
