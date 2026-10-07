@@ -1,32 +1,43 @@
-"""NestSAR-RCE30-T16.
+"""NestSAR-RCEX-T16.
 
-Protected FMSE/R4 generalist plus a compact rival-conditioned evidence path.
+Strong post-RCE30 architecture:
+- protected frozen FMSE/R4 base;
+- stream-oracle-aware candidate generation;
+- learned global retrieval for candidate recall;
+- rival-conditioned high-resolution evidence;
+- no teacher-forced candidate injection during training;
+- supervised intervention gate and margin protection.
 
-The evidence path is intentionally designed to add roughly 5 MFLOPs under
-1 MAC = 2 FLOPs, matching the Astra prototype budget while implementing the
-full architectural changes rather than another scalar or head-only patch.
+This branch intentionally changes the full specialist learning problem rather
+than tuning one scalar on RCE30.
 """
 
-VERSION = "nestsar-rce30-t16-v1"
-MODEL_NAME = "NestSAR-RCE30-T16-v1"
+VERSION = "nestsar-rcex-t16-v1"
+MODEL_NAME = "NestSAR-RCEX-T16-v1"
 
 MODEL_IDENTITY = {
     "family": "NestSAR-R4-FMSE",
-    "variant": "RCE30-v1",
+    "variant": "RCEX-v1",
     "frames": 16,
     "joints": 25,
     "evidence_dim": 40,
     "evidence_blocks": 2,
     "low_rank": 4,
-    "candidate_topk": 3,
-    "rivals_per_top": 2,
-    "candidate_slots": 9,
+    "base_topk": 3,
+    "stream_top1_slots": 4,
+    "retrieval_topk": 3,
+    "rivals_for_base_top1": 2,
+    "candidate_slots": 12,
     "query_modes": 4,
     "base_protected": True,
     "base_frozen_stage2": True,
     "zero_init_correction": True,
     "masked_local_correction": True,
+    "teacher_forcing_candidates": False,
     "training_only_rival_graph": True,
-    "supports_fixed_query_ablation": True,
+    "uses_stream_oracle_candidates": True,
+    "uses_global_evidence_retrieval": True,
+    "uses_base_descriptor_context": True,
+    "uses_stream_disagreement_gate": True,
     "supports_rival_conditioned_query": True,
 }
