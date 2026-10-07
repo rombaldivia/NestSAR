@@ -186,46 +186,34 @@ def run(
         )
 
         # Exact-baseline synthetic checks for BOTH prototypes.
-        preflight = (
-            "import json,jax,jax.numpy as jnp;"
-            "from flax import serialization;"
-            "from pathlib import Path;"
-            "from experiments.nestsar_rce30_t16.worker import "
-            "load_base_checkpoint,specialist_parameter_count;"
-            "from experiments.nestsar_rce30_t16.model import NestSARRCE30T16;"
-            f"ckpt={str(base_ckpts['xsub'])!r};"
-            "bm,bp,payload=load_base_checkpoint(ckpt);"
-            "x=jnp.zeros((2,16,750),jnp.float32);"
-            "base=bm.apply({'params':bp},x,training=False)['logits'];"
-            "rivals=jnp.tile(jnp.array([[1,2]],jnp.int32),(120,1));"
-            "rivals=rivals.at[:,0].set((jnp.arange(120)+1)%120);"
-            "rivals=rivals.at[:,1].set((jnp.arange(120)+2)%120);"
-            "result={};"
-            "
-for variant in ('fixed','rival'):
-"
-            " m=NestSARRCE30T16(variant=variant,dim=40,blocks=2,rank=4,dropout=0.05)
-"
-            " k=jax.random.PRNGKey(11)
-"
-            " p=m.init({'params':k,'dropout':k},x,base,rivals,training=False)['params']
-"
-            " o=m.apply({'params':p},x,base,rivals,training=False)
-"
-            " err=float(jnp.max(jnp.abs(o['logits']-base)))
-"
-            " n=int(sum(v.size for v in jax.tree.leaves(p)))
-"
-            " assert err<=1e-7,(variant,err)
-"
-            " assert o['carrier'].shape==(2,16,25,40)
-"
-            " assert o['evidence_bank'].shape==(2,25,40)
-"
-            " result[variant]={'params':n,'baseline_max_abs_error':err,"
-            "'carrier':list(o['carrier'].shape),'bank':list(o['evidence_bank'].shape)}
-"
-            "print('RCE_PREFLIGHT='+json.dumps(result),flush=True)"
+        preflight = "\n".join(
+            [
+                "import json",
+                "import jax",
+                "import jax.numpy as jnp",
+                "from experiments.nestsar_rce30_t16.worker import load_base_checkpoint",
+                "from experiments.nestsar_rce30_t16.model import NestSARRCE30T16",
+                f"ckpt={str(base_ckpts['xsub'])!r}",
+                "bm,bp,payload=load_base_checkpoint(ckpt)",
+                "x=jnp.zeros((2,16,750),jnp.float32)",
+                "base=bm.apply({'params':bp},x,training=False)['logits']",
+                "rivals=jnp.zeros((120,2),jnp.int32)",
+                "rivals=rivals.at[:,0].set((jnp.arange(120)+1)%120)",
+                "rivals=rivals.at[:,1].set((jnp.arange(120)+2)%120)",
+                "result={}",
+                "for variant in ('fixed','rival'):",
+                "    m=NestSARRCE30T16(variant=variant,dim=40,blocks=2,rank=4,dropout=0.05)",
+                "    k=jax.random.PRNGKey(11)",
+                "    p=m.init({'params':k,'dropout':k},x,base,rivals,training=False)['params']",
+                "    o=m.apply({'params':p},x,base,rivals,training=False)",
+                "    err=float(jnp.max(jnp.abs(o['logits']-base)))",
+                "    n=int(sum(v.size for v in jax.tree.leaves(p)))",
+                "    assert err<=1e-7,(variant,err)",
+                "    assert o['carrier'].shape==(2,16,25,40)",
+                "    assert o['evidence_bank'].shape==(2,25,40)",
+                "    result[variant]={'params':n,'baseline_max_abs_error':err,'carrier':list(o['carrier'].shape),'bank':list(o['evidence_bank'].shape)}",
+                "print('RCE_PREFLIGHT='+json.dumps(result),flush=True)",
+            ]
         )
 
         base.quiet_run(
