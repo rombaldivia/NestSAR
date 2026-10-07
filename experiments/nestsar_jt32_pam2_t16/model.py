@@ -155,8 +155,8 @@ class FactorizedJointEncoder(nn.Module):
         path = actor_group(12, 15, absolute_rel=True)
 
         # Bone geometry and bone displacement retain local anatomical changes.
-        p1_parent_pose = jnp.take(p1[..., 0:3], parents, axis=3)
-        p2_parent_pose = jnp.take(p2[..., 0:3], parents, axis=3)
+        p1_parent_pose = jnp.take(p1[..., 0:3], parents, axis=2)
+        p2_parent_pose = jnp.take(p2[..., 0:3], parents, axis=2)
         p1_bone = p1[..., 0:3] - p1_parent_pose
         p2_bone = p2[..., 0:3] - p2_parent_pose
         bone_rel = (p2_bone - p1_bone) * pair
@@ -165,8 +165,8 @@ class FactorizedJointEncoder(nn.Module):
             axis=-1,
         )
 
-        p1_parent_full = jnp.take(p1[..., 3:6], parents, axis=3)
-        p2_parent_full = jnp.take(p2[..., 3:6], parents, axis=3)
+        p1_parent_full = jnp.take(p1[..., 3:6], parents, axis=2)
+        p2_parent_full = jnp.take(p2[..., 3:6], parents, axis=2)
         p1_bm = p1[..., 3:6] - p1_parent_full
         p2_bm = p2[..., 3:6] - p2_parent_full
         bm_rel = (p2_bm - p1_bm) * pair
