@@ -435,7 +435,7 @@ class CandidateBuilder:
                 (b, NUM_CLASSES),
                 dtype=jnp.float32,
             )
-            return mask.at[rows, idx].max(1.0)
+            return mask.at[rows, idx].set(1.0)
 
         return (
             candidate_idx,
