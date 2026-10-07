@@ -56,6 +56,56 @@ These gains are noise-level and not architecturally meaningful.
 - Geometry loss contribution: **0.000826**
 - At best epoch 25: D active **21.94%**, G4 active **42.56%**
 
+## Class-error audit of the exact best checkpoints
+
+The best XSUB/XSET checkpoints from this branch were audited end-to-end and reproduced with **+0.000000 pp** delta.
+
+### XSUB
+
+- Top-1: **77.336554%**
+- Top-5: **93.682123%**
+- macro recall: **78.952%**
+
+Weakest classes are dominated by fine-grained actions:
+
+- A073 staple book: 27.85%
+- A072 make victory sign: 36.35%
+- A074 counting money: 39.65%
+- A071 make OK sign: 43.30%
+- A084 play magic cube: 47.03%
+- A091 open a box: 47.91%
+- A105 blow nose: 49.22%
+- A082 fold paper: 50.96%
+- A075 cutting nails: 51.14%
+- A012 writing: 53.31%
+
+Largest confusions include A072->A071 (169), A073->A076 (154), A071->A072 (141), A074->A084 (87) and A074->A075 (86).
+
+### XSET
+
+- Top-1: **78.458900%**
+- Top-5: **94.043075%**
+- macro recall: **78.419%**
+
+Weakest classes:
+
+- A072 make victory sign: 39.80%
+- A012 writing: 40.76%
+- A073 staple book: 40.78%
+- A074 counting money: 43.62%
+- A084 play magic cube: 49.28%
+- A071 make OK sign: 50.41%
+- A011 reading: 52.20%
+- A107 wield knife towards other person: 52.64%
+- A076 cutting paper with scissors: 52.66%
+- A075 cutting nails: 53.43%
+
+Largest confusions include A072->A071 (128), A071->A072 (119), A073->A076 (93), A076->A073 (91), A017->A016 (83), A016->A017 (79), A056->A118 (78) and A012->A030 (77).
+
+Seven weak classes recur in both protocols: **A071/A072/A073/A074/A075/A084/A012**.
+
+This strongly reinforces the negative geometry conclusion: the residual error is structured around specific rival classes and fine evidence, not a universal late-embedding margin problem.
+
 ## What worked
 
 - Prototype banks fully populated.
@@ -97,4 +147,6 @@ Such sweeps are too close to two already-negative prototype/geometry experiments
 
 **Archive as a clean negative result.**
 
-Keep the checkpoint because it is numerically the best XSUB FMSE-family checkpoint and its inference graph is still plain FMSE, but do not continue the geometry-loss research line.
+Keep the checkpoints because they reproduce exactly and are the strongest FMSE-architecture weights currently available. Their inference graph is still plain FMSE.
+
+Do not continue geometry-loss tuning. The full NTU120 class audit redirects the next architecture toward a protected FMSE base plus a rival-conditioned high-resolution evidence path.
