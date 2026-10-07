@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Dual-T4 launcher for NestSAR-RCE30.
+"""Dual-T4 launcher for NestSAR-RCEX.
 
 GPU0 -> XSUB specialist using protected XSUB FMSE checkpoint.
 GPU1 -> XSET specialist using protected XSET FMSE checkpoint.
@@ -30,7 +30,7 @@ MODULE = "experiments.nestsar_rce30_t16"
 
 def run(
     *,
-    outdir="/kaggle/working/NestSAR_RCE30_T16_v1",
+    outdir="/kaggle/working/NestSAR_RCEX_T16_v1",
     cache_dir="/kaggle/working/NestSAR_R4_EMA_REP_CONSISTENCY_CACHE_REBUILT_v1",
     base_xsub_checkpoint="/kaggle/working/NestSAR_R4_FMSE_LOCAL_GEOMETRY_T16_v1/xsub/best.msgpack",
     base_xset_checkpoint="/kaggle/working/NestSAR_R4_FMSE_LOCAL_GEOMETRY_T16_v1/xset/best.msgpack",
@@ -72,7 +72,7 @@ def run(
     except BlockingIOError:
         lock.close()
         raise RuntimeError(
-            "This OUT_DIR already has an active RCE launcher."
+            "This OUT_DIR already has an active RCEX launcher."
         )
 
     bars = []
@@ -96,7 +96,7 @@ def run(
         old = read_json(cfg_path)
         if old is not None and old != c:
             raise ValueError(
-                "OUT_DIR has a different RCE config. "
+                "OUT_DIR has a different RCEX config. "
                 "Use the same config to resume or choose a new OUT_DIR."
             )
         atomic_json(cfg_path, c)
@@ -178,54 +178,54 @@ def run(
                 "xsub",
                 0,
                 dict(
-                    phase="RCE compute audit",
+                    phase="RCEX compute audit",
                     current=0,
                     total=1,
                 ),
             ),
         )
 
-        # Exact-baseline synthetic checks for BOTH prototypes.
+        # Exact-baseline synthetic check using the real frozen FMSE interface.
         preflight = "\n".join(
             [
                 "import json",
                 "import jax",
                 "import jax.numpy as jnp",
                 "from experiments.nestsar_rce30_t16.worker import load_base_checkpoint",
-                "from experiments.nestsar_rce30_t16.model import NestSARRCE30T16",
+                "from experiments.nestsar_rce30_t16.model import NestSARRCEXT16",
                 f"ckpt={str(base_ckpts['xsub'])!r}",
                 "bm,bp,payload=load_base_checkpoint(ckpt)",
                 "x=jnp.zeros((2,16,750),jnp.float32)",
-                "base=bm.apply({'params':bp},x,training=False)['logits']",
+                "base=bm.apply({'params':bp},x,training=False)",
                 "rivals=jnp.zeros((120,2),jnp.int32)",
                 "rivals=rivals.at[:,0].set((jnp.arange(120)+1)%120)",
                 "rivals=rivals.at[:,1].set((jnp.arange(120)+2)%120)",
-                "result={}",
-                "for variant in ('fixed','rival'):",
-                "    m=NestSARRCE30T16(variant=variant,dim=40,blocks=2,rank=4,dropout=0.05)",
-                "    k=jax.random.PRNGKey(11)",
-                "    p=m.init({'params':k,'dropout':k},x,base,rivals,training=False)['params']",
-                "    o=m.apply({'params':p},x,base,rivals,training=False)",
-                "    err=float(jnp.max(jnp.abs(o['logits']-base)))",
-                "    n=int(sum(v.size for v in jax.tree.leaves(p)))",
-                "    assert err<=1e-7,(variant,err)",
-                "    assert o['carrier'].shape==(2,16,25,40)",
-                "    assert o['evidence_bank'].shape==(2,25,40)",
-                "    result[variant]={'params':n,'baseline_max_abs_error':err,'carrier':list(o['carrier'].shape),'bank':list(o['evidence_bank'].shape)}",
-                "print('RCE_PREFLIGHT='+json.dumps(result),flush=True)",
+                "m=NestSARRCEXT16(dim=40,blocks=2,rank=4,dropout=0.06)",
+                "k=jax.random.PRNGKey(11)",
+                "p=m.init({'params':k,'dropout':k},x,base['logits'],base['stream_logits'],base['descriptors'],base['fusion_weights'],rivals,training=False)['params']",
+                "o=m.apply({'params':p},x,base['logits'],base['stream_logits'],base['descriptors'],base['fusion_weights'],rivals,training=False)",
+                "err=float(jnp.max(jnp.abs(o['logits']-base['logits'])))",
+                "n=int(sum(v.size for v in jax.tree.leaves(p)))",
+                "assert err<=1e-7,err",
+                "assert o['carrier'].shape==(2,16,25,40)",
+                "assert o['evidence_bank'].shape==(2,25,40)",
+                "assert o['retrieval_logits'].shape==(2,120)",
+                "assert o['candidate_idx'].shape==(2,12)",
+                "result={'params':n,'baseline_max_abs_error':err,'carrier':list(o['carrier'].shape),'bank':list(o['evidence_bank'].shape),'retrieval':list(o['retrieval_logits'].shape),'candidates':list(o['candidate_idx'].shape)}",
+                "print('RCEX_PREFLIGHT='+json.dumps(result),flush=True)",
             ]
         )
 
         base.quiet_run(
             [python, "-c", preflight],
-            out / "rce_preflight.log",
+            out / "rcex_preflight.log",
             base.isolated_env(gpus[0]),
             lambda: base.update_bar(
                 bars[0],
                 "xsub",
                 0,
                 dict(
-                    phase="RCE exact-baseline preflight",
+                    phase="RCEX exact-baseline preflight",
                     current=0,
                     total=1,
                 ),
