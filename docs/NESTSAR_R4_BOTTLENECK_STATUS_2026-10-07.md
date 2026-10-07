@@ -164,6 +164,100 @@ Representative hard neighborhoods:
 
 A002 is more representation-limited: Top-1 61.82%, Top-5 only 81.45%.
 
+## Full NTU120 class-error audit
+
+Using the strongest FMSE-architecture checkpoints (FMSE + training-only local geometry):
+
+### XSUB
+
+- n: **50,919**
+- Top-1: **77.336554%**
+- Top-5: **93.682123%**
+- macro recall: **78.952%**
+- checkpoint reproduction delta: **+0.000000 pp**
+
+Weakest classes:
+
+- A073 staple book: **27.85%**
+- A072 make victory sign: **36.35%**
+- A074 counting money: **39.65%**
+- A071 make OK sign: **43.30%**
+- A084 play magic cube: **47.03%**
+- A091 open a box: **47.91%**
+- A105 blow nose: **49.22%**
+- A082 fold paper: **50.96%**
+- A075 cutting nails: **51.14%**
+- A012 writing: **53.31%**
+
+Largest confusion directions:
+
+- A072 -> A071: **169**
+- A073 -> A076: **154**
+- A071 -> A072: **141**
+- A074 -> A084: **87**
+- A074 -> A075: **86**
+- A072 -> A069: **75**
+- A106 -> A050: **75**
+- A118 -> A056: **72**
+
+### XSET
+
+- n: **59,477**
+- Top-1: **78.458900%**
+- Top-5: **94.043075%**
+- macro recall: **78.419%**
+- checkpoint reproduction delta: **+0.000000 pp**
+
+Weakest classes:
+
+- A072 make victory sign: **39.80%**
+- A012 writing: **40.76%**
+- A073 staple book: **40.78%**
+- A074 counting money: **43.62%**
+- A084 play magic cube: **49.28%**
+- A071 make OK sign: **50.41%**
+- A011 reading: **52.20%**
+- A107 wield knife towards other person: **52.64%**
+- A076 cutting paper with scissors: **52.66%**
+- A075 cutting nails: **53.43%**
+
+Largest confusion directions:
+
+- A072 -> A071: **128**
+- A071 -> A072: **119**
+- A073 -> A076: **93**
+- A076 -> A073: **91**
+- A017 -> A016: **83**
+- A016 -> A017: **79**
+- A056 -> A118: **78**
+- A012 -> A030: **77**
+
+Seven classes are present in the weakest-10 list of both protocols:
+
+- A071
+- A072
+- A073
+- A074
+- A075
+- A084
+- A012
+
+This cross-protocol overlap is strong evidence that the remaining weakness is systematic rather than split-specific.
+
+The recurrent error families are:
+
+1. **micro hand/gesture geometry** — A069/A071/A072;
+2. **fine object manipulation / local trajectory** — A073/A074/A075/A076/A082/A084/A091;
+3. **direction / interaction semantics** — A016/A017, A050/A106, A056/A118, A107;
+4. **local reading/writing/typing discrimination** — A011/A012/A030.
+
+The large global Top-5 versus Top-1 gap means much of the missing accuracy is local ranking, not total absence of the correct class.
+
+The next audit should compute per-class Top-5 recall for all 120 classes and separate:
+
+- **Type R**: ranking failures, correct class usually in Top-5;
+- **Type I**: representation failures, correct class frequently outside Top-5.
+
 ## JT32 replacement evidence
 
 Deep JT32 global replacement failed:
@@ -180,7 +274,9 @@ Conclusion: **do not replace the strong FMSE backbone globally**.
 
 The evidence now supports:
 
-**The main remaining problem is concentrated local fine-class discrimination, with a smaller subset of true representation failures.**
+**The main remaining problem is concentrated fine-class rival discrimination, with a smaller subset of genuine representation failures.**
+
+The full NTU120 audit strengthens this conclusion because the same weak classes and confusion pairs recur across both XSUB and XSET.
 
 Not supported as primary solutions:
 
@@ -193,17 +289,30 @@ Not supported as primary solutions:
 - tiny hand-only residuals
 - full replacement by the under-capacity JT32 v1
 
-## Current recommended direction
+## Current recommended direction — NestSAR-RCE
 
-Protect FMSE and add a **conditional rival/fine-motion specialist**:
+Protect FMSE and add **Rival-Conditioned Evidence (RCE)**:
 
-1. base FMSE logits remain the default;
-2. specialist sees richer pre-pooling joint-time motion;
-3. specialist activates only for ambiguous local neighborhoods;
-4. correction logits are zero-initialized;
-5. logits outside the active rival cluster are unchanged;
-6. protection/distillation loss suppresses destructive corrections on confident base predictions;
-7. hard clusters for NTU120 training are derived from training-only statistics to avoid validation leakage;
-8. separate representation-improvement treatment is allowed for A002-like failure modes.
+1. FMSE/R4 remains the protected generalist and supplies the default logits.
+2. A separate D40 high-resolution evidence path consumes richer pre-pooling joint-time motion.
+3. Preserve complete motion families, including parent-relative phase/path terms that JT32-v1 accidentally dropped.
+4. Use 1-2 parallel joint-time evidence blocks with temporal axial mixing, spatial axial mixing, spectral/DCT evidence and low-rank associative memory.
+5. Replace generic mean readout with **rival-conditioned learned queries** over the joint-time tokens.
+6. Build a small candidate set from FMSE Top-k plus training-derived rivals.
+7. Zero-initialize the correction projection so the initial final logits exactly reproduce FMSE.
+8. Mask correction logits outside the active candidate/rival set.
+9. Gate intervention using FMSE margin, local entropy and specialist evidence; confident clips should bypass the specialist.
+10. Use a protection/distillation loss to suppress destructive corrections on confident FMSE predictions.
+11. Derive hard neighborhoods from cross-fitted or strongly augmented **training-only** predictions, not validation confusion.
+12. Track **fixed vs broken** and per-class Top-5 as first-class diagnostics.
+13. Treat Type-I representation failures separately from Type-R local ranking failures.
 
-This direction directly targets the observed fixed/broken cancellation problem while preserving the strongest parts of the existing model.
+Current design estimates, not audited counts:
+
+- added parameters: **~0.08-0.15M**
+- worst-case invoked specialist compute: **~0.035-0.040 strict GFLOPs**
+- if invoked on 20-30% of clips: estimated average added compute **~0.008-0.012 GFLOPs**
+
+Do not publish those compute figures until a compiler-independent operator audit is committed.
+
+This direction directly targets the observed class-error structure while preserving the strongest parts of the existing model.
