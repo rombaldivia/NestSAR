@@ -27,6 +27,92 @@ Delta vs R4:
 
 This is materially different from the many post-compression changes that produced only noise-level gains.
 
+## Full NTU120 class-error audit using the strongest FMSE-architecture checkpoints
+
+The later FMSE + training-only local-geometry checkpoints reproduce exactly and use the same FMSE inference graph.
+
+### XSUB
+
+- n: **50,919**
+- Top-1: **77.336554%**
+- Top-5: **93.682123%**
+- macro recall: **78.952%**
+- reproduction delta: **+0.000000 pp**
+
+Weakest classes:
+
+| Class | Action | Recall |
+|---|---|---:|
+| A073 | staple book | **27.85%** |
+| A072 | make victory sign | **36.35%** |
+| A074 | counting money | **39.65%** |
+| A071 | make OK sign | **43.30%** |
+| A084 | play magic cube | **47.03%** |
+| A091 | open a box | **47.91%** |
+| A105 | blow nose | **49.22%** |
+| A082 | fold paper | **50.96%** |
+| A075 | cutting nails | **51.14%** |
+| A012 | writing | **53.31%** |
+
+Largest confusion directions:
+
+- A072 -> A071: **169**
+- A073 -> A076: **154**
+- A071 -> A072: **141**
+- A074 -> A084: **87**
+- A074 -> A075: **86**
+- A072 -> A069: **75**
+- A106 -> A050: **75**
+- A118 -> A056: **72**
+
+### XSET
+
+- n: **59,477**
+- Top-1: **78.458900%**
+- Top-5: **94.043075%**
+- macro recall: **78.419%**
+- reproduction delta: **+0.000000 pp**
+
+Weakest classes:
+
+| Class | Action | Recall |
+|---|---|---:|
+| A072 | make victory sign | **39.80%** |
+| A012 | writing | **40.76%** |
+| A073 | staple book | **40.78%** |
+| A074 | counting money | **43.62%** |
+| A084 | play magic cube | **49.28%** |
+| A071 | make OK sign | **50.41%** |
+| A011 | reading | **52.20%** |
+| A107 | wield knife towards other person | **52.64%** |
+| A076 | cutting paper with scissors | **52.66%** |
+| A075 | cutting nails | **53.43%** |
+
+Largest confusion directions:
+
+- A072 -> A071: **128**
+- A071 -> A072: **119**
+- A073 -> A076: **93**
+- A076 -> A073: **91**
+- A017 -> A016: **83**
+- A016 -> A017: **79**
+- A056 -> A118: **78**
+- A012 -> A030: **77**
+
+Seven weakest classes recur in both protocols: **A071, A072, A073, A074, A075, A084 and A012**.
+
+This cross-protocol stability is the strongest evidence so far that the remaining bottleneck is concentrated, systematic fine-class discrimination rather than a generic capacity shortage.
+
+The recurring error families are:
+
+- micro hand/gesture geometry;
+- fine object manipulation and local trajectory;
+- temporal direction/order;
+- inter-person direction/interaction semantics;
+- reading/writing/typing-like local ranking.
+
+The large Top-5/Top-1 gap shows that much of the missing accuracy is local ranking rather than complete loss of the correct class.
+
 ## NTU60 compatibility audit using the best FMSE-architecture XSUB weights
 
 The strongest tested XSUB checkpoint used the FMSE inference architecture and was trained with the later geometry loss only during training. Its original NTU120 XSUB result was **77.336554%**.
@@ -146,4 +232,16 @@ Diagnostic NTU60 neighborhoods worth investigating (not hard-coding directly):
 
 ## Decision
 
-**Keep FMSE as the protected backbone.** Future work should add targeted fine-motion discrimination rather than another global replacement or generic width increase.
+**Keep FMSE as the protected backbone.**
+
+The next strong architecture should be **NestSAR-RCE (Rival-Conditioned Evidence)** rather than another global replacement:
+
+- FMSE supplies default logits;
+- a D40 high-resolution pre-pooling evidence path preserves individual joint-time motion;
+- rival-conditioned learned queries gather evidence for the current ambiguous class neighborhood;
+- correction logits are zero-initialized and masked outside that neighborhood;
+- confident FMSE decisions bypass the specialist;
+- hard neighborhoods are learned from cross-fitted/augmented training-only predictions;
+- fixed-vs-broken and per-class Top-5 become primary diagnostics.
+
+This preserves the model's strong generalist behavior while targeting the exact cross-protocol fine-class failures observed in the audit.
