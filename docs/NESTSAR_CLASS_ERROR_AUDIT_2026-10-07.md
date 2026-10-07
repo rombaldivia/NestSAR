@@ -327,6 +327,42 @@ Static specialist compute estimate:
 
 under 1 MAC = 2 FLOPs. Exact publishable compute still requires the operator auditor.
 
+## RCE30 early-run diagnosis and RCEX correction
+
+The first RCE30 run remained almost exactly at the protected FMSE baseline
+while training accuracy reached approximately 100% in the first few epochs.
+
+Source inspection identified a concrete train/eval mismatch:
+
+- training passed `force_class=y` into the specialist;
+- the candidate builder replaced one candidate slot with the ground-truth class;
+- validation/inference did not and cannot do this.
+
+Therefore the local ranker was optimized on an easier candidate problem than
+the real inference problem.  The early near-100% training accuracy is not
+evidence that the natural routing problem was solved.
+
+A new full branch was created:
+
+- `experiment/nestsar-rcex-t16`
+
+RCEX removes true-class candidate injection entirely and adds:
+
+- final FMSE Top-3 candidates;
+- four FMSE stream Top-1 candidates;
+- a learned global 120-class evidence-retrieval Top-3;
+- two training-only rivals of the final Top-1;
+- frozen FMSE descriptor context;
+- per-stream candidate support;
+- explicit gate supervision;
+- KL + margin + correction-norm protection;
+- hard-example weighting based on base error/margin/stream disagreement;
+- stronger training-only rival mining from clean + multiple augmented passes.
+
+The RCEX static specialist estimate is approximately **7.96 MFLOPs** under
+1 MAC = 2 FLOPs, versus approximately 5.27 MFLOPs for the first rival RCE30
+prototype.
+
 ## Decision
 
 The strongest current diagnosis is:
