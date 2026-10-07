@@ -1,23 +1,23 @@
 from __future__ import annotations
 
-"""Compact Rival-Conditioned Evidence (RCE30) specialist.
+"""NestSAR-RCEX: stream-oracle-aware Rival-Conditioned Evidence.
 
-The FMSE/R4 base remains frozen and supplies base logits.  This module consumes
-the same [B,16,750] input and learns only a residual correction.
+RCEX keeps the successful FMSE/R4 model frozen and changes the specialist
+problem substantially relative to RCE30:
 
-Design constraints from the diagnostic work:
-- preserve individual joint-time evidence until the specialist readout;
-- retain complete pose/motion/parent-relative motion families;
-- include distal and inter-person evidence;
-- avoid JT32's destructive mean-pooling readout;
-- build candidate sets from FMSE Top-3 plus training-derived rivals;
-- use learned rival-conditioned queries;
-- zero-initialize the correction so initial predictions exactly equal FMSE;
-- mask corrections outside the active candidate set.
+1. no teacher-forced class insertion at training time;
+2. candidates come from four complementary sources:
+   final FMSE Top-3, four stream Top-1 predictions, learned evidence retrieval
+   Top-3, and two training-only rivals of the base Top-1;
+3. a global class-conditioned retrieval head is trained to increase candidate
+   recall before local reranking;
+4. local rival queries consume high-resolution joint evidence AND frozen FMSE
+   descriptor/stream evidence;
+5. gating sees cross-stream disagreement and is trained explicitly in worker.py;
+6. zero-initialized masked corrections still make initial RCEX == FMSE exactly.
 
-The implementation also includes a fixed-query ablation so the ordinary
-learned-query and rival-conditioned prototypes can be compared under the same
-training schedule.
+The goal is to exploit the previously measured large any-stream oracle gap
+without allowing a new global model to destroy already-correct FMSE decisions.
 """
 
 from typing import Mapping
@@ -37,29 +37,37 @@ JOINTS = 25
 TOKEN_CHANNELS = 15
 FEATURES = 750
 NUM_CLASSES = 120
+NUM_STREAMS = 4
+BASE_DESCRIPTOR_DIM = 112
 
 EVIDENCE_DIM = 40
 LOW_RANK = 4
 QUERY_MODES = 4
-TOPK = 3
-RIVALS_PER_TOP = 2
-CANDIDATE_SLOTS = TOPK * (1 + RIVALS_PER_TOP)  # 9
+
+BASE_TOPK = 3
+STREAM_TOP1_SLOTS = 4
+RETRIEVAL_TOPK = 3
+RIVALS_FOR_BASE_TOP1 = 2
+CANDIDATE_SLOTS = (
+    BASE_TOPK
+    + STREAM_TOP1_SLOTS
+    + RETRIEVAL_TOPK
+    + RIVALS_FOR_BASE_TOP1
+)  # 12
 
 
 PARENTS_NP = np.asarray(r4.base.PARENTS, np.int32)
 
-# NTU 0-based distal chain anchors.
-# wrist -> elbow, hand -> wrist, hand-tip/thumb -> wrist.
 DISTAL_ANCHOR_NP = np.arange(JOINTS, dtype=np.int32)
 for child, anchor in (
-    (6, 5),   # left wrist -> left elbow
-    (7, 6),   # left hand -> left wrist
-    (21, 6),  # left hand tip -> left wrist
-    (22, 6),  # left thumb -> left wrist
-    (10, 9),  # right wrist -> right elbow
-    (11, 10), # right hand -> right wrist
-    (23, 10), # right hand tip -> right wrist
-    (24, 10), # right thumb -> right wrist
+    (6, 5),
+    (7, 6),
+    (21, 6),
+    (22, 6),
+    (10, 9),
+    (11, 10),
+    (23, 10),
+    (24, 10),
 ):
     DISTAL_ANCHOR_NP[child] = anchor
 
@@ -81,49 +89,64 @@ def _dct_basis(k_count=3):
 DCT_BASIS_NP = _dct_basis(3)
 
 
-def _safe_entropy_from_logits(logits: jnp.ndarray) -> jnp.ndarray:
+def _entropy_from_logits(logits: jnp.ndarray) -> jnp.ndarray:
     p = jax.nn.softmax(logits, axis=-1)
-    return -jnp.sum(p * jax.nn.log_softmax(logits, axis=-1), axis=-1)
+    return -jnp.sum(
+        p * jax.nn.log_softmax(logits, axis=-1),
+        axis=-1,
+    )
 
 
 class _FamilyViewProjector(nn.Module):
-    """Project P1, P2 and relative 3-D evidence separately (never 9 -> 4)."""
+    """Keep P1, P2 and P2-P1 distinct instead of compressing 9 -> 4."""
 
     out_each: int = 2
 
     @nn.compact
     def __call__(
         self,
-        family: jnp.ndarray,   # [B,T,P,J,3]
+        family: jnp.ndarray,
         pair_valid: jnp.ndarray,
     ) -> jnp.ndarray:
         p1 = family[:, :, 0]
         p2 = family[:, :, 1]
-        rel = (p2 - p1) * pair_valid[..., None].astype(family.dtype)
+        rel = (
+            p2 - p1
+        ) * pair_valid[..., None].astype(family.dtype)
 
         pieces = []
-        for name, x in (("p1", p1), ("p2", p2), ("rel", rel)):
+        for name, z in (
+            ("p1", p1),
+            ("p2", p2),
+            ("rel", rel),
+        ):
             pieces.append(
                 nn.gelu(
                     nn.Dense(
                         self.out_each,
                         name=name,
-                    )(x)
+                    )(z)
                 )
             )
-        return jnp.concatenate(pieces, axis=-1)  # 6-D
+        return jnp.concatenate(pieces, axis=-1)
 
 
 class RichEvidenceEncoder(nn.Module):
-    """Preserve full pre-pooling joint-time evidence in a D40 carrier."""
+    """Complete pre-pooling joint-time evidence -> persistent D40 carrier."""
 
     dim: int = EVIDENCE_DIM
     dropout: float = 0.05
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, training: bool) -> jnp.ndarray:
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        training: bool,
+    ) -> jnp.ndarray:
         if x.shape[1:] != (FRAMES, FEATURES):
-            raise ValueError(f"Expected [B,16,750], got {x.shape}")
+            raise ValueError(
+                f"Expected [B,16,750], got {x.shape}"
+            )
 
         tok = x.reshape(
             x.shape[0],
@@ -133,9 +156,17 @@ class RichEvidenceEncoder(nn.Module):
             TOKEN_CHANNELS,
         )
 
-        joint_valid = jnp.any(jnp.abs(tok) > 1e-8, axis=-1)
-        person_present = jnp.any(joint_valid, axis=3)
-        joint_valid = joint_valid.at[..., 0].set(person_present)
+        joint_valid = jnp.any(
+            jnp.abs(tok) > 1e-8,
+            axis=-1,
+        )
+        person_present = jnp.any(
+            joint_valid,
+            axis=3,
+        )
+        joint_valid = joint_valid.at[..., 0].set(
+            person_present
+        )
         tok = tok * joint_valid[..., None].astype(tok.dtype)
 
         p1v = joint_valid[:, :, 0]
@@ -149,12 +180,19 @@ class RichEvidenceEncoder(nn.Module):
         path = tok[..., 12:15]
 
         parents = jnp.asarray(PARENTS_NP)
-
-        parent_valid = jnp.take(joint_valid, parents, axis=3)
+        parent_valid = jnp.take(
+            joint_valid,
+            parents,
+            axis=3,
+        )
         bone_valid = joint_valid & parent_valid
 
         def parent_relative(z, absolute=False):
-            parent = jnp.take(z, parents, axis=3)
+            parent = jnp.take(
+                z,
+                parents,
+                axis=3,
+            )
             rel = z - parent
             if absolute:
                 rel = jnp.abs(rel)
@@ -166,7 +204,6 @@ class RichEvidenceEncoder(nn.Module):
         bone_phase_b = parent_relative(phase_b)
         bone_path = parent_relative(path, absolute=True)
 
-        # Ten complete evidence families.  R4/FMSE information is not dropped.
         families = (
             pose,
             bone_pose,
@@ -192,7 +229,6 @@ class RichEvidenceEncoder(nn.Module):
                 )
             )
 
-        # Validity/inter-person presence evidence.
         presence = jnp.stack(
             [
                 p1v.astype(tok.dtype),
@@ -208,7 +244,6 @@ class RichEvidenceEncoder(nn.Module):
             )(presence)
         )
 
-        # Explicit distal evidence on the complete 12-D motion descriptor.
         motion12 = jnp.concatenate(
             [full, phase_a, phase_b, path],
             axis=-1,
@@ -225,15 +260,26 @@ class RichEvidenceEncoder(nn.Module):
             axis=3,
         )
         distal_valid = joint_valid & anchor_valid
-        distal = (motion12 - anchor_motion) * distal_valid[..., None].astype(tok.dtype)
-        distal = distal * jnp.asarray(DISTAL_MASK_NP, tok.dtype)[None, None, None, :, None]
+        distal = (
+            motion12 - anchor_motion
+        ) * distal_valid[..., None].astype(tok.dtype)
+        distal = distal * jnp.asarray(
+            DISTAL_MASK_NP,
+            tok.dtype,
+        )[None, None, None, :, None]
 
         d1 = distal[:, :, 0]
         d2 = distal[:, :, 1]
-        drel = (d2 - d1) * pair_valid[..., None].astype(tok.dtype)
+        drel = (
+            d2 - d1
+        ) * pair_valid[..., None].astype(tok.dtype)
 
         distal_pieces = []
-        for name, z in (("p1", d1), ("p2", d2), ("rel", drel)):
+        for name, z in (
+            ("p1", d1),
+            ("p2", d2),
+            ("rel", drel),
+        ):
             distal_pieces.append(
                 nn.gelu(
                     nn.Dense(
@@ -242,14 +288,19 @@ class RichEvidenceEncoder(nn.Module):
                     )(z)
                 )
             )
-        distal_feat = jnp.concatenate(distal_pieces, axis=-1)  # 6-D
+        distal_feat = jnp.concatenate(
+            distal_pieces,
+            axis=-1,
+        )
 
         h = jnp.concatenate(
             projected + [presence, distal_feat],
             axis=-1,
         )
         if h.shape[-1] != 70:
-            raise ValueError(f"Expected 70-D preserved evidence, got {h.shape}")
+            raise ValueError(
+                f"Expected 70-D evidence, got {h.shape}"
+            )
 
         h = nn.Dense(
             self.dim,
@@ -267,9 +318,12 @@ class RichEvidenceEncoder(nn.Module):
             (1, FRAMES, 1, self.dim),
         )
 
-        h = nn.LayerNorm(name="evidence_norm")(
+        h = nn.LayerNorm(
+            name="evidence_norm",
+        )(
             h + joint_embed + time_embed
         )
+
         return nn.Dropout(
             self.dropout,
             name="evidence_dropout",
@@ -280,17 +334,18 @@ class RichEvidenceEncoder(nn.Module):
 
 
 class EvidenceRefineBlock(nn.Module):
-    """Cheap joint-time refinement with channel, temporal and anatomical deltas.
-
-    Three D40 -> rank4 -> D40 residual branches preserve the ~5 MFLOP specialist
-    budget while still changing the architecture substantially.
-    """
+    """Parallel low-rank channel, temporal and anatomical evidence updates."""
 
     dim: int = EVIDENCE_DIM
     rank: int = LOW_RANK
     dropout: float = 0.05
 
-    def branch(self, x, name, training):
+    def branch(
+        self,
+        x,
+        name,
+        training,
+    ):
         h = nn.Dense(
             self.rank,
             use_bias=False,
@@ -311,8 +366,14 @@ class EvidenceRefineBlock(nn.Module):
         )
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, training: bool) -> jnp.ndarray:
-        h = nn.LayerNorm(name="norm")(x)
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        training: bool,
+    ) -> jnp.ndarray:
+        h = nn.LayerNorm(
+            name="norm",
+        )(x)
 
         temporal_prev = jnp.concatenate(
             [h[:, 0:1], h[:, :-1]],
@@ -328,20 +389,42 @@ class EvidenceRefineBlock(nn.Module):
         )
         spatial_delta = h - parent_h
 
-        channel = self.branch(h, "channel", training)
-        temporal = self.branch(temporal_delta, "temporal", training)
-        spatial = self.branch(spatial_delta, "spatial", training)
+        channel = self.branch(
+            h,
+            "channel",
+            training,
+        )
+        temporal = self.branch(
+            temporal_delta,
+            "temporal",
+            training,
+        )
+        spatial = self.branch(
+            spatial_delta,
+            "spatial",
+            training,
+        )
 
-        # Small bounded gates.  These branches augment rather than replace the
-        # carrier.
-        g_channel = 0.20 * jax.nn.sigmoid(
-            self.param("gate_channel", nn.initializers.zeros, ())
+        g_channel = 0.25 * jax.nn.sigmoid(
+            self.param(
+                "gate_channel",
+                nn.initializers.zeros,
+                (),
+            )
         )
-        g_temporal = 0.20 * jax.nn.sigmoid(
-            self.param("gate_temporal", nn.initializers.zeros, ())
+        g_temporal = 0.25 * jax.nn.sigmoid(
+            self.param(
+                "gate_temporal",
+                nn.initializers.zeros,
+                (),
+            )
         )
-        g_spatial = 0.20 * jax.nn.sigmoid(
-            self.param("gate_spatial", nn.initializers.zeros, ())
+        g_spatial = 0.25 * jax.nn.sigmoid(
+            self.param(
+                "gate_spatial",
+                nn.initializers.zeros,
+                (),
+            )
         )
 
         return (
@@ -353,35 +436,55 @@ class EvidenceRefineBlock(nn.Module):
 
 
 class TemporalEvidenceBank(nn.Module):
-    """Order-sensitive temporal summaries without destructive backbone pooling."""
+    """Order-sensitive per-joint evidence; no global joint mean."""
 
     dim: int = EVIDENCE_DIM
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    def __call__(
+        self,
+        x: jnp.ndarray,
+    ) -> jnp.ndarray:
         mean = jnp.mean(x, axis=1)
         direction = x[:, -1] - x[:, 0]
         half = (
-            jnp.mean(x[:, FRAMES // 2 :], axis=1)
-            - jnp.mean(x[:, : FRAMES // 2], axis=1)
+            jnp.mean(
+                x[:, FRAMES // 2 :],
+                axis=1,
+            )
+            - jnp.mean(
+                x[:, : FRAMES // 2],
+                axis=1,
+            )
         )
 
-        basis = jnp.asarray(DCT_BASIS_NP, x.dtype)
+        basis = jnp.asarray(
+            DCT_BASIS_NP,
+            x.dtype,
+        )
         dct = jnp.einsum(
             "kt,btjd->bkjd",
             basis,
             x,
         )
-        dct = jnp.transpose(dct, (0, 2, 1, 3)).reshape(
+        dct = jnp.transpose(
+            dct,
+            (0, 2, 1, 3),
+        ).reshape(
             x.shape[0],
             JOINTS,
             3 * self.dim,
         )
 
         summary = jnp.concatenate(
-            [mean, direction, half, dct],
+            [
+                mean,
+                direction,
+                half,
+                dct,
+            ],
             axis=-1,
-        )  # 6 * D
+        )
 
         z = nn.gelu(
             nn.Dense(
@@ -391,12 +494,20 @@ class TemporalEvidenceBank(nn.Module):
         )
 
         parents = jnp.asarray(PARENTS_NP)
-        parent = jnp.take(z, parents, axis=1)
+        parent = jnp.take(
+            z,
+            parents,
+            axis=1,
+        )
+
         local = jnp.concatenate(
             [z, parent, z - parent],
             axis=-1,
         )
-        return nn.LayerNorm(name="bank_norm")(
+
+        return nn.LayerNorm(
+            name="bank_norm",
+        )(
             z
             + nn.Dense(
                 self.dim,
@@ -405,90 +516,201 @@ class TemporalEvidenceBank(nn.Module):
         )
 
 
-class CandidateBuilder:
-    """Pure helper for Top-3 + two training-derived rivals per top candidate."""
+class GlobalEvidenceRetrieval(nn.Module):
+    """Class-conditioned retrieval over all 25 joint evidence tokens."""
 
-    @staticmethod
-    def build(
-        base_logits: jnp.ndarray,
-        rival_table: jnp.ndarray,
-        force_class: jnp.ndarray | None = None,
-    ):
-        top_values, top_idx = jax.lax.top_k(base_logits, TOPK)
-        rivals = rival_table[top_idx]  # [B,3,2]
-        candidate_idx = jnp.concatenate(
-            [
-                top_idx[:, :, None],
-                rivals,
-            ],
-            axis=-1,
-        ).reshape(base_logits.shape[0], CANDIDATE_SLOTS)
-
-        natural_idx = candidate_idx
-        if force_class is not None:
-            candidate_idx = candidate_idx.at[:, -1].set(force_class)
-
-        def mask_from_idx(idx):
-            b = idx.shape[0]
-            rows = jnp.arange(b)[:, None]
-            mask = jnp.zeros(
-                (b, NUM_CLASSES),
-                dtype=jnp.float32,
-            )
-            return mask.at[rows, idx].set(1.0)
-
-        return (
-            candidate_idx,
-            mask_from_idx(candidate_idx),
-            natural_idx,
-            mask_from_idx(natural_idx),
-            top_values,
-            top_idx,
-        )
-
-
-class RivalConditionedReadout(nn.Module):
     dim: int = EVIDENCE_DIM
-    query_modes: int = QUERY_MODES
 
     @nn.compact
     def __call__(
         self,
-        bank: jnp.ndarray,          # [B,25,D]
-        base_logits: jnp.ndarray,   # [B,120]
-        rival_table: jnp.ndarray,   # [120,2]
-        force_class: jnp.ndarray | None,
+        bank: jnp.ndarray,
+        class_embed: jnp.ndarray,
+        base_logits: jnp.ndarray,
     ) -> Mapping[str, jnp.ndarray]:
+        q = nn.Dense(
+            self.dim,
+            use_bias=False,
+            name="retrieval_query",
+        )(class_embed)
 
-        (
-            candidate_idx,
-            candidate_mask,
-            natural_idx,
-            natural_mask,
-            top_values,
-            top_idx,
-        ) = CandidateBuilder.build(
+        k = nn.Dense(
+            self.dim,
+            use_bias=False,
+            name="retrieval_key",
+        )(bank)
+
+        v = nn.Dense(
+            self.dim,
+            use_bias=False,
+            name="retrieval_value",
+        )(bank)
+
+        score = jnp.einsum(
+            "cd,bjd->bcj",
+            q,
+            k,
+        ) / math.sqrt(self.dim)
+
+        attn = jax.nn.softmax(
+            score,
+            axis=-1,
+        )
+
+        context = jnp.einsum(
+            "bcj,bjd->bcd",
+            attn,
+            v,
+        )
+
+        class_feature = jnp.broadcast_to(
+            class_embed[None, :, :],
+            context.shape,
+        )
+
+        hidden = nn.gelu(
+            nn.Dense(
+                self.dim,
+                name="retrieval_hidden",
+            )(
+                jnp.concatenate(
+                    [
+                        context,
+                        class_feature,
+                        context * class_feature,
+                    ],
+                    axis=-1,
+                )
+            )
+        )
+
+        evidence_logits = nn.Dense(
+            1,
+            kernel_init=nn.initializers.normal(0.01),
+            bias_init=nn.initializers.zeros,
+            name="retrieval_score",
+        )(hidden)[..., 0]
+
+        # Base prior makes early retrieval sensible while the evidence head learns.
+        logits = (
+            evidence_logits
+            + 0.20 * jax.lax.stop_gradient(base_logits)
+        )
+
+        return {
+            "logits": logits,
+            "attention": attn,
+            "context": context,
+        }
+
+
+class CandidateBuilder:
+    """Final Top3 + 4 stream winners + retrieval Top3 + 2 base-Top1 rivals."""
+
+    @staticmethod
+    def build(
+        base_logits: jnp.ndarray,
+        stream_logits: jnp.ndarray,
+        retrieval_logits: jnp.ndarray,
+        rival_table: jnp.ndarray,
+    ):
+        base_values, base_idx = jax.lax.top_k(
             base_logits,
-            rival_table,
-            force_class,
+            BASE_TOPK,
         )
 
-        class_embed = self.param(
-            "class_embed",
-            nn.initializers.normal(0.02),
-            (NUM_CLASSES, self.dim),
+        stream_top1 = jnp.argmax(
+            stream_logits,
+            axis=-1,
         )
+
+        _, retrieval_idx = jax.lax.top_k(
+            retrieval_logits,
+            RETRIEVAL_TOPK,
+        )
+
+        base_top1 = base_idx[:, 0]
+        rivals = rival_table[base_top1]
+
+        candidate_idx = jnp.concatenate(
+            [
+                base_idx,
+                stream_top1,
+                retrieval_idx,
+                rivals,
+            ],
+            axis=-1,
+        )
+
+        if candidate_idx.shape[-1] != CANDIDATE_SLOTS:
+            raise ValueError(
+                f"Expected {CANDIDATE_SLOTS} candidate slots, "
+                f"got {candidate_idx.shape}"
+            )
+
+        b = candidate_idx.shape[0]
+        rows = jnp.arange(b)[:, None]
+        mask = jnp.zeros(
+            (b, NUM_CLASSES),
+            dtype=jnp.float32,
+        )
+        mask = mask.at[
+            rows,
+            candidate_idx,
+        ].set(1.0)
+
+        return {
+            "candidate_idx": candidate_idx,
+            "candidate_mask": mask,
+            "base_top_values": base_values,
+            "base_top_idx": base_idx,
+            "stream_top1": stream_top1,
+            "retrieval_top_idx": retrieval_idx,
+        }
+
+
+class RivalConditionedReadout(nn.Module):
+    """Local scorer using joint evidence plus frozen FMSE context."""
+
+    dim: int = EVIDENCE_DIM
+    query_modes: int = QUERY_MODES
+    delta_scale: float = 3.0
+
+    @nn.compact
+    def __call__(
+        self,
+        bank: jnp.ndarray,
+        class_embed: jnp.ndarray,
+        base_logits: jnp.ndarray,
+        stream_logits: jnp.ndarray,
+        base_context: jnp.ndarray,
+        retrieval_logits: jnp.ndarray,
+        candidates: Mapping[str, jnp.ndarray],
+    ) -> Mapping[str, jnp.ndarray]:
+        candidate_idx = candidates["candidate_idx"]
+        candidate_mask = candidates["candidate_mask"]
+        base_top_idx = candidates["base_top_idx"]
+        base_top_values = candidates["base_top_values"]
+
+        ref = class_embed[base_top_idx[:, 0]]
+        cand = class_embed[candidate_idx]
+
         mode_embed = self.param(
             "mode_embed",
             nn.initializers.normal(0.02),
             (self.query_modes, self.dim),
         )
 
-        ref = class_embed[top_idx[:, 0]]
-        cand = class_embed[candidate_idx]
+        q0 = (
+            cand - ref[:, None, :]
+        )[:, :, None, :]
+        q0 = (
+            q0
+            + mode_embed[None, None, :, :]
+            + 0.25
+            * base_context[:, None, None, :]
+        )
 
-        q0 = cand - ref[:, None, :]
-        q0 = q0[:, :, None, :] + mode_embed[None, None, :, :]
         q = nn.Dense(
             self.dim,
             use_bias=False,
@@ -500,6 +722,7 @@ class RivalConditionedReadout(nn.Module):
             use_bias=False,
             name="key_proj",
         )(bank)
+
         v = nn.Dense(
             self.dim,
             use_bias=False,
@@ -511,7 +734,11 @@ class RivalConditionedReadout(nn.Module):
             q,
             k,
         ) / math.sqrt(self.dim)
-        attn = jax.nn.softmax(score, axis=-1)
+
+        attn = jax.nn.softmax(
+            score,
+            axis=-1,
+        )
 
         context = jnp.einsum(
             "bcmj,bjd->bcmd",
@@ -523,138 +750,114 @@ class RivalConditionedReadout(nn.Module):
             self.query_modes * self.dim,
         )
 
-        rows = jnp.arange(base_logits.shape[0])[:, None]
-        cand_base = base_logits[rows, candidate_idx]
-        top1 = top_values[:, 0:1]
-        gap = cand_base - top1
+        rows = jnp.arange(
+            base_logits.shape[0]
+        )[:, None]
+
+        cand_base = base_logits[
+            rows,
+            candidate_idx,
+        ]
+
+        cand_retrieval = retrieval_logits[
+            rows,
+            candidate_idx,
+        ]
+
+        stream_support = jnp.take_along_axis(
+            stream_logits,
+            candidate_idx[:, None, :],
+            axis=2,
+        )
+        stream_support = jnp.transpose(
+            stream_support,
+            (0, 2, 1),
+        )
+
+        top1 = base_top_values[:, 0:1]
+        base_gap = cand_base - top1
+
+        ctx = jnp.broadcast_to(
+            base_context[:, None, :],
+            (
+                base_context.shape[0],
+                CANDIDATE_SLOTS,
+                self.dim,
+            ),
+        )
 
         feat = jnp.concatenate(
             [
                 context,
                 cand,
+                ctx,
+                stream_support,
                 cand_base[..., None],
-                gap[..., None],
+                cand_retrieval[..., None],
+                base_gap[..., None],
             ],
             axis=-1,
         )
 
         hidden = nn.gelu(
             nn.Dense(
-                self.dim,
-                name="candidate_hidden",
+                2 * self.dim,
+                name="candidate_hidden_1",
             )(feat)
         )
+        hidden = nn.gelu(
+            nn.Dense(
+                self.dim,
+                name="candidate_hidden_2",
+            )(hidden)
+        )
 
-        # Exact-baseline guarantee at initialization.
-        candidate_delta = nn.Dense(
+        raw_delta = nn.Dense(
             1,
             kernel_init=nn.initializers.zeros,
             bias_init=nn.initializers.zeros,
             name="candidate_delta",
         )(hidden)[..., 0]
 
-        # Average duplicate candidate slots rather than double-counting them.
-        delta = jnp.zeros_like(base_logits)
-        counts = jnp.zeros_like(base_logits)
-        delta = delta.at[rows, candidate_idx].add(candidate_delta)
-        counts = counts.at[rows, candidate_idx].add(1.0)
-        delta = jnp.where(counts > 0, delta / jnp.maximum(counts, 1.0), 0.0)
-        delta = delta * candidate_mask
+        candidate_delta = (
+            self.delta_scale
+            * jnp.tanh(raw_delta)
+        )
 
-        return {
-            "delta_logits": delta,
-            "candidate_idx": candidate_idx,
-            "candidate_mask": candidate_mask,
-            "natural_candidate_idx": natural_idx,
-            "natural_candidate_mask": natural_mask,
-            "attention": attn,
-        }
+        delta = jnp.zeros_like(
+            base_logits
+        )
+        counts = jnp.zeros_like(
+            base_logits
+        )
 
-
-class FixedQueryReadout(nn.Module):
-    """Ordinary learned-query ablation under the same evidence encoder."""
-
-    dim: int = EVIDENCE_DIM
-    query_modes: int = QUERY_MODES
-
-    @nn.compact
-    def __call__(
-        self,
-        bank: jnp.ndarray,
-        base_logits: jnp.ndarray,
-        rival_table: jnp.ndarray,
-        force_class: jnp.ndarray | None,
-    ) -> Mapping[str, jnp.ndarray]:
-
-        (
+        delta = delta.at[
+            rows,
             candidate_idx,
-            candidate_mask,
-            natural_idx,
-            natural_mask,
-            _,
-            _,
-        ) = CandidateBuilder.build(
-            base_logits,
-            rival_table,
-            force_class,
+        ].add(candidate_delta)
+
+        counts = counts.at[
+            rows,
+            candidate_idx,
+        ].add(1.0)
+
+        delta = jnp.where(
+            counts > 0,
+            delta / jnp.maximum(counts, 1.0),
+            0.0,
         )
 
-        queries = self.param(
-            "queries",
-            nn.initializers.normal(0.02),
-            (self.query_modes, self.dim),
-        )
-        k = nn.Dense(
-            self.dim,
-            use_bias=False,
-            name="key_proj",
-        )(bank)
-        v = nn.Dense(
-            self.dim,
-            use_bias=False,
-            name="value_proj",
-        )(bank)
-
-        score = jnp.einsum(
-            "md,bjd->bmj",
-            queries,
-            k,
-        ) / math.sqrt(self.dim)
-        attn = jax.nn.softmax(score, axis=-1)
-        context = jnp.einsum(
-            "bmj,bjd->bmd",
-            attn,
-            v,
-        ).reshape(bank.shape[0], self.query_modes * self.dim)
-
-        hidden = nn.gelu(
-            nn.Dense(
-                80,
-                name="fixed_hidden",
-            )(context)
-        )
-        delta = nn.Dense(
-            NUM_CLASSES,
-            kernel_init=nn.initializers.zeros,
-            bias_init=nn.initializers.zeros,
-            name="fixed_delta",
-        )(hidden)
         delta = delta * candidate_mask
 
         return {
             "delta_logits": delta,
-            "candidate_idx": candidate_idx,
-            "candidate_mask": candidate_mask,
-            "natural_candidate_idx": natural_idx,
-            "natural_candidate_mask": natural_mask,
             "attention": attn,
         }
 
 
-class NestSARRCE30T16(nn.Module):
-    """Full RCE specialist.  Base FMSE logits are provided externally/frozen."""
+class NestSARRCEXT16(nn.Module):
+    """Complete RCEX specialist over a frozen FMSE/R4 base."""
 
-    variant: str = "rival"
     dim: int = EVIDENCE_DIM
     blocks: int = 2
     rank: int = LOW_RANK
@@ -665,19 +868,50 @@ class NestSARRCE30T16(nn.Module):
         self,
         x: jnp.ndarray,
         base_logits: jnp.ndarray,
+        stream_logits: jnp.ndarray,
+        descriptors: jnp.ndarray,
+        fusion_weights: jnp.ndarray,
         rival_table: jnp.ndarray,
         training: bool = False,
-        force_class: jnp.ndarray | None = None,
     ) -> Mapping[str, jnp.ndarray]:
 
-        if self.variant not in ("rival", "fixed"):
-            raise ValueError(f"variant must be rival or fixed, got {self.variant}")
+        if base_logits.shape[-1] != NUM_CLASSES:
+            raise ValueError(
+                f"base_logits must end in {NUM_CLASSES}"
+            )
+
+        if stream_logits.shape[-2:] != (
+            NUM_STREAMS,
+            NUM_CLASSES,
+        ):
+            raise ValueError(
+                f"stream_logits expected [B,4,120], "
+                f"got {stream_logits.shape}"
+            )
+
+        if descriptors.shape[-2:] != (
+            NUM_STREAMS,
+            BASE_DESCRIPTOR_DIM,
+        ):
+            raise ValueError(
+                f"descriptors expected [B,4,112], "
+                f"got {descriptors.shape}"
+            )
+
+        class_embed = self.param(
+            "class_embed",
+            nn.initializers.normal(0.02),
+            (NUM_CLASSES, self.dim),
+        )
 
         carrier = RichEvidenceEncoder(
             self.dim,
             self.dropout,
             name="evidence_encoder",
-        )(x, training)
+        )(
+            x,
+            training,
+        )
 
         block_states = []
         for i in range(self.blocks):
@@ -686,7 +920,10 @@ class NestSARRCE30T16(nn.Module):
                 self.rank,
                 self.dropout,
                 name=f"evidence_block_{i}",
-            )(carrier, training)
+            )(
+                carrier,
+                training,
+            )
             block_states.append(carrier)
 
         bank = TemporalEvidenceBank(
@@ -694,83 +931,196 @@ class NestSARRCE30T16(nn.Module):
             name="temporal_bank",
         )(carrier)
 
-        if self.variant == "rival":
-            readout = RivalConditionedReadout(
-                self.dim,
-                QUERY_MODES,
-                name="rival_readout",
-            )(
-                bank,
-                base_logits,
-                rival_table,
-                force_class,
+        fused_descriptor = jnp.einsum(
+            "bs,bsd->bd",
+            fusion_weights,
+            descriptors,
+        )
+
+        base_context = nn.LayerNorm(
+            name="base_context_norm",
+        )(
+            nn.gelu(
+                nn.Dense(
+                    self.dim,
+                    name="base_context_proj",
+                )(fused_descriptor)
             )
-        else:
-            readout = FixedQueryReadout(
-                self.dim,
-                QUERY_MODES,
-                name="fixed_readout",
-            )(
-                bank,
-                base_logits,
-                rival_table,
-                force_class,
-            )
+        )
+
+        retrieval = GlobalEvidenceRetrieval(
+            self.dim,
+            name="global_retrieval",
+        )(
+            bank,
+            class_embed,
+            base_logits,
+        )
+
+        candidates = CandidateBuilder.build(
+            base_logits,
+            stream_logits,
+            retrieval["logits"],
+            rival_table,
+        )
+
+        readout = RivalConditionedReadout(
+            self.dim,
+            QUERY_MODES,
+            delta_scale=3.0,
+            name="rival_readout",
+        )(
+            bank,
+            class_embed,
+            base_logits,
+            stream_logits,
+            base_context,
+            retrieval["logits"],
+            candidates,
+        )
 
         delta = readout["delta_logits"]
+        candidate_mask = candidates["candidate_mask"]
 
-        top2 = jax.lax.top_k(base_logits, 2)[0]
+        top2 = jax.lax.top_k(
+            base_logits,
+            2,
+        )[0]
         margin = top2[:, 0] - top2[:, 1]
 
-        natural_mask = readout["natural_candidate_mask"]
         masked_base = jnp.where(
-            natural_mask > 0,
+            candidate_mask > 0,
             base_logits,
             -1e9,
         )
-        local_entropy = _safe_entropy_from_logits(masked_base)
+        local_entropy = _entropy_from_logits(
+            masked_base
+        )
 
-        base_prob = jax.nn.softmax(base_logits, axis=-1)
-        candidate_mass = jnp.sum(base_prob * natural_mask, axis=-1)
-        correction_strength = jnp.max(jnp.abs(delta), axis=-1)
+        base_prob = jax.nn.softmax(
+            base_logits,
+            axis=-1,
+        )
+        candidate_mass = jnp.sum(
+            base_prob * candidate_mask,
+            axis=-1,
+        )
+
+        retrieval_top2 = jax.lax.top_k(
+            retrieval["logits"],
+            2,
+        )[0]
+        retrieval_margin = (
+            retrieval_top2[:, 0]
+            - retrieval_top2[:, 1]
+        )
+
+        base_top1 = candidates[
+            "base_top_idx"
+        ][:, 0]
+
+        stream_top1 = candidates[
+            "stream_top1"
+        ]
+
+        stream_agreement = jnp.mean(
+            (
+                stream_top1
+                == base_top1[:, None]
+            ).astype(jnp.float32),
+            axis=-1,
+        )
+
+        stream_disagreement = (
+            1.0 - stream_agreement
+        )
+
+        fusion_entropy = -jnp.sum(
+            fusion_weights
+            * jnp.log(
+                jnp.maximum(
+                    fusion_weights,
+                    1e-8,
+                )
+            ),
+            axis=-1,
+        ) / math.log(NUM_STREAMS)
+
+        correction_strength = jnp.max(
+            jnp.abs(delta),
+            axis=-1,
+        )
 
         gate_features = jnp.stack(
             [
                 margin,
                 local_entropy,
                 candidate_mass,
+                retrieval_margin,
+                stream_disagreement,
+                fusion_entropy,
                 correction_strength,
             ],
             axis=-1,
         )
 
+        gate_hidden = nn.gelu(
+            nn.Dense(
+                16,
+                name="gate_hidden_1",
+            )(gate_features)
+        )
         gate_hidden = jnp.tanh(
             nn.Dense(
                 8,
-                name="gate_hidden",
-            )(gate_features)
+                name="gate_hidden_2",
+            )(gate_hidden)
         )
+
+        # Bias -1.5 => ~0.18 initial gate.  Final logits are STILL exactly
+        # FMSE because candidate_delta is exactly zero at initialization.
         gate_logit = nn.Dense(
             1,
             kernel_init=nn.initializers.zeros,
-            bias_init=nn.initializers.constant(-4.0),
+            bias_init=nn.initializers.constant(-1.5),
             name="gate_out",
         )(gate_hidden)[..., 0]
-        gate = jax.nn.sigmoid(gate_logit)
 
-        final_logits = base_logits + gate[:, None] * delta
+        gate = jax.nn.sigmoid(
+            gate_logit
+        )
+
+        final_logits = (
+            base_logits
+            + gate[:, None] * delta
+        )
 
         return {
             "logits": final_logits,
             "base_logits": base_logits,
             "delta_logits": delta,
             "gate": gate,
-            "candidate_idx": readout["candidate_idx"],
-            "candidate_mask": readout["candidate_mask"],
-            "natural_candidate_idx": readout["natural_candidate_idx"],
-            "natural_candidate_mask": natural_mask,
+            "gate_logit": gate_logit,
+            "gate_features": gate_features,
+            "candidate_idx": candidates["candidate_idx"],
+            "candidate_mask": candidate_mask,
+            "base_top_idx": candidates["base_top_idx"],
+            "stream_top1": stream_top1,
+            "retrieval_top_idx": candidates["retrieval_top_idx"],
+            "retrieval_logits": retrieval["logits"],
+            "retrieval_attention": retrieval["attention"],
+            "stream_disagreement": stream_disagreement,
+            "fusion_entropy": fusion_entropy,
+            "base_context": base_context,
             "evidence_bank": bank,
             "carrier": carrier,
-            "block_states": jnp.stack(block_states, axis=1),
+            "block_states": jnp.stack(
+                block_states,
+                axis=1,
+            ),
             "attention": readout["attention"],
         }
+
+
+# Compatibility alias for older RCE30 import paths in shared utilities.
+NestSARRCE30T16 = NestSARRCEXT16
