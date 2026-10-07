@@ -1,12 +1,10 @@
-"""Static operator estimate for the RCE30 specialist.
+"""Static architecture-level MAC/FLOP estimate for NestSAR-RCEX.
 
-This is a transparent architecture-level MAC/FLOP estimate, not a compiler
-profile.  Convention: 1 MAC = 2 FLOPs.
+Convention: 1 MAC = 2 FLOPs.
 
-The historical Astra design discussion used an FMSE full-model reference of
-~64.69 MFLOPs under one consistent recurrent-iteration accounting scheme.
-This file reports the specialist delta separately so it cannot be confused with
-the older ~0.0296 XLA/static number or the D112 compiler-independent audit.
+This is intentionally separate from the old XLA/static NestSAR number.  It is
+an auditable operator estimate for the new specialist only.  Run the full
+compiler-independent model auditor before publication.
 """
 
 import json
@@ -16,62 +14,81 @@ J = 25
 D = 40
 R = 4
 MODES = 4
-C = 9
+CANDIDATES = 12
 CLASSES = 120
+STREAMS = 4
 
 parts = {}
 
-# Ten families, each P1/P2/relative, each Dense 3->2.
+# Rich evidence encoder.
 parts["family_views"] = 10 * 3 * (3 * 2) * T * J
 parts["presence"] = 3 * 4 * T * J
-# Three distal views, each Dense 12->2.
 parts["distal_views"] = 3 * (12 * 2) * T * J
 parts["evidence_fuse"] = 70 * D * T * J
 
-# 2 blocks * 3 branches * (D->R + R->D) over all 400 tokens.
+# Two blocks, three D40->R4->D40 branches over all 400 tokens.
 parts["refine_blocks"] = 2 * 3 * (2 * D * R * T * J)
 
-# Six temporal summaries -> D, once per joint.
+# Six temporal summaries and anatomical mixing.
 parts["temporal_summary"] = 6 * D * D * J
-# [z,parent,z-parent] -> D.
 parts["anatomical_mix"] = 3 * D * D * J
 
-common_macs = sum(parts.values())
+# Frozen FMSE descriptor context projection.
+parts["base_context"] = 112 * D
 
-# Fixed-query prototype.
-fixed = dict(parts)
-fixed["kv_projection"] = 2 * D * D * J
-fixed["query_attention"] = 2 * MODES * J * D
-fixed["fixed_hidden"] = (MODES * D) * 80
-fixed["fixed_delta"] = 80 * CLASSES
-fixed_macs = sum(fixed.values())
+# Global class-conditioned retrieval over all 120 classes.
+parts["retrieval_query"] = CLASSES * D * D
+parts["retrieval_key_value"] = 2 * D * D * J
+parts["retrieval_attention"] = 2 * CLASSES * J * D
+parts["retrieval_hidden"] = CLASSES * (3 * D) * D
+parts["retrieval_score"] = CLASSES * D
 
-# Rival-conditioned prototype.
-rival = dict(parts)
-rival["kv_projection"] = 2 * D * D * J
-rival["query_projection"] = C * MODES * D * D
-rival["query_attention"] = 2 * C * MODES * J * D
-# context(4D) + class embedding(D) + base logit + gap -> D -> 1
-rival["candidate_scorer"] = C * (((MODES * D + D + 2) * D) + D)
-rival_macs = sum(rival.values())
+# Rival-conditioned local scorer over 12 candidate slots.
+parts["candidate_query"] = CANDIDATES * MODES * D * D
+parts["candidate_key_value"] = 2 * D * D * J
+parts["candidate_attention"] = 2 * CANDIDATES * MODES * J * D
 
-def summarize(name, table, macs):
-    return {
-        "variant": name,
-        "components_macs": table,
-        "specialist_macs": macs,
-        "specialist_mflops_1mac_eq_2flops": 2.0 * macs / 1e6,
-        "fmse_reference_mflops_astra_accounting": 64.69,
-        "estimated_total_mflops_same_reference": 64.69 + 2.0 * macs / 1e6,
-        "note": (
-            "Static architecture estimate. Run the compiler-independent "
-            "operator auditor before publication."
-        ),
-    }
+candidate_feature_dim = (
+    MODES * D
+    + D                 # candidate class embedding
+    + D                 # frozen FMSE context
+    + STREAMS           # per-stream candidate support
+    + 1                 # base logit
+    + 1                 # retrieval logit
+    + 1                 # base gap
+)
+
+parts["candidate_hidden_1"] = (
+    CANDIDATES
+    * candidate_feature_dim
+    * (2 * D)
+)
+parts["candidate_hidden_2"] = (
+    CANDIDATES
+    * (2 * D)
+    * D
+)
+parts["candidate_delta"] = CANDIDATES * D
+
+# Gate MLP: 7 -> 16 -> 8 -> 1.
+parts["gate"] = 7 * 16 + 16 * 8 + 8
+
+macs = int(sum(parts.values()))
+mflops = 2.0 * macs / 1e6
 
 report = {
-    "fixed": summarize("fixed", fixed, fixed_macs),
-    "rival": summarize("rival", rival, rival_macs),
+    "model": "NestSAR-RCEX-T16-v1",
+    "components_macs": parts,
+    "specialist_macs": macs,
+    "specialist_mflops_1mac_eq_2flops": mflops,
+    "fmse_reference_mflops_astra_accounting": 64.69,
+    "estimated_total_mflops_same_reference": 64.69 + mflops,
+    "delta_vs_rce30_rival_mflops": mflops - 5.27,
+    "note": (
+        "Static architecture estimate. The added cost comes mainly from the "
+        "120-class global evidence retrieval that improves candidate recall. "
+        "Use a compiler-independent full-model operator audit before publication."
+    ),
 }
 
 print(json.dumps(report, indent=2))
