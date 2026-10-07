@@ -292,6 +292,41 @@ Do not publish the compute estimates until an exact operator audit exists.
 
 ---
 
+## RCE implementation status
+
+The complete post-audit architecture is now implemented on:
+
+- branch: `experiment/nestsar-rce30-t16`
+- package: `experiments/nestsar_rce30_t16/`
+
+Implemented components:
+
+- frozen/protected FMSE base;
+- full pre-pooling evidence families;
+- explicit distal + inter-person evidence;
+- persistent D40 joint-time carrier;
+- two rank-4 channel/temporal/anatomical evidence blocks;
+- order-sensitive mean/direction/half/DCT temporal bank;
+- training-only rival graph from clean+augmented training predictions;
+- Top3 + 2 rivals/class candidate routing;
+- rival-conditioned 4-mode learned queries;
+- ordinary fixed-query ablation under the same schedule;
+- zero-initialized local correction;
+- candidate-masked logits;
+- confidence gate;
+- rival ranking loss;
+- protection KL;
+- clean/aug consistency;
+- exact-baseline preflight for both fixed/rival prototypes;
+- automatic per-class Top-1/Top-5/fixed/broken/Type-R/Type-I audit.
+
+Static specialist compute estimate:
+
+- fixed-query: ~4.93 MFLOPs;
+- rival-conditioned: ~5.27 MFLOPs;
+
+under 1 MAC = 2 FLOPs. Exact publishable compute still requires the operator auditor.
+
 ## Decision
 
 The strongest current diagnosis is:
