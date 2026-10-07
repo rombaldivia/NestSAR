@@ -1,310 +1,373 @@
-# NestSAR-RCE30-T16
+# NestSAR-RCEX-T16
 
 Updated: 2026-10-07
 
-This package implements the complete post-audit architecture proposed after the
-FMSE/geometry/JT32/class-error work.  It is not another scalar tweak.
+RCEX is the strong replacement for the first RCE30 specialist experiment.
+
+It keeps the proven FMSE/R4 generalist frozen, but substantially changes
+candidate recall, gating, training supervision, and how frozen FMSE evidence is
+used.
+
+## Why RCE30 was changed
+
+The first RCE30 run stayed almost exactly at the protected FMSE baseline while
+its reported training accuracy reached about 100% within the first few epochs.
+
+Source inspection exposed a real train/eval mismatch:
 
-## Starting point
+- training called the specialist with `force_class=y`;
+- `CandidateBuilder` replaced one candidate slot with the true class;
+- validation/inference did not know the true class and therefore could not do
+  the same thing.
 
-Protected base checkpoints:
+So the local ranker was trained on an easier candidate problem than the one it
+faced at validation.  This can explain extremely high training accuracy with
+almost no validation gain.
 
-- XSUB FMSE-architecture best: **77.336554%**
-- XSET FMSE-architecture best: **78.458900%**
+RCEX removes that mechanism completely.  The true label is never inserted into
+the candidate set.
 
-The base is loaded from the existing FMSE + training-only geometry checkpoints,
-but geometry has no inference module: the frozen inference graph is FMSE.
+## Protected starting point
+
+FMSE-architecture checkpoints:
 
-The full NTU120 audit showed:
+- XSUB: **77.336554%**
+- XSET: **78.458900%**
 
-- XSUB Top-5 **93.682123%**
-- XSET Top-5 **94.043075%**
-- seven weakest classes recur across protocols:
-  A071/A072/A073/A074/A075/A084/A012
-- recurring rivals:
-  A071<->A072, A073<->A076, A016<->A017,
-  A056<->A118, A012->A030
+The FMSE EMA parameters remain outside the optimizer state.
 
-Therefore RCE protects the strong generalist and adds local evidence only where
-the base is ambiguous.
+## Full RCEX architecture
 
-## What changed
+```
+                           frozen FMSE/R4
+                      +----------------------+
+input ----------------> base final logits    |
+        |             | 4 stream logits      |
+        |             | 4 descriptors        |
+        |             | fusion weights       |
+        |             +----------+-----------+
+        |                        |
+        v                        |
+rich joint-time evidence         |
+[B,16,25,40]                     |
+        |                        |
+2 evidence blocks                |
+        |                        |
+per-joint temporal bank          |
+[B,25,40]                        |
+        |                        |
+        +--> global 120-class retrieval
+        |          |
+        |          +--> retrieval Top-3
+        |
+        +------------------------------+
+                                       |
+candidate union:                        |
+  final FMSE Top-3                      |
+  + four stream Top-1                   |
+  + retrieval Top-3                     |
+  + two training-only rivals            |
+                                       |
+                           12 candidate slots
+                                       |
+                         rival-conditioned queries
+                                       |
+                           masked local correction
+                                       |
+final = base_logits + gate * correction
+```
 
-### 1. Frozen FMSE base
+## Major changes vs RCE30
 
-The FMSE EMA parameters are never inserted into the RCE optimizer state.
+### 1. No teacher-forced candidates
 
-Stage-2 training updates **only** RCE parameters.
+RCE30:
 
-This makes the protection structural, not merely a small learning rate.
+```
+training candidate set = natural candidates + TRUE CLASS
+validation candidate set = natural candidates
+```
 
-### 2. Rich pre-pooling evidence
+RCEX:
 
-The specialist reconstructs complete joint-time evidence directly from the
-canonical [B,16,750] input and keeps all 25 joints.
+```
+training candidate set == validation candidate set
+```
 
-Ten evidence families are preserved:
+The true label is used only to compute losses and metrics.
 
-1. pose
-2. bone pose
-3. full displacement
-4. phase A
-5. phase B
-6. path
-7. parent-relative full displacement
-8. parent-relative phase A
-9. parent-relative phase B
-10. parent-relative path
+### 2. Stream-oracle candidate routing
 
-For every family, P1, P2 and P2-P1 are projected **separately**.  This avoids
-JT32-v1's destructive [P1,P2,relative] 9->4 bottleneck.
+Previous R4 audits showed large complementary information across J/B/JM/BM
+streams.  RCEX now uses it directly.
 
-### 3. Distal evidence
+Candidate slots contain the Top-1 class from every frozen FMSE stream in
+addition to final-model candidates.
 
-Explicit wrist/hand/hand-tip/thumb motion relations are added for both persons,
-including inter-person relative distal motion.
+This gives the specialist access to classes the final fusion may suppress even
+when one stream strongly supports them.
 
-### 4. D40 joint-time carrier
+### 3. Learned global evidence retrieval
 
-The specialist carrier is:
+A new 120-class class-conditioned retrieval head attends over all 25 joint
+evidence tokens.
 
-    [B,16,25,40]
+Its job is **candidate recall**, not final classification.
 
-Individual joint identity survives through both evidence blocks.
+It is trained with global retrieval CE and contributes its Top-3 classes to the
+local candidate set.
 
-### 5. Two efficient evidence-refinement blocks
+This gives Type-I / outside-Top3 errors a path into the specialist.
 
-Each block has three parallel low-rank residual branches:
+### 4. Candidate set is now multi-source
 
-- channel evidence
-- temporal direction/difference evidence
-- anatomical parent-relative evidence
+```
+C(x) =
+    Top3(final FMSE)
+  + Top1(each of 4 FMSE streams)
+  + Top3(global evidence retrieval)
+  + 2 training-only rivals of final Top1
+```
 
-Each branch is D40 -> rank4 -> D40.
+Fixed slots: **12** before duplicate merging.
 
-This is the strong architecture change that preserves the ~5 MFLOP specialist
-budget instead of using expensive full 400x400 attention.
+### 5. Frozen FMSE descriptor context
 
-### 6. Order-sensitive temporal evidence bank
+The four 112-D FMSE descriptors are fused with the frozen FMSE fusion weights,
+projected to D40, and supplied to every local rival query.
 
-The final evidence bank is per joint, not mean pooled.
+The specialist therefore does not have to reconstruct all high-level action
+context from raw skeleton evidence.
 
-For every joint it uses:
+### 6. Per-stream candidate support
 
-- temporal mean
-- last minus first
-- second-half minus first-half
-- DCT component 1
-- DCT component 2
-- DCT component 3
+For every candidate class, the local scorer sees all four frozen FMSE stream
+logits for that class.
 
-These six summaries are projected back to D40 and combined with an anatomical
-parent-relative mixer.
+The scorer can learn patterns such as:
 
-Output:
+- JM strongly supports class A;
+- B strongly supports class B;
+- final fusion is uncertain;
+- distal evidence favors A.
 
-    [B,25,40]
+### 7. Rich evidence path remains
 
-### 7. Training-only rival graph
+RCEX keeps the strong RCE evidence representation:
 
-Before specialist training, the frozen FMSE model predicts the **training set
-only**, on both clean and augmented views.
+- pose;
+- bone pose;
+- full displacement;
+- phase A;
+- phase B;
+- path;
+- parent-relative full displacement;
+- parent-relative phase A;
+- parent-relative phase B;
+- parent-relative path;
+- explicit distal wrist/hand/tip/thumb motion;
+- P1, P2 and inter-person relative evidence projected separately.
 
-For every true class, the two strongest competing classes are saved.
+Carrier:
 
-No validation labels are used to construct routing.
+```
+[B,16,25,40]
+```
 
-### 8. Candidate routing
+No global joint mean is used inside the evidence backbone.
 
-At inference:
+### 8. Two parallel evidence blocks
 
-    C(x) = Top3_FMSE(x) + 2 training-rivals for each Top3 class
+Each block contains low-rank residual evidence branches for:
 
-There are nine fixed candidate slots before duplicate removal.
+- channel evidence;
+- temporal direction/difference;
+- anatomical parent-relative difference.
 
-During training the true class is forced into the final candidate slot only for
-the local ranking loss.  Natural candidate coverage is tracked separately.
+All branches preserve the 16x25 carrier.
 
-### 9. Rival-conditioned learned queries
+### 9. Order-sensitive temporal bank
 
-The default RCE variant uses class embeddings.
+Every joint keeps:
 
-For candidate c against the FMSE Top-1 class b:
+- temporal mean;
+- last - first;
+- second-half - first-half;
+- DCT1;
+- DCT2;
+- DCT3.
 
-    q(c,b,m) = Wq(e_c - e_b + mode_m)
+These six temporal summaries are fused with an anatomical parent-relative
+mixer.
 
-with four learned query modes.
+### 10. Rival-conditioned readout is stronger
 
-Each candidate query attends to all 25 joint evidence tokens.  Therefore
-A071/A072 can search different evidence from A016/A017 or A056/A118.
+For candidate c against base Top-1 b:
 
-### 10. Ordinary fixed-query ablation
+```
+q(c,b,m) = Wq(e_c - e_b + mode_m + 0.25 * base_context)
+```
 
-The same package also implements the Astra fixed-query prototype:
+Four query modes attend over all 25 joint tokens.
 
-    rce_variant = "fixed"
+Candidate scoring then consumes:
 
-It uses four learned global queries over the same evidence bank, then predicts
-a 120-way residual that is still masked to the candidate set.
+- four query contexts;
+- candidate class embedding;
+- frozen FMSE context;
+- four stream-support logits;
+- final FMSE candidate logit;
+- retrieval candidate logit;
+- final-FMSE logit gap.
 
-Thus the experiment can compare under an identical schedule:
+### 11. Bounded zero-init correction
 
-- unchanged frozen FMSE
-- fixed learned-query RCE
-- rival-conditioned RCE
+The raw local correction uses a zero-initialized output layer and:
 
-### 11. Hard masked correction
+```
+delta = 3 * tanh(raw_delta)
+```
 
-Corrections are exactly zero outside the active candidate set.
+So initial RCEX predictions are exactly FMSE, while corrections cannot diverge
+without bound.
 
-The candidate correction projection is zero-initialized.
+### 12. Gate no longer starts almost closed
 
-Therefore at initialization:
+RCE30 initialized the gate near 0.018 (bias -4), which scaled early correction
+gradients heavily.
 
-    final_logits == base_logits
+RCEX initializes near 0.18 (bias -1.5).
 
-to machine precision.
+Because the correction itself is exactly zero-initialized, RCEX still equals
+FMSE at initialization.
 
-The dual-T4 launcher verifies this for **both fixed and rival prototypes** before
-starting expensive training.
+### 13. Explicit gate supervision
 
-### 12. Confidence gate
+RCE30 only penalized gate size.
 
-The gate sees:
+RCEX trains the gate with a binary target:
 
-- FMSE top1-top2 margin
-- candidate entropy
-- candidate probability mass
-- specialist correction strength
+```
+gate_target = 1
+when base is wrong AND natural candidate set contains truth
 
-Its final layer is initialized with zero kernel and bias -4, so intervention is
-initially small.  Exact prediction equivalence is guaranteed by the zero
-correction projection.
+gate_target = 0
+otherwise
+```
 
-### 13. Protection loss
+Gate inputs include:
 
-On confident, base-correct training examples:
+- final FMSE margin;
+- candidate entropy;
+- candidate probability mass;
+- retrieval margin;
+- stream disagreement;
+- fusion entropy;
+- correction strength.
 
-    KL(stopgrad(p_base) || p_final)
+### 14. Stronger base protection
 
-penalizes unnecessary changes.
+RCEX uses three separate protections:
 
-This directly targets the historical "fixed some / broke more" failure mode.
+1. KL(base || final) on base-correct clips;
+2. true-class margin preservation on base-correct clips;
+3. correction L2 on base-correct clips.
 
-### 14. Local rival ranking loss
+This directly targets the historical fixed-vs-broken cancellation problem.
 
-The specialist explicitly learns to raise the true candidate above the hardest
-active rival:
+### 15. Hard-example weighting
 
-    softplus(logit_rival - logit_true)
+Examples receive more specialist weight when:
 
-### 15. Fresh-view consistency
+- FMSE is wrong;
+- FMSE margin is low;
+- frozen streams disagree.
 
-Clean and augmented RCE predictions retain a small symmetric consistency term,
-but the old R4 stream-auxiliary loss is **not** copied into RCE.
+Easy/high-confidence examples receive reduced CE pressure.
 
-### 16. Automatic Type-R / Type-I class audit
+### 16. Training-only rival graph is stronger
 
-After training, the best EMA specialist is evaluated class by class.
+Rivals are built from:
 
-The worker saves:
+- clean training predictions;
+- multiple fresh augmented training passes;
+- rank-weighted final-model competitors;
+- frozen stream winners.
 
-- Top-1
-- Top-5
-- base Top-1
-- fixed
-- broken
-- net fixed
-- candidate coverage
-- gate mean
+No validation labels are used.
 
-Weak classes are labelled diagnostically:
+### 17. Diagnostics are stronger
 
-- Type-R: Top-1 <75%, Top-5 >=90% -> ranking problem
-- Type-I: Top-1 <75%, Top-5 <90% -> representation problem
+Every epoch records:
 
-Files:
+- final validation accuracy;
+- frozen base accuracy;
+- fixed rate;
+- broken rate;
+- candidate coverage;
+- retrieval Top-5;
+- stream disagreement;
+- gate mean.
 
-    xsub/per_class.csv
-    xsub/class_audit.json
-    xset/per_class.csv
-    xset/class_audit.json
+The final per-class audit saves:
 
-## Training stages
+- base Top-1;
+- RCEX Top-1;
+- RCEX Top-5;
+- delta;
+- fixed;
+- broken;
+- candidate coverage;
+- retrieval Top-5;
+- gate mean;
+- stream disagreement;
+- Type-R / Type-I label.
 
-This implementation is Stage 2:
+## Training objective
 
-1. load protected FMSE EMA;
-2. derive training-only rival graph;
-3. initialize RCE with exact zero correction;
-4. freeze FMSE;
-5. train only RCE;
-6. select best RCE EMA by final validation accuracy;
-7. audit fixed-vs-broken and per-class Top-5.
+```
+L =
+    hard_weight * CE(final)
+  + 0.18 * CE(retrieval)
+  + 0.10 * local_rival_loss
+  + 0.25 * KL_protection
+  + 0.20 * margin_protection
+  + 0.08 * gate_supervision
+  + 0.01 * correction_L2
+  + 0.01 * clean_aug_consistency
+```
 
-Stage 3 (optional FMSE Spatial-2 unfreeze at ~0.05x LR) is intentionally not
-mixed into the first controlled run.  It should only be attempted if Stage 2
-has net fixed > broken.
+Default specialist LR is reduced to **6e-4** because the new retrieval/gating
+problem is better supervised and no longer needs the aggressive RCE30 update.
 
-## Compute
+## Static compute estimate
 
-The static architecture audit uses 1 MAC = 2 FLOPs.
+The architecture-level estimate is:
 
-Current specialist estimates:
+- RCEX specialist: **~7.96 MFLOPs**
+- increase over RCE30 rival specialist: **~+2.69 MFLOPs**
 
-- fixed-query RCE: **~4.93 MFLOPs**
-- rival-conditioned RCE: **~5.27 MFLOPs**
+Using the same older Astra FMSE accounting reference (~64.69 MFLOPs):
 
-The earlier Astra design accounting used an FMSE full-model reference around
-64.69 MFLOPs and two specialist prototypes around ~69.71 MFLOPs total.  The
-implementation remains in that ~+5 MFLOP regime.
+- estimated combined total: **~72.65 MFLOPs**
 
-These are architecture estimates.  A compiler-independent operator audit is
-still required before publishing a final FLOP number.
+This is still extremely small compared with conventional skeleton models.
 
-## Parameters
+These values are design/operator estimates, not final publication counts.  A
+full compiler-independent audit is still required.
 
-The specialist is intentionally compact.  Exact counts are printed by the
-launcher preflight because fixed and rival variants differ slightly.
+## Success criteria
 
-The base 1,831,932 FMSE parameters remain frozen and protected.
+Primary:
 
-## Default training config
+- improve both XSUB and XSET;
+- candidate coverage materially higher than RCE30;
+- net fixed > broken;
+- hard classes improve without destroying strong classes.
 
-- epochs 40
-- patience 6
-- specialist LR 8e-4
-- min LR 2e-5
-- warmup 8%
-- weight decay 0.02
-- dropout 0.05
-- label smoothing 0.02
-- rival loss 0.10
-- protection KL 0.20
-- clean/aug consistency 0.02
-- gate regularization 0.005
-- protect margin 1.0
-- microbatch 64
-- accumulation 4
-- eval batch 256
-- seed 128
+Strong result:
 
-## Primary success criteria
+- >= +0.50 pp both protocols.
 
-A successful RCE run must satisfy more than raw Top-1:
-
-1. beat FMSE on both XSUB and XSET;
-2. net fixed > broken;
-3. no meaningful destruction of strong classes;
-4. candidate coverage remains high;
-5. hard-class gains are concentrated in training-derived rival neighborhoods.
-
-Strong target: >= +0.50 pp on both protocols.
-
-## Files
-
-- model.py — full evidence architecture, fixed and rival query variants
-- worker.py — frozen-base Stage-2 training, training-only rival graph, losses,
-  exact resume/checkpointing, per-class audit
-- launch.py — dual-T4 launcher and exact-baseline preflight
-- audit.py — transparent specialist MAC/FLOP estimate
+Do **not** unfreeze FMSE unless frozen-base RCEX first produces positive
+fixed-minus-broken behavior on both protocols.
