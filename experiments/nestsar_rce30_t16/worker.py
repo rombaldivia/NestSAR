@@ -545,6 +545,162 @@ def restore_last(path, template, digest):
     )
 
 
+
+def run_per_class_audit(
+    *,
+    dataset,
+    val_ids,
+    base_model,
+    base_params,
+    specialist,
+    specialist_params,
+    rival_table,
+    config,
+    protocol,
+    out,
+):
+    """Save Top-1/Top-5/fixed/broken/candidate coverage for all 120 classes."""
+
+    @jax.jit
+    def step(x, y, mask):
+        base_logits = base_model.apply(
+            {"params": base_params},
+            x,
+            training=False,
+        )["logits"]
+        result = specialist.apply(
+            {"params": specialist_params},
+            x,
+            base_logits,
+            rival_table,
+            training=False,
+        )
+        logits = result["logits"]
+        pred = jnp.argmax(logits, axis=-1)
+        base_pred = jnp.argmax(base_logits, axis=-1)
+        top5 = jax.lax.top_k(logits, 5)[1]
+        rows = jnp.arange(y.shape[0])
+        return (
+            pred,
+            base_pred,
+            jnp.any(top5 == y[:, None], axis=-1),
+            result["natural_candidate_mask"][rows, y],
+            result["gate"],
+            mask,
+        )
+
+    counts = np.zeros(NUM_CLASSES, np.int64)
+    correct = np.zeros(NUM_CLASSES, np.int64)
+    top5_ok = np.zeros(NUM_CLASSES, np.int64)
+    base_correct = np.zeros(NUM_CLASSES, np.int64)
+    fixed = np.zeros(NUM_CLASSES, np.int64)
+    broken = np.zeros(NUM_CLASSES, np.int64)
+    coverage = np.zeros(NUM_CLASSES, np.float64)
+    gate_sum = np.zeros(NUM_CLASSES, np.float64)
+
+    batch_size = int(config["eval_batch"])
+    steps = math.ceil(len(val_ids) / batch_size)
+
+    with closing(
+        dataset.batches(
+            val_ids,
+            batch_size,
+            config,
+            protocol=protocol,
+        )
+    ) as batches:
+        for _ in range(steps):
+            batch, _ = next(batches)
+            y = batch["y"]
+            (
+                pred,
+                base_pred,
+                t5,
+                cov,
+                gate,
+                mask,
+            ) = jax.block_until_ready(
+                step(
+                    jax.device_put(batch["x"]),
+                    jax.device_put(batch["y"]),
+                    jax.device_put(batch["mask"]),
+                )
+            )
+
+            pred = np.asarray(pred)
+            base_pred = np.asarray(base_pred)
+            t5 = np.asarray(t5)
+            cov = np.asarray(cov)
+            gate = np.asarray(gate)
+            mask = np.asarray(mask).astype(bool)
+
+            yy = y[mask]
+            pp = pred[mask]
+            bp = base_pred[mask]
+            tt = t5[mask]
+            cc = cov[mask]
+            gg = gate[mask]
+
+            np.add.at(counts, yy, 1)
+            np.add.at(correct, yy, pp == yy)
+            np.add.at(top5_ok, yy, tt)
+            np.add.at(base_correct, yy, bp == yy)
+            np.add.at(fixed, yy, (bp != yy) & (pp == yy))
+            np.add.at(broken, yy, (bp == yy) & (pp != yy))
+            np.add.at(coverage, yy, cc)
+            np.add.at(gate_sum, yy, gg)
+
+    rows = []
+    for c in range(NUM_CLASSES):
+        n = max(int(counts[c]), 1)
+        top1 = float(correct[c] / n)
+        top5 = float(top5_ok[c] / n)
+        base = float(base_correct[c] / n)
+
+        failure_type = "OK"
+        if top1 < 0.75:
+            failure_type = "Type-R" if top5 >= 0.90 else "Type-I"
+
+        rows.append(
+            {
+                "class_index": c,
+                "action": f"A{c+1:03d}",
+                "samples": int(counts[c]),
+                "base_top1": 100.0 * base,
+                "rce_top1": 100.0 * top1,
+                "rce_top5": 100.0 * top5,
+                "delta_pp": 100.0 * (top1 - base),
+                "fixed": int(fixed[c]),
+                "broken": int(broken[c]),
+                "net_fixed": int(fixed[c] - broken[c]),
+                "candidate_coverage": 100.0 * float(coverage[c] / n),
+                "gate_mean": float(gate_sum[c] / n),
+                "failure_type": failure_type,
+            }
+        )
+
+    csv_path = out / "per_class.csv"
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    summary = {
+        "protocol": protocol,
+        "classes": rows,
+        "type_r": [
+            r["action"] for r in rows if r["failure_type"] == "Type-R"
+        ],
+        "type_i": [
+            r["action"] for r in rows if r["failure_type"] == "Type-I"
+        ],
+        "fixed_total": int(fixed.sum()),
+        "broken_total": int(broken.sum()),
+        "net_fixed": int(fixed.sum() - broken.sum()),
+    }
+    atomic_json(out / "class_audit.json", summary)
+    return summary
+
 def run(
     *,
     config,
@@ -937,6 +1093,26 @@ def run(
         if metadata["stopped_early"]:
             break
 
+    # Final per-class audit always uses the best specialist EMA, not the last epoch.
+    best_payload = serialization.msgpack_restore(
+        (out / "best.msgpack").read_bytes()
+    )
+    best_specialist_params = jax.device_put(
+        best_payload["specialist_ema_params"]
+    )
+    class_audit = run_per_class_audit(
+        dataset=dataset,
+        val_ids=val_ids,
+        base_model=base_model,
+        base_params=base_params,
+        specialist=specialist,
+        specialist_params=best_specialist_params,
+        rival_table=rival_table,
+        config=config,
+        protocol=protocol,
+        out=out,
+    )
+
     result = {
         "model": MODEL_NAME,
         "model_identity": MODEL_IDENTITY,
@@ -954,6 +1130,13 @@ def run(
         "zero_init_baseline_max_abs_error": metadata[
             "zero_init_baseline_max_abs_error"
         ],
+        "fixed_total": class_audit["fixed_total"],
+        "broken_total": class_audit["broken_total"],
+        "net_fixed": class_audit["net_fixed"],
+        "type_r_classes": class_audit["type_r"],
+        "type_i_classes": class_audit["type_i"],
+        "per_class_csv": str(out / "per_class.csv"),
+        "class_audit": str(out / "class_audit.json"),
     }
     atomic_json(out / "result.json", result)
     atomic_json(Path(outdir) / f"result_{protocol}.json", result)
