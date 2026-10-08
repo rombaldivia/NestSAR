@@ -163,7 +163,9 @@ def start_or_attach(launch_argv, outdir):
                                 cwd=REPO, env=env, stdout=fh, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, start_new_session=True)
     pid_file.write_text(str(proc.pid))
-    print(f"\nLauncher started (pid {proc.pid}); log: {log}\n", flush=True)
+    print(f"\nLauncher started (pid {proc.pid}); log: {log}", flush=True)
+    print("Stopping this cell does NOT stop training. For progress bars, stop it and run the "
+          "monitor cell (experiments/nestsar_pt_t16/README.md).\n", flush=True)
     return follow(log, offset, proc.pid, proc)
 
 

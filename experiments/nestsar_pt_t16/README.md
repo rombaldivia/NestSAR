@@ -68,6 +68,27 @@ runs resume from `last.msgpack`.
 If a worker runs out of GPU memory, use `--micro-batch 32` (accumulation 8, the
 effective batch stays 256) and a new `--outdir`.
 
+## Live progress bars (optional second cell)
+
+The launch cell prints text lines (one per phase change, plus a heartbeat every
+10 minutes). For the two R4-style progress rows, stop the launch cell — training
+keeps running — and run:
+
+```python
+import importlib.util, subprocess
+REPO = "/kaggle/working/NestSAR_PT_branch"
+subprocess.run(["git", "-C", REPO, "fetch", "-q", "--depth", "1", "origin", "experiment/nestsar-pt-t16"], check=True)
+subprocess.run(["git", "-C", REPO, "reset", "-q", "--hard", "FETCH_HEAD"], check=True)
+spec = importlib.util.spec_from_file_location("nestsar_pt_monitor", f"{REPO}/experiments/nestsar_pt_t16/monitor.py")
+mon = importlib.util.module_from_spec(spec); spec.loader.exec_module(mon)
+mon.monitor("/kaggle/working/NestSAR_PT_T16_v1")
+```
+
+`monitor.py` only reads the status/history files: it lists the R4 reference runs
+(and whether the epoch-10 rule can decide), then shows the two progress rows,
+one line per finished epoch with its delta vs R4, and the kill decision.
+Stopping it never affects training.
+
 ## Early kill rule
 
 At epoch 10 the launcher compares EMA validation accuracy with the plain R4 run
