@@ -64,8 +64,21 @@ def _fill(args):
     return b - a
 
 
+def _fmt(seconds):
+    seconds = int(seconds)
+    return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m" if seconds >= 3600 else f"{seconds // 60}m{seconds % 60:02d}s"
+
+
+def _progress(view, views, finished, total, elapsed, done_view=False):
+    rate = finished / elapsed if elapsed > 0 else 0.0
+    eta = (total - finished) / rate if rate > 0 else 0.0
+    bar = "#" * int(20 * finished / max(total, 1))
+    return (f"  [{bar:<20}] {100 * finished / max(total, 1):5.1f}%  view {view + 1}/{views}"
+            f"{' done' if done_view else '     '}  {rate:5.0f} views/s  elapsed {_fmt(elapsed)}  ETA {_fmt(eta)}")
+
+
 def build(cache, pool_dir, views=8, strength=1.0, view_degrees=15.0, seed=POOL_SEED, workers=None,
-          chunk=256, log=print):
+          chunk=256, log=print, progress_every=15.0):
     from experiments.nestsar_r5_t16.data import Dataset, read_manifest
     cache, pool_dir = str(cache), Path(pool_dir)
     meta = read_manifest(Path(cache))
@@ -88,6 +101,9 @@ def build(cache, pool_dir, views=8, strength=1.0, view_degrees=15.0, seed=POOL_S
         raise RuntimeError(f"The pool needs {need / 2**30:.1f} GiB; only {(free + done_bytes) / 2**30:.1f} GiB free "
                            f"in {pool_dir}. Use fewer --views or a bigger disk (/tmp on Kaggle).")
     workers = workers or max(1, mp.cpu_count())
+    pending = [v for v in range(views) if not view_file(pool_dir, v).is_file()]
+    total_views = len(pending) * n                      # views already finished do not count towards the ETA
+    finished = 0
     ctx = mp.get_context("spawn")                     # no fork after JAX/threads: workers import numpy code only
     t0 = time.time()
     with cf.ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
@@ -101,13 +117,14 @@ def build(cache, pool_dir, views=8, strength=1.0, view_degrees=15.0, seed=POOL_S
             del mm
             jobs = [(cache, str(pool_dir), v, a, min(a + chunk, n), strength, view_degrees, seed)
                     for a in range(0, n, chunk)]
-            done = 0
+            last = time.time()
             for count in ex.map(_fill, jobs):
-                done += count
-                if done % (chunk * 40) < chunk:
-                    log(f"  view {v + 1}/{views}: {done:,}/{n:,}  ({time.time() - t0:.0f} s)")
+                finished += count
+                if time.time() - last >= progress_every:
+                    last = time.time()
+                    log(_progress(v, views, finished, total_views, time.time() - t0))
             partial.replace(final)
-            log(f"  view {v + 1}/{views} done  ({time.time() - t0:.0f} s)")
+            log(_progress(v, views, finished, total_views, time.time() - t0, done_view=True))
     out = {"signature": sig, "complete": True, "build_seconds": time.time() - t0}
     mf.write_text(json.dumps(out))
     return out
