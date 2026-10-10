@@ -236,3 +236,29 @@ def test_filtered_cache_has_its_own_signature_and_dataset_uses_it(tmp_path):
     assert validate_config({"hand_filter": "smooth"})["hand_filter"] == "smooth"
     with pytest.raises(ValueError):
         validate_config({"hand_filter": "x"})
+
+
+def test_sun_frame_filter_replaces_noisy_frames_with_the_previous_one():
+    clean, x = noisy_hand_clip()
+    valid = r4pp.raw_valid(x)
+    h = list(pp._HAND_JOINTS)
+    bad = x.copy()
+    bad[40, 0, [6, 7, 21, 22]] += 1.0                        # whole left hand teleports for one frame
+    y = pp.denoise_hand_joints(bad, valid, "sun")
+    np.testing.assert_array_equal(y[40, 0, [6, 7, 21, 22]], bad[39, 0, [6, 7, 21, 22]])
+    other = [j for j in range(25) if j not in pp._HAND_JOINTS]
+    np.testing.assert_array_equal(y[:, :, other], bad[:, :, other])
+    err = lambda a: np.abs(a[:, :, h] - clean[:, :, h]).mean()
+    assert err(y) < err(bad)
+    assert err(pp.denoise_hand_joints(bad, valid, "sun_smooth")) < err(y)
+
+
+def test_sun_filter_keeps_clean_clips_and_gaps():
+    clean = noisy_hand_clip()[0]
+    valid = r4pp.raw_valid(clean)
+    np.testing.assert_array_equal(pp.denoise_hand_joints(clean, valid, "sun"), clean)
+    x = clean.copy()
+    x[10:15, 0, 7] = 0
+    y = pp.denoise_hand_joints(x, r4pp.raw_valid(x), "sun")
+    assert np.abs(y[10:15, 0, 7]).max() == 0 and np.isfinite(y).all()
+    assert np.isfinite(pp.features(x[:5], hand_filter="sun_smooth")).all()

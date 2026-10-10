@@ -226,9 +226,9 @@ feeds the GPU. Resuming an older run needs the commit it was started with (the c
 
     --extra-config '{"aug_strength": 1.0, "prefetch_workers": 2}' --ignore-kill
 
-**Hand filter** (`--hand-filter none|hampel|smooth`): only wrist/hand/tip/thumb joints, only inside the
+**Hand filter** (`--hand-filter none|hampel|smooth|sun|sun_smooth`): only wrist/hand/tip/thumb joints, only inside the
 hand tokens (the 750 R4 features stay bit-identical). `hampel` = Hampel identifier (window 5, 3 MAD,
-0.002 m floor); `smooth` = Hampel + zero-phase Savitzky–Golay (window 7, order 2). Gaps are never filled
+0.002 m floor); `smooth` = Hampel + zero-phase Savitzky–Golay (window 7, order 2). `sun` is frame-level, adapted from Sun et al. (2105.11312: detect a noisy frame, replace it by the previous one): a hand side is noisy when a hand bone length leaves max(4 MAD, 25 %) of its clip median or the wrist jumps > 6 robust sigmas in one step; its four joints are then held from the last clean frame. Only the idea is from the paper (I could not read their criterion); the detector is mine. `sun_smooth` = `sun` + `smooth`. Gaps are never filled
 and runs shorter than the window are left alone. A filtered run needs its own hand cache (the name gets a
 `_<filter>` suffix, the signature records it) and `worker.py` refuses a config/cache mismatch.
 Motivation: BHaRNet reports hand keypoints are noisier than body keypoints.

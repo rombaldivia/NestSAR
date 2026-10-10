@@ -169,7 +169,7 @@ def hand_tokens(x, valid, starts, ends, scale):
     return out.astype(np.float32).reshape(FRAMES, HAND_FEATURES)
 
 
-HAND_FILTERS = ("none", "hampel", "smooth")
+HAND_FILTERS = ("none", "hampel", "smooth", "sun", "sun_smooth")
 HAMPEL_FLOOR = 0.002          # metres; keeps static joints (MAD ~ 0) from being flagged by sensor jitter
 _HAND_JOINTS = tuple(sorted({j for side in HAND_SIDES for j in side}))
 
@@ -185,11 +185,46 @@ def _hampel(run, window, k):
     return np.where(bad, med, run)
 
 
+def _hold_noisy_frames(x, valid, k=4.0, rel=0.25, jump=6.0):
+    """Frame-level denoising in the spirit of Sun et al. (replace a noisy frame by the previous one).
+
+    Per person and hand side, a frame is noisy when a hand bone (wrist-hand, hand-tip, hand-thumb) is
+    more than max(k MAD, rel * median) away from its clip median length, or the wrist jumps more than
+    ``jump`` robust standard deviations in one step. All four joints of that side are replaced by the last
+    clean frame (the next clean one at the start). Invalid (missing) frames are never filled.
+    """
+    out = np.array(x, np.float32, copy=True)
+    for p in range(x.shape[1]):
+        for wrist, hand, tip, thumb in HAND_SIDES:
+            ok = valid[:, p, wrist] & valid[:, p, hand] & valid[:, p, tip] & valid[:, p, thumb]
+            if ok.sum() < 8:
+                continue
+            idx = np.flatnonzero(ok)
+            bad = np.zeros(len(idx), bool)
+            for a, b in ((wrist, hand), (hand, tip), (hand, thumb)):
+                length = np.linalg.norm(x[idx, p, a] - x[idx, p, b], axis=-1)
+                med = np.median(length)
+                mad = 1.4826 * np.median(np.abs(length - med))
+                bad |= np.abs(length - med) > np.maximum(k * mad, rel * med)
+            step = np.linalg.norm(np.diff(x[idx, p, wrist], axis=0), axis=-1)
+            smed = np.median(step)
+            sstd = 1.4826 * np.median(np.abs(step - smed))
+            bad[1:] |= step > smed + jump * np.maximum(sstd, HAMPEL_FLOOR)
+            if not bad.any() or bad.all():
+                continue
+            good = np.flatnonzero(~bad)
+            src = good[np.maximum(np.searchsorted(good, np.arange(len(idx)), side="right") - 1, 0)]
+            for j in (wrist, hand, tip, thumb):
+                out[idx[bad], p, j] = x[idx[src[bad]], p, j]
+    return out
+
+
 def denoise_hand_joints(x, valid, mode):
     """Zero-phase denoising of the wrist/hand/tip/thumb joints only (body joints are returned untouched).
 
     ``hampel``: Hampel identifier (window 5, 3 MAD) replaces isolated spikes by the local median.
     ``smooth``: Hampel followed by a Savitzky-Golay filter (window 7, order 2, symmetric so no lag).
+    ``sun``: frame-level (see ``_hold_noisy_frames``); ``sun_smooth``: that, then ``smooth``.
     It runs per person and per joint on each run of consecutive valid frames and never fills gaps.
     """
     if mode == "none" or len(x) == 0:
@@ -197,6 +232,10 @@ def denoise_hand_joints(x, valid, mode):
     if mode not in HAND_FILTERS:
         raise ValueError(f"hand filter must be one of {HAND_FILTERS}, got {mode!r}")
     from scipy.signal import savgol_filter
+    if mode.startswith("sun"):
+        x = _hold_noisy_frames(x, valid)
+        if mode == "sun":
+            return x
     out = np.array(x, np.float32, copy=True)
     for p in range(x.shape[1]):
         for j in _HAND_JOINTS:
@@ -208,7 +247,7 @@ def denoise_hand_joints(x, valid, mode):
                 run = x[a:b, p, j].astype(np.float64)
                 if len(run) >= 5:
                     run = _hampel(run, 5, 3.0)
-                if mode == "smooth" and len(run) >= 7:
+                if mode in ("smooth", "sun_smooth") and len(run) >= 7:
                     run = savgol_filter(run, 7, 2, axis=0, mode="interp")
                 out[a:b, p, j] = run
     return out

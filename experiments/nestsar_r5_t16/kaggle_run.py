@@ -265,7 +265,7 @@ def main(argv=None):
     ap.add_argument("--no-follow", action="store_true",
                     help="return after starting/attaching (the notebook monitor shows progress)")
     ap.add_argument("--cpu-smoke", action="store_true", help="local test only (no GPU)")
-    ap.add_argument("--hand-filter", default="none", choices=["none", "hampel", "smooth"],
+    ap.add_argument("--hand-filter", default="none", choices=["none", "hampel", "smooth", "sun", "sun_smooth"],
                     help="denoise the hand joints (builds/uses a separate hand cache)")
     ap.add_argument("--extra-config", default="{}", help='JSON merged into config, e.g. \'{"aug_strength": 1.0, "prefetch_workers": 2}\'')
     a = ap.parse_args(argv)

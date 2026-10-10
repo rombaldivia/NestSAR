@@ -59,8 +59,8 @@ def validate_config(config):
         raise ValueError("early_stop_guard_epoch must be a nonnegative integer")
     if not 0 <= c["aug_strength"] <= 2:
         raise ValueError("aug_strength must be in [0, 2] (0 = R4 augmentation)")
-    if c["hand_filter"] not in ("none", "hampel", "smooth"):
-        raise ValueError("hand_filter must be none, hampel or smooth")
+    if c["hand_filter"] not in ("none", "hampel", "smooth", "sun", "sun_smooth"):
+        raise ValueError("hand_filter must be none, hampel, smooth, sun or sun_smooth")
     if not 0 <= c["aug_clean_prob"] <= 1:
         raise ValueError("aug_clean_prob must be in [0, 1]")
     if c["prefetch_workers"] not in (1, 2, 3, 4):
