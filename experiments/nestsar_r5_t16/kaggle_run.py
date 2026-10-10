@@ -203,8 +203,12 @@ def check_disk_for_cache(hand_cache, body_align, working, r4_cache=None):
     print(f"Disk: {free:.1f} GiB free, new cache needs ~{need:.1f} GiB", flush=True)
     if free >= need:
         return
-    olds = [d for d in sorted(Path(working).iterdir()) if d.is_dir() and str(d) != str(hand_cache)
-            and not (d / "manifest.json").is_file() or (d.is_dir() and d.name.startswith("NestSAR_R5") and str(d) != str(hand_cache))]
+    olds = [d for d in sorted(Path(working).iterdir()) if d.is_dir()
+            and (d.name.startswith("NestSAR_R5") or (d.name.startswith("NestSAR_") and not (d / "manifest.json").is_file()))]
+    partial = Path(hand_cache)
+    if partial.is_dir() and not (partial / "manifest.json").is_file() and partial not in olds:
+        olds.append(partial)                       # leftover of an interrupted build: usually the big one
+    olds = [d for d in olds if d.name not in ("NestSAR_R5_ALIGNMIX_branch",)]
     lines = [f"  {_dir_gib(d):5.1f} GiB  rm -rf {d}" for d in olds]
     raise SystemExit(f"Not enough disk for the new cache ({free:.1f} GiB free, ~{need:.1f} GiB needed).\n"
                      "Delete caches of finished/stopped runs, e.g.:\n" + ("\n".join(lines) or "  (none found)"))
