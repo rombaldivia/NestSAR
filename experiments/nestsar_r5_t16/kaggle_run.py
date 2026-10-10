@@ -70,7 +70,7 @@ print("R4 cache samples:", meta.get("samples"), meta.get("split_counts"))
 HAND_CACHE_BUILD = """
 import sys, json
 from experiments.nestsar_r5_t16.data import build
-meta = build(sys.argv[1], sys.argv[2])
+meta = build(sys.argv[1], sys.argv[2], hand_filter=sys.argv[3] if len(sys.argv) > 3 else "none")
 print(json.dumps({"samples": meta["samples"], "base_dir": meta["base_dir"],
                   "max_body_token_difference": meta.get("max_body_token_difference")}))
 """
@@ -164,18 +164,19 @@ def find_r4_cache(explicit, working, inputs):
     return str(target)
 
 
-def default_hand_cache_name(r4_cache):
+def default_hand_cache_name(r4_cache, hand_filter="none"):
     """One hand cache per R4 cache: the name carries a hash of the R4 manifest."""
     import hashlib
     manifest = json.loads((Path(r4_cache) / "manifest.json").read_text())
     key = json.dumps({"signature": manifest["signature"], "files": manifest["files"]}, sort_keys=True)
-    return f"{DEFAULT_HAND_CACHE}_{hashlib.sha256(key.encode()).hexdigest()[:8]}"
+    suffix = "" if hand_filter == "none" else f"_{hand_filter}"
+    return f"{DEFAULT_HAND_CACHE}_{hashlib.sha256(key.encode()).hexdigest()[:8]}{suffix}"
 
 
-def ensure_hand_cache(r4_cache, hand_cache):
+def ensure_hand_cache(r4_cache, hand_cache, hand_filter="none"):
     print(f"R5 hand cache: {hand_cache} (from {r4_cache})", flush=True)
     t0 = time.time()
-    r = cpu_python(HAND_CACHE_BUILD, r4_cache, hand_cache, capture=True, timeout=6 * 3600)
+    r = cpu_python(HAND_CACHE_BUILD, r4_cache, hand_cache, hand_filter, capture=True, timeout=6 * 3600)
     if r.returncode != 0:
         raise SystemExit("Hand cache build failed:\n" + "\n".join((r.stderr or "").splitlines()[-20:]))
     info = json.loads(last_line(r.stdout))
@@ -264,7 +265,9 @@ def main(argv=None):
     ap.add_argument("--no-follow", action="store_true",
                     help="return after starting/attaching (the notebook monitor shows progress)")
     ap.add_argument("--cpu-smoke", action="store_true", help="local test only (no GPU)")
-    ap.add_argument("--extra-config", default="{}", help="JSON merged into config (smoke tests)")
+    ap.add_argument("--hand-filter", default="none", choices=["none", "hampel", "smooth"],
+                    help="denoise the hand joints (builds/uses a separate hand cache)")
+    ap.add_argument("--extra-config", default="{}", help='JSON merged into config, e.g. \'{"aug_strength": 1.0, "prefetch_workers": 2}\'')
     a = ap.parse_args(argv)
 
     print(f"{MODEL_NAME}  variant={a.variant}  micro_batch={a.micro_batch}  out={a.outdir}", flush=True)
@@ -286,8 +289,8 @@ def main(argv=None):
 
     r4_cache = find_r4_cache(a.r4_cache, a.working, a.inputs)
     print("R4 CACHE:", r4_cache, flush=True)
-    hand_cache = a.hand_cache or str(Path(a.working) / default_hand_cache_name(r4_cache))
-    ensure_hand_cache(r4_cache, hand_cache)
+    hand_cache = a.hand_cache or str(Path(a.working) / default_hand_cache_name(r4_cache, a.hand_filter))
+    ensure_hand_cache(r4_cache, hand_cache, a.hand_filter)
 
     launch_argv = ["--cache", hand_cache, "--outdir", a.outdir, "--variant", a.variant,
                    "--protocols", a.protocols, "--micro-batch", str(a.micro_batch),
@@ -299,7 +302,12 @@ def main(argv=None):
     if a.ignore_kill:
         launch_argv.append("--ignore-kill")
     if a.cpu_smoke:
-        launch_argv += ["--cpu-smoke", "--extra-config", a.extra_config]
+        launch_argv.append("--cpu-smoke")
+    extra = json.loads(a.extra_config)
+    if a.hand_filter != "none":
+        extra["hand_filter"] = a.hand_filter
+    if extra:
+        launch_argv += ["--extra-config", json.dumps(extra)]
     code = start_or_attach(launch_argv, a.outdir, follow_log=not a.no_follow)
     decision = launch.read_json(Path(a.outdir) / "kill_decision.json")
     if decision:

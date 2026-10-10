@@ -212,3 +212,27 @@ The tests cover:
 The smoke test runs the exact Kaggle path on a synthetic pickle: caches,
 detached launcher, two concurrent workers, kill decision, results, re-run,
 resume, and refusal of a variant change.
+
+## Strong augmentation, hand filter and TTA (post-audit)
+
+The audit showed 99.7–99.9 % clean-train accuracy against 76–77 % validation, so the next lever is
+regularisation, not more capacity.
+
+**Strong augmentation** (`aug_strength` 0 = old behaviour, 0–2): random affine (yaw ±15°, pitch/roll ±5°,
+shear, per-axis scale), per-bone length perturbation along the kinematic tree, joint noise, speed
+resampling (±25 %), temporal crop, joint cut-out. Deterministic per (seed, epoch, sample, stream).
+`aug_clean_prob` (0.2) keeps the canonical view for that share of samples; `prefetch_workers` (1–4)
+feeds the GPU. Resuming an older run needs the commit it was started with (the config is hashed).
+
+    --extra-config '{"aug_strength": 1.0, "prefetch_workers": 2}' --ignore-kill
+
+**Hand filter** (`--hand-filter none|hampel|smooth`): only wrist/hand/tip/thumb joints, only inside the
+hand tokens (the 750 R4 features stay bit-identical). `hampel` = Hampel identifier (window 5, 3 MAD,
+0.002 m floor); `smooth` = Hampel + zero-phase Savitzky–Golay (window 7, order 2). Gaps are never filled
+and runs shorter than the window are left alone. A filtered run needs its own hand cache (the name gets a
+`_<filter>` suffix, the signature records it) and `worker.py` refuses a config/cache mismatch.
+Motivation: BHaRNet reports hand keypoints are noisier than body keypoints.
+Not validated on real NTU yet: compare `none` vs `smooth` with the same augmentation before trusting it.
+
+**TTA** in the audit: `--tta N` adds N mildly augmented views (same hand filter as the cache) and reports
+mean-logit / mean-softmax accuracy against the canonical view.

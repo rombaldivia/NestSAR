@@ -17,6 +17,8 @@ Per protocol, on the full official validation split (inference only, no training
                    A drop is a counterfactual on a model trained WITH the component; it is
                    not the gain of the component in a model trained without it (that needs
                    the ablation variants).
+  TTA              optional (--tta N): mean logits of the canonical view and N mildly augmented views
+                   (yaw +-8 deg, +-1 frame boundary jitter); inference only
   R4 comparison    optional (--r4-checkpoint-root): both models on the same clips, who is
                    right when, the oracle union and the softmax-average ensemble
   history          overfit gap, gain per epoch, learned scales, timing (history.json)
@@ -111,6 +113,41 @@ def logits_for(forward, params, dataset, ids, batch, hand_start=None, label=""):
         if i % 50 == 0 or i + 1 == steps:
             print(f"    {label:<18} {i + 1}/{steps}  {time.time() - t0:.0f}s", flush=True)
     return out
+
+
+def tta_logits(forward, params, dataset, ids, batch, views, workers=4, seed=424242):
+    """Mean logits over the canonical view and ``views`` augmented views, plus the per-view accuracies' inputs."""
+    import concurrent.futures
+    import jax
+    from experiments.nestsar_r5_t16 import preprocessing as pp
+
+    ids = np.asarray(ids, np.int64)
+    total = np.zeros((len(ids), NUM_CLASSES), np.float32)
+    per_view = []
+    steps = math.ceil(len(ids) / batch)
+    t0 = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        for view in range(1, views + 1):
+            def prepare(i, view=view):
+                chunk = ids[i * batch:(i + 1) * batch]
+                x = np.zeros((batch, pp.FRAMES, pp.FEATURES), np.float32)
+                for j, idx in enumerate(chunk):
+                    x[j] = pp.augmented_features(dataset.base.sample(idx), seed, view, int(idx), 8.0, 1,
+                                                hand_filter=getattr(dataset, "hand_filter", "none"))
+                return chunk, x
+            out = np.zeros_like(total)
+            futures = [pool.submit(prepare, i) for i in range(min(steps, workers + 1))]
+            nxt = len(futures)
+            for i in range(steps):
+                chunk, x = futures[i].result()
+                if nxt < steps:
+                    futures.append(pool.submit(prepare, nxt))
+                    nxt += 1
+                out[i * batch:i * batch + len(chunk)] = np.asarray(jax.device_get(forward(params, x)))[:len(chunk)]
+            per_view.append(out)
+            total += out
+            print(f"    TTA view {view}/{views}  {time.time() - t0:.0f}s", flush=True)
+    return per_view
 
 
 def softmax(z):
@@ -258,6 +295,7 @@ def main(argv=None):
     ap.add_argument("--modes", default=",".join(MODES))
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--train-samples", type=int, default=6000, help="clean train accuracy subset (0 = skip)")
+    ap.add_argument("--tta", type=int, default=0, help="augmented views for test-time augmentation (0 = skip)")
     ap.add_argument("--max-val-samples", type=int, default=0, help="0 = full validation split")
     ap.add_argument("--output", default=None, help="default: <run-dir>/r5_audit.json")
     a = ap.parse_args(argv)
@@ -364,6 +402,20 @@ def main(argv=None):
                                              "gap_to_val_pp": 100 * (tacc - modes_out["trained"]["accuracy"])}
             print(f"  clean train acc    {100 * tacc:7.3f}%  gap to val {entry['clean_train_accuracy']['gap_to_val_pp']:.2f} pp",
                   flush=True)
+        if a.tta:
+            views = tta_logits(forward, jax.device_put(params), dataset, ids, a.batch, a.tta)
+            base_acc = modes_out["trained"]["accuracy"]
+            mean_logits = (base_logits + sum(views)) / (1 + len(views))
+            mean_prob = (softmax(base_logits) + sum(softmax(v) for v in views)) / (1 + len(views))
+            entry["tta"] = {
+                "views": a.tta, "canonical_accuracy": base_acc,
+                "single_view_accuracies": [float(np.mean(v.argmax(1) == labels)) for v in views],
+                "mean_logits_accuracy": float(np.mean(mean_logits.argmax(1) == labels)),
+                "mean_softmax_accuracy": float(np.mean(mean_prob.argmax(1) == labels)),
+            }
+            entry["tta"]["gain_pp"] = 100 * (entry["tta"]["mean_softmax_accuracy"] - base_acc)
+            print(f"  TTA x{a.tta}: canonical {100 * base_acc:.3f}%  ->  {100 * entry['tta']['mean_softmax_accuracy']:.3f}% "
+                  f"({entry['tta']['gain_pp']:+.3f} pp)", flush=True)
         if a.r4_checkpoint_root:
             entry["r4_comparison"] = r4_comparison(a.r4_checkpoint_root, protocol, dataset, ids,
                                                    base_logits, labels, a.batch)

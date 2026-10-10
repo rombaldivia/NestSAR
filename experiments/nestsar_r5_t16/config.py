@@ -33,6 +33,9 @@ VARIANTS = {
 DEFAULTS = {k: v for k, v in r4_launch.DEFAULTS.items() if k not in R4_MODEL_KEYS}
 DEFAULTS.update(MODEL_DEFAULTS)
 DEFAULTS.update(variant="full", early_stop_guard_epoch=14)
+# Strong training-only augmentation (preprocessing.strong_augmented_features). 0 = the R4 recipe
+# (yaw +-8 deg and +-1 frame boundary jitter on one augmented view).
+DEFAULTS.update(aug_strength=0.0, aug_clean_prob=0.2, prefetch_workers=1, hand_filter="none")
 
 
 def validate_config(config):
@@ -54,6 +57,14 @@ def validate_config(config):
             raise ValueError(f"Keep {k}={v}: parameter/FLOP audits are recorded for the default sizes")
     if not isinstance(c["early_stop_guard_epoch"], int) or c["early_stop_guard_epoch"] < 0:
         raise ValueError("early_stop_guard_epoch must be a nonnegative integer")
+    if not 0 <= c["aug_strength"] <= 2:
+        raise ValueError("aug_strength must be in [0, 2] (0 = R4 augmentation)")
+    if c["hand_filter"] not in ("none", "hampel", "smooth"):
+        raise ValueError("hand_filter must be none, hampel or smooth")
+    if not 0 <= c["aug_clean_prob"] <= 1:
+        raise ValueError("aug_clean_prob must be in [0, 1]")
+    if c["prefetch_workers"] not in (1, 2, 3, 4):
+        raise ValueError("prefetch_workers must be 1..4")
     return c
 
 

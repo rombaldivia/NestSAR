@@ -97,3 +97,23 @@ def test_actor_count_from_tokens():
             return out
     two = audit.actor_count(Fake(), [0, 1, 2])
     assert two.tolist() == [False, True, False]
+
+
+def test_tta_logits_shape_and_determinism(trained_like):
+    model, params, _ = trained_like
+    rng = np.random.default_rng(1)
+
+    class Fake:
+        class base:
+            @staticmethod
+            def sample(i):
+                x = np.zeros((30, 2, 25, 3), np.float32)
+                x[:, 0] = rng_state[i] + 0.01 * np.arange(30)[:, None, None]
+                return x
+
+    rng_state = rng.normal(0, 0.3, (3, 25, 3)) + np.array([0, 0.4, 3.0])
+    fwd = lambda p, x: model.apply({"params": p}, x, training=False)["logits"]
+    a = audit.tta_logits(fwd, params, Fake, [0, 1, 2], 2, 2, workers=2)
+    b = audit.tta_logits(fwd, params, Fake, [0, 1, 2], 2, 2, workers=1)
+    assert np.asarray(a).shape == (2, 3, audit.NUM_CLASSES)
+    np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-5)

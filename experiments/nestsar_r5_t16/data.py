@@ -65,14 +65,17 @@ def candidate_r4_caches(roots, preferred=()):
     return out
 
 
-def _signature(base):
-    return {
+def _signature(base, hand_filter="none"):
+    sig = {
         "base_signature": base.meta["signature"],
         "base_files": base.meta["files"],
         "base_samples": int(base.meta["samples"]),
         "preprocessing": r5pp.VERSION,
         "cache_version": CACHE_VERSION,
     }
+    if hand_filter != "none":          # absent == "none", so caches built before the filter keep loading
+        sig["hand_filter"] = hand_filter
+    return sig
 
 
 def _existing(cache_dir, signature, base_dir):
@@ -95,11 +98,11 @@ def _existing(cache_dir, signature, base_dir):
     return meta
 
 
-def build(base_dir, cache_dir, status=None, check_body=True):
+def build(base_dir, cache_dir, status=None, check_body=True, hand_filter="none"):
     """Create (or validate) the derived hand cache for `base_dir` in `cache_dir`."""
     base_dir, cache_dir = Path(base_dir).resolve(), Path(cache_dir)
     base = r4_data.Dataset(base_dir)          # validates the R4 manifest and file sizes
-    signature = _signature(base)
+    signature = _signature(base, hand_filter)
     n = int(base.meta["samples"])
     done = _existing(cache_dir, signature, base_dir)
     if done is not None:
@@ -125,7 +128,7 @@ def build(base_dir, cache_dir, status=None, check_body=True):
         worst = 0.0
         t0 = time.time()
         for i in range(n):
-            tokens = r5pp.features(base.sample(i))
+            tokens = r5pp.features(base.sample(i), hand_filter=hand_filter)
             if check_body:
                 diff = float(np.max(np.abs(tokens[:, :r5pp.R4_FEATURES] - base.canonical[i])))
                 worst = max(worst, diff)
@@ -192,6 +195,7 @@ class Dataset:
             raise ValueError(f"Unexpected hand cache shape {self.hand.shape}")
         if len(self.base.labels) != meta["samples"]:
             raise ValueError("Base cache and hand cache sample counts differ")
+        self.hand_filter = meta["signature"].get("hand_filter", "none")
         self.meta = {"signature": meta["signature"], "samples": meta["samples"]}
         self.splits = self.base.splits
         self.labels = self.base.labels
@@ -213,25 +217,41 @@ class Dataset:
         if training:
             b["xa"] = np.zeros_like(b["x"])
             protocol_seed = config["seed"] + (100000 if protocol == "xset" else 0)
+            strength = config.get("aug_strength", 0.0)
+            aug_epoch = epoch if config["fresh_augmentation"] else 1
             for j, (index, position) in enumerate(zip(indices, positions)):
-                b["xa"][j] = r5pp.augmented_features(
-                    self.base.sample(index), protocol_seed,
-                    epoch if config["fresh_augmentation"] else 1,
-                    int(position), config["rotation_degrees"], config["jitter_shift"])
+                sample = self.base.sample(index)
+                if strength > 0:
+                    # Two independent strong views; the clean view survives with aug_clean_prob so the
+                    # canonical input that validation uses stays in the training distribution.
+                    b["xa"][j] = r5pp.strong_augmented_features(
+                        sample, protocol_seed, aug_epoch, int(position), strength, stream=1,
+                        shift=config["jitter_shift"], hand_filter=self.hand_filter)
+                    keep_clean = np.random.default_rng(np.random.SeedSequence(
+                        [protocol_seed, aug_epoch, int(position), 4177])).random() < config.get("aug_clean_prob", 0.2)
+                    if not keep_clean:
+                        b["x"][j] = r5pp.strong_augmented_features(
+                            sample, protocol_seed, aug_epoch, int(position), strength, stream=0,
+                            shift=config["jitter_shift"], hand_filter=self.hand_filter)
+                else:
+                    b["xa"][j] = r5pp.augmented_features(
+                        sample, protocol_seed, aug_epoch, int(position),
+                        config["rotation_degrees"], config["jitter_shift"], hand_filter=self.hand_filter)
         return b, time.perf_counter() - t0
 
     def batches(self, indices, size, config, epoch=0, training=False, protocol="xsub"):
-        """One producer thread, at most `prefetch_batches` prepared batches; errors propagate."""
+        """``prefetch_workers`` producer threads, at most max(`prefetch_batches`, workers) prepared batches; errors propagate."""
         indices = np.array(indices, np.int64)
         positions = np.arange(len(indices))
         if training:
             # Same sample order and augmentation seeds as the R4 runner.
             positions = np.random.default_rng(config["seed"] + epoch).permutation(len(indices))
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        workers = int(config.get("prefetch_workers", 1))
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
         try:
             pending, cursor = [], 0
             while cursor < len(indices) or pending:
-                while cursor < len(indices) and len(pending) < config.get("prefetch_batches", 2):
+                while cursor < len(indices) and len(pending) < max(config.get("prefetch_batches", 2), workers):
                     pos = positions[cursor:cursor + size]
                     pending.append(pool.submit(self.batch, indices[pos], pos, size, config, epoch,
                                                training, protocol))

@@ -302,6 +302,9 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
     params_count = EXPECTED_PARAMS[variant]
     identity = implementation_identity(variant)
     dataset = Dataset(cache)
+    if config.get("hand_filter", "none") != dataset.hand_filter:
+        raise ValueError(f"config hand_filter={config.get('hand_filter', 'none')!r} but the hand cache was built with "
+                         f"{dataset.hand_filter!r}")
     train_ids = dataset.splits[f"{protocol}_train"]
     val_ids = dataset.splits[f"{protocol}_val"]
     if config["max_train_samples"]:
