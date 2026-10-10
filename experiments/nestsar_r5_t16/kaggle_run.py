@@ -174,6 +174,36 @@ def default_hand_cache_name(r4_cache, hand_filter="none", body_align="none"):
     return f"{DEFAULT_HAND_CACHE}_{hashlib.sha256(key.encode()).hexdigest()[:8]}{suffix}"
 
 
+def _dir_gib(path):
+    total = 0
+    for p in Path(path).rglob("*"):
+        try:
+            total += p.stat().st_size if p.is_file() else 0
+        except OSError:
+            pass
+    return total / 2 ** 30
+
+
+def check_disk_for_cache(hand_cache, body_align, working):
+    """Fail early (with the exact cleanup command) when the new cache cannot fit."""
+    import shutil
+    from experiments.nestsar_r5_t16 import preprocessing as pp
+    if (Path(hand_cache) / "manifest.json").is_file():
+        return
+    n = 128_000                                    # NTU-120 upper bound, enough for a conservative estimate
+    width = pp.FEATURES if body_align != "none" else pp.HAND_FEATURES
+    need = n * pp.FRAMES * width * 4 / 2 ** 30 + 0.5
+    Path(hand_cache).parent.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(Path(hand_cache).parent).free / 2 ** 30
+    print(f"Disk: {free:.1f} GiB free, new cache needs ~{need:.1f} GiB", flush=True)
+    if free >= need:
+        return
+    olds = [d for d in sorted(Path(working).glob(DEFAULT_HAND_CACHE + "*")) if d.is_dir() and str(d) != str(hand_cache)]
+    lines = [f"  {_dir_gib(d):5.1f} GiB  rm -rf {d}" for d in olds]
+    raise SystemExit(f"Not enough disk for the new cache ({free:.1f} GiB free, ~{need:.1f} GiB needed).\n"
+                     "Delete caches of finished/stopped runs, e.g.:\n" + ("\n".join(lines) or "  (none found)"))
+
+
 def ensure_hand_cache(r4_cache, hand_cache, hand_filter="none", body_align="none"):
     print(f"R5 hand cache: {hand_cache} (from {r4_cache})", flush=True)
     t0 = time.time()
@@ -293,6 +323,7 @@ def main(argv=None):
     r4_cache = find_r4_cache(a.r4_cache, a.working, a.inputs)
     print("R4 CACHE:", r4_cache, flush=True)
     hand_cache = a.hand_cache or str(Path(a.working) / default_hand_cache_name(r4_cache, a.hand_filter, a.body_align))
+    check_disk_for_cache(hand_cache, a.body_align, a.working)
     ensure_hand_cache(r4_cache, hand_cache, a.hand_filter, a.body_align)
 
     launch_argv = ["--cache", hand_cache, "--outdir", a.outdir, "--variant", a.variant,

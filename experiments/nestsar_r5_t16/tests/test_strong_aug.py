@@ -352,3 +352,16 @@ def test_aligned_cache_roundtrip_and_config(tmp_path):
     for batch, _ in d.batches(d.splits["xsub_train"], 4, cfg, epoch=1, training=True, protocol="xsub"):
         assert np.isfinite(batch["x"]).all() and np.isfinite(batch["xa"]).all()
         break
+
+
+def test_disk_check_lists_old_caches(tmp_path, monkeypatch):
+    from experiments.nestsar_r5_t16 import kaggle_run, DEFAULT_HAND_CACHE
+    old = tmp_path / (DEFAULT_HAND_CACHE + "_old")
+    old.mkdir()
+    (old / "hand.npy").write_bytes(b"x" * 1024)
+    monkeypatch.setattr("shutil.disk_usage", lambda p: type("U", (), {"free": 1 * 2 ** 30})())
+    with pytest.raises(SystemExit) as e:
+        kaggle_run.check_disk_for_cache(str(tmp_path / (DEFAULT_HAND_CACHE + "_new_yaw")), "yaw", str(tmp_path))
+    assert "rm -rf" in str(e.value) and "_old" in str(e.value)
+    monkeypatch.setattr("shutil.disk_usage", lambda p: type("U", (), {"free": 500 * 2 ** 30})())
+    kaggle_run.check_disk_for_cache(str(tmp_path / (DEFAULT_HAND_CACHE + "_new_yaw")), "yaw", str(tmp_path))
