@@ -236,3 +236,8 @@ Not validated on real NTU yet: compare `none` vs `smooth` with the same augmenta
 
 **TTA** in the audit: `--tta N` adds N mildly augmented views (same hand filter as the cache) and reports
 mean-logit / mean-softmax accuracy against the canonical view.
+
+**Multi-view augmentation** (`aug_view_degrees`, default 15 = previous behaviour, max 90): the yaw range of
+the random viewpoint change in the strong augmentation (NTU records each action from three cameras).
+e.g. `{"aug_strength": 1.0, "aug_view_degrees": 45}`. It conflicts with body-frame alignment: with
+alignment, use a small value.

@@ -300,9 +300,9 @@ def _tree_order(parents):
 TREE_ORDER = _tree_order(NTU_PARENTS)           # root first, parents before children
 
 
-def _random_affine(rng, s):
+def _random_affine(rng, s, view_degrees=15.0):
     """Rotation (yaw +-15, pitch/roll +-5 deg) x shear x per-axis scale, all scaled by ``s``."""
-    yaw, pitch, roll = np.deg2rad(rng.uniform(-1, 1, 3) * np.array([15.0, 5.0, 5.0]) * s)
+    yaw, pitch, roll = np.deg2rad(rng.uniform(-1, 1, 3) * np.array([view_degrees, 5.0, 5.0]) * s)
     cy, sy, cp, sp, cr, sr = np.cos(yaw), np.sin(yaw), np.cos(pitch), np.sin(pitch), np.cos(roll), np.sin(roll)
     ry = np.asarray([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
     rx = np.asarray([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])
@@ -343,7 +343,8 @@ def _resample_time(x, valid, factor):
     return np.where(ok[..., None], out, 0).astype(np.float32), ok
 
 
-def strong_augmented_features(x, seed, epoch, sample_index, strength=1.0, stream=0, shift=1, hand_filter="none"):
+def strong_augmented_features(x, seed, epoch, sample_index, strength=1.0, stream=0, shift=1, hand_filter="none",
+                              view_degrees=15.0):
     """R5 tokens of a strongly augmented view of the raw clip ``x`` [T, 2, 25, 3].
 
     Deterministic in (seed, epoch, sample_index, stream), so a resumed run repeats the same views.
@@ -356,7 +357,7 @@ def strong_augmented_features(x, seed, epoch, sample_index, strength=1.0, stream
     s = float(strength)
     rng = np.random.default_rng(np.random.SeedSequence([seed, epoch, sample_index, 7919, stream]))
 
-    x = np.where(valid[..., None], x @ _random_affine(rng, s).T, 0).astype(np.float32)
+    x = np.where(valid[..., None], x @ _random_affine(rng, s, view_degrees).T, 0).astype(np.float32)
     if rng.random() < 0.8:
         x = _perturb_bones(x, valid, rng, s)
     if rng.random() < 0.8:

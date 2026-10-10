@@ -262,3 +262,15 @@ def test_sun_filter_keeps_clean_clips_and_gaps():
     y = pp.denoise_hand_joints(x, r4pp.raw_valid(x), "sun")
     assert np.abs(y[10:15, 0, 7]).max() == 0 and np.isfinite(y).all()
     assert np.isfinite(pp.features(x[:5], hand_filter="sun_smooth")).all()
+
+
+def test_view_degrees_widens_the_viewpoint_range_and_default_is_unchanged():
+    x = clip(60)
+    base = pp.strong_augmented_features(x, 0, 1, 3, 1.0)
+    np.testing.assert_array_equal(base, pp.strong_augmented_features(x, 0, 1, 3, 1.0, view_degrees=15.0))
+    d = lambda deg: np.mean([np.abs(pp.strong_augmented_features(x, 0, 1, i, 1.0, view_degrees=deg)
+                                    - pp.features(x)).mean() for i in range(12)])
+    assert d(45.0) > d(15.0) > d(0.0)
+    assert validate_config({"aug_view_degrees": 45})["aug_view_degrees"] == 45
+    with pytest.raises(ValueError):
+        validate_config({"aug_view_degrees": 120})
