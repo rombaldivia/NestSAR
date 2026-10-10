@@ -136,6 +136,35 @@ It first checks that the trained accuracy reproduces exactly, then saves
 `r4_fastweight_ablation.json`. These are counterfactuals on trained weights.
 Training-time evidence comes from the R5 variants.
 
+## Audit of trained checkpoints (also works on a stopped run)
+
+Needs only `<run>/<protocol>/best.msgpack` (and `history.json`). Inference only; run it on one
+GPU when no training is using it.
+
+```python
+import os, subprocess, sys
+REPO = "/kaggle/working/NestSAR_R5_branch"
+subprocess.run([sys.executable, "-u", "-m", "experiments.nestsar_r5_t16.audit_r5_checkpoint",
+                "--run-dir", "/kaggle/working/NestSAR_R5_T16_v1",
+                "--r4-checkpoint-root", "/kaggle/working/NestSAR_R4_FMSE_LOCAL_GEOMETRY_T16_v1"],
+               cwd=REPO, env=dict(os.environ, PYTHONPATH=REPO, CUDA_VISIBLE_DEVICES="0"), check=True)
+```
+
+`--r4-checkpoint-root` is optional (adds the R4-vs-R5 comparison). Output: `<run>/r5_audit.json`.
+
+- **reproduction**: the best EMA checkpoint must give back its recorded accuracy.
+- **clean train accuracy**: eval mode, no augmentation, on a train subset (the training log
+  accuracy uses augmentation and dropout, so it overstates the gap).
+- **per class**: recall, macro recall, weakest classes, top confusions, the finger classes and the
+  R4 weak classes (A071-A075, A084, ...), R4 vs R5.
+- **subsets**: one actor vs two actors.
+- **calibration**: confidence of right and wrong predictions.
+- **counterfactuals** on the trained weights: `hand_zeroed`, `fast_scale_zero`, `fast_frozen`
+  (eta = 0, alpha = 1), `pair_message_off`. A drop is not the gain of the component in a model
+  trained without it; that comes from the ablation variants.
+- **R4 comparison**: who is right when, oracle union, softmax-average ensemble.
+- **history**: gap, gain per epoch, learned fast/pair scales, eta/alpha, timing.
+
 ## Ablations
 
 ```python
