@@ -169,6 +169,37 @@ def hand_tokens(x, valid, starts, ends, scale):
     return out.astype(np.float32).reshape(FRAMES, HAND_FEATURES)
 
 
+BODY_ALIGNS = ("none", "yaw")
+_L_SHOULDER, _R_SHOULDER, _L_HIP, _R_HIP = 4, 8, 12, 16
+
+
+def align_to_body(x, valid=None):
+    """Rotate the clip about the vertical axis so the first actor's shoulder/hip line faces +x.
+
+    One rotation per clip (not per frame), so motion, speed and the people's relative geometry are kept;
+    only the viewpoint is removed. The rotation is about the first actor's root in the first usable frame
+    and is taken from the mean shoulder+hip line of up to the first 8 frames where those four joints exist.
+    Missing joints stay exactly zero; clips without a usable torso are returned unchanged.
+    """
+    x = np.asarray(x, np.float32)
+    if len(x) == 0:
+        return x
+    valid = pp.raw_valid(x) if valid is None else np.asarray(valid, bool)
+    torso = valid[:, 0, _L_SHOULDER] & valid[:, 0, _R_SHOULDER] & valid[:, 0, _L_HIP] & valid[:, 0, _R_HIP]
+    use = np.flatnonzero(torso)[:8]
+    if len(use) == 0:
+        return x
+    across = (x[use, 0, _R_SHOULDER] - x[use, 0, _L_SHOULDER] + x[use, 0, _R_HIP] - x[use, 0, _L_HIP]).mean(axis=0)
+    if float(np.hypot(across[0], across[2])) < 1e-3:
+        return x
+    theta = np.arctan2(across[2], across[0])
+    c, s_ = np.cos(theta), np.sin(theta)
+    rotation = np.asarray([[c, 0, s_], [0, 1, 0], [-s_, 0, c]], np.float32)
+    pivot = x[use[0], 0, 0] if valid[use[0], 0, 0] else x[use[0], 0, _L_HIP]
+    rotated = (x - pivot) @ rotation.T + pivot
+    return np.where(valid[..., None], rotated, 0).astype(np.float32)
+
+
 HAND_FILTERS = ("none", "hampel", "smooth", "sun", "sun_smooth")
 HAMPEL_FLOOR = 0.002          # metres; keeps static joints (MAD ~ 0) from being flagged by sensor jitter
 _HAND_JOINTS = tuple(sorted({j for side in HAND_SIDES for j in side}))
@@ -253,9 +284,13 @@ def denoise_hand_joints(x, valid, mode):
     return out
 
 
-def features(x, valid=None, rng=None, shift=0, hand_filter="none"):
+def features(x, valid=None, rng=None, shift=0, hand_filter="none", body_align="none"):
     """R5 tokens [FRAMES, FEATURES]; the first 750 equal ``pp.features`` exactly."""
     x = np.asarray(x, np.float32)
+    if body_align not in BODY_ALIGNS:
+        raise ValueError(f"body_align must be one of {BODY_ALIGNS}, got {body_align!r}")
+    if body_align == "yaw":
+        x = align_to_body(x, valid)
     local, valid, scale = pp.canonicalize_raw(x, valid)
     total = len(x)
     if total == 0:
@@ -266,9 +301,12 @@ def features(x, valid=None, rng=None, shift=0, hand_filter="none"):
     return np.concatenate([body, hands], axis=-1)
 
 
-def augmented_features(x, seed, epoch, sample_index, rotation_degrees=8.0, shift=1, hand_filter="none"):
+def augmented_features(x, seed, epoch, sample_index, rotation_degrees=8.0, shift=1, hand_filter="none",
+                       body_align="none"):
     """Same RNG stream, yaw rotation and boundary jitter as ``pp.augmented_features``."""
     valid = pp.raw_valid(x)
+    if body_align == "yaw":              # remove the viewpoint first; the rotation below is then a small jitter around it
+        x = align_to_body(x, valid)
     rng = np.random.default_rng(np.random.SeedSequence([seed, epoch, sample_index]))
     theta = np.deg2rad(rng.uniform(-rotation_degrees, rotation_degrees)) if rotation_degrees else 0.0
     c, s = np.cos(theta), np.sin(theta)
@@ -344,7 +382,7 @@ def _resample_time(x, valid, factor):
 
 
 def strong_augmented_features(x, seed, epoch, sample_index, strength=1.0, stream=0, shift=1, hand_filter="none",
-                              view_degrees=15.0):
+                              view_degrees=15.0, body_align="none"):
     """R5 tokens of a strongly augmented view of the raw clip ``x`` [T, 2, 25, 3].
 
     Deterministic in (seed, epoch, sample_index, stream), so a resumed run repeats the same views.
@@ -353,7 +391,9 @@ def strong_augmented_features(x, seed, epoch, sample_index, strength=1.0, stream
     x = np.asarray(x, np.float32)
     valid = pp.raw_valid(x)
     if len(x) == 0 or not valid.any():
-        return features(x, valid, hand_filter=hand_filter)
+        return features(x, valid, hand_filter=hand_filter, body_align=body_align)
+    if body_align == "yaw":
+        x = align_to_body(x, valid)
     s = float(strength)
     rng = np.random.default_rng(np.random.SeedSequence([seed, epoch, sample_index, 7919, stream]))
 

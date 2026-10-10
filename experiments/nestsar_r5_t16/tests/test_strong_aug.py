@@ -274,3 +274,81 @@ def test_view_degrees_widens_the_viewpoint_range_and_default_is_unchanged():
     assert validate_config({"aug_view_degrees": 45})["aug_view_degrees"] == 45
     with pytest.raises(ValueError):
         validate_config({"aug_view_degrees": 120})
+
+
+# ------------------------------------------------------------------ body alignment
+def posed_clip(total=40, yaw_deg=0.0, seed=0):
+    """A person whose shoulders/hips lie along +x, then rotated about the vertical axis."""
+    rng = np.random.default_rng(seed)
+    x = np.zeros((total, 2, 25, 3), np.float32)
+    pose = rng.normal(0, 0.1, (25, 3)).astype(np.float32)
+    pose[4], pose[8], pose[12], pose[16] = (-0.2, 0.4, 0), (0.2, 0.4, 0), (-0.1, 0, 0), (0.1, 0, 0)
+    pose[0] = 0
+    t = np.arange(total)[:, None, None]
+    x[:, 0] = pose + 0.03 * np.sin(0.2 * t)
+    th = np.deg2rad(yaw_deg)
+    r = np.asarray([[np.cos(th), 0, np.sin(th)], [0, 1, 0], [-np.sin(th), 0, np.cos(th)]], np.float32)
+    x = x @ r.T + np.array([0.3, 0.0, 3.0], np.float32)
+    return np.where(r4pp.raw_valid(x)[..., None], x, 0).astype(np.float32)
+
+
+def test_alignment_makes_features_invariant_to_yaw():
+    base = pp.features(posed_clip(yaw_deg=0), body_align="yaw")
+    for yaw in (-60, -25, 17, 45, 90, 170):
+        np.testing.assert_allclose(pp.features(posed_clip(yaw_deg=yaw), body_align="yaw"), base, atol=2e-4)
+    assert not np.allclose(pp.features(posed_clip(yaw_deg=60)), pp.features(posed_clip(yaw_deg=0)), atol=1e-3)
+
+
+def test_alignment_keeps_zeros_gaps_and_the_second_actor():
+    x = posed_clip(40, 30)
+    x[5:9, 0, 7] = 0
+    x[:, 1] = x[:, 0] + 0.5
+    y = pp.align_to_body(x)
+    assert np.abs(y[5:9, 0, 7]).max() == 0 and np.isfinite(y).all()
+    np.testing.assert_allclose(np.linalg.norm(y[:, 1, 5] - y[:, 0, 5], axis=-1),
+                               np.linalg.norm(x[:, 1, 5] - x[:, 0, 5], axis=-1), atol=1e-4)
+    z = pp.align_to_body(np.zeros((10, 2, 25, 3), np.float32))
+    assert np.abs(z).max() == 0
+    assert pp.align_to_body(np.zeros((0, 2, 25, 3), np.float32)).shape == (0, 2, 25, 3)
+
+
+def test_alignment_leaves_clips_without_torso_unchanged():
+    x = posed_clip(20, 30)
+    x[:, 0, 4] = 0                                           # no left shoulder anywhere
+    np.testing.assert_array_equal(pp.align_to_body(x), x)
+
+
+def test_alignment_through_the_augmentation_paths_is_finite_and_shaped():
+    x = posed_clip(60, 40)
+    for fn in (lambda: pp.augmented_features(x, 0, 1, 2, body_align="yaw"),
+               lambda: pp.strong_augmented_features(x, 0, 1, 2, 1.0, view_degrees=5.0, body_align="yaw")):
+        out = fn()
+        assert out.shape == (16, 942) and np.isfinite(out).all()
+    with pytest.raises(ValueError):
+        pp.features(x, body_align="roll")
+    # small rotation aug around the aligned pose: far smaller change than the same aug without alignment
+    a = pp.augmented_features(posed_clip(60, 0), 0, 1, 2, 8.0, body_align="yaw")
+    b = pp.augmented_features(posed_clip(60, 90), 0, 1, 2, 8.0, body_align="yaw")
+    np.testing.assert_allclose(a, b, atol=2e-4)
+
+
+def test_aligned_cache_roundtrip_and_config(tmp_path):
+    synthetic_pickle(tmp_path / "ntu120_3danno.pkl")
+    prepare(tmp_path / "ntu120_3danno.pkl", tmp_path / "r4", tmp_path / "s.json")
+    meta = r5data.build(tmp_path / "r4", tmp_path / "al", body_align="yaw")
+    assert meta["signature"]["body_align"] == "yaw" and r5data.FULL_FILE in meta["files"]
+    d = r5data.Dataset(tmp_path / "al")
+    assert d.body_align == "yaw"
+    got = d.canonical([0, 1])
+    want = np.stack([pp.features(d.base.sample(i), body_align="yaw") for i in (0, 1)])
+    np.testing.assert_allclose(got, want, atol=1e-6)
+    with pytest.raises(ValueError):
+        r5data.build(tmp_path / "r4", tmp_path / "al", body_align="none")      # other signature, same dir
+    assert validate_config({"body_align": "yaw"})["body_align"] == "yaw"
+    with pytest.raises(ValueError):
+        validate_config({"body_align": "pitch"})
+    cfg = validate_config({"micro_batch": 2, "accumulation_steps": 2, "aug_strength": 1.0, "aug_view_degrees": 5,
+                           "body_align": "yaw"})
+    for batch, _ in d.batches(d.splits["xsub_train"], 4, cfg, epoch=1, training=True, protocol="xsub"):
+        assert np.isfinite(batch["x"]).all() and np.isfinite(batch["xa"]).all()
+        break

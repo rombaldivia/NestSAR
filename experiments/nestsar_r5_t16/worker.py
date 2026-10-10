@@ -28,6 +28,7 @@ from experiments.nestsar_sm_all_t16.streaming import worker as r4_worker
 from experiments.nestsar_sm_all_t16.streaming.io_utils import Reporter, atomic_bytes, atomic_json, read_json
 
 from . import MODEL_IDENTITY as BASE_IDENTITY, MODEL_NAME, VERSION
+from .mixing import mix_batch
 from .config import model_kwargs, validate_config
 from .data import Dataset
 from .model import NUM_CLASSES, NestSARR5T16
@@ -89,8 +90,12 @@ class State(train_state.TrainState):
     ema_params: object
 
 
-def ce(logits, labels, smoothing):
+def ce(logits, labels, smoothing, labels2=None, lam=None):
+    """Cross-entropy with label smoothing; ``lam``/``labels2`` give the CutMix soft target (lam = 1: plain)."""
     target = jax.nn.one_hot(labels, NUM_CLASSES)
+    if labels2 is not None:
+        lam = lam.reshape(lam.shape + (1,) * (target.ndim - lam.ndim))
+        target = lam * target + (1 - lam) * jax.nn.one_hot(labels2, NUM_CLASSES)
     target = target * (1 - smoothing) + smoothing / NUM_CLASSES
     return -jnp.sum(target * jax.nn.log_softmax(logits), axis=-1)
 
@@ -103,9 +108,10 @@ def build_steps(model, config):
         out = model.apply({"params": params}, batch["x"], training=True, rngs={"dropout": k1})
         aug = model.apply({"params": params}, batch["xa"], training=True, rngs={"dropout": k2})
         y, smooth = batch["y"], config["label_smoothing"]
-        main = (ce(out["logits"], y, smooth) + ce(aug["logits"], y, smooth)) / 2
-        aux = (ce(out["stream_logits"], y[:, None], smooth).mean(1)
-               + ce(aug["stream_logits"], y[:, None], smooth).mean(1)) / 2
+        y2, lam = batch["y2"], batch["lam"]
+        main = (ce(out["logits"], y, smooth, y2, lam) + ce(aug["logits"], y, smooth, y2, lam)) / 2
+        aux = (ce(out["stream_logits"], y[:, None], smooth, y2[:, None], lam[:, None]).mean(1)
+               + ce(aug["stream_logits"], y[:, None], smooth, y2[:, None], lam[:, None]).mean(1)) / 2
         temperature = config["consistency_temperature"]
         logp = jax.nn.log_softmax(out["logits"] / temperature)
         logq = jax.nn.log_softmax(aug["logits"] / temperature)
@@ -125,6 +131,13 @@ def build_steps(model, config):
     @jax.jit
     def train_step(state, key, batch):
         k = config["accumulation_steps"]
+        if config.get("mix_prob", 0.0) > 0:       # static: with mixing off the key chain is untouched
+            key, mix_key = jax.random.split(key)
+            mixed_x, mixed_xa, y2, lam = mix_batch(mix_key, batch["x"], batch["xa"], batch["y"], batch["mask"],
+                                                   config["mix_prob"])
+        else:
+            mixed_x, mixed_xa, y2, lam = batch["x"], batch["xa"], batch["y"], jnp.ones_like(batch["mask"])
+        batch = dict(batch, x=mixed_x, xa=mixed_xa, y2=y2, lam=lam)
         micros = jax.tree.map(lambda x: x.reshape(k, config["micro_batch"], *x.shape[1:]), batch)
         denom = jnp.maximum(jnp.sum(batch["mask"]), 1)
         key, step_key = jax.random.split(key)
@@ -305,6 +318,9 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
     if config.get("hand_filter", "none") != dataset.hand_filter:
         raise ValueError(f"config hand_filter={config.get('hand_filter', 'none')!r} but the hand cache was built with "
                          f"{dataset.hand_filter!r}")
+    if config.get("body_align", "none") != dataset.body_align:
+        raise ValueError(f"config body_align={config.get('body_align', 'none')!r} but the cache was built with "
+                         f"{dataset.body_align!r}")
     train_ids = dataset.splits[f"{protocol}_train"]
     val_ids = dataset.splits[f"{protocol}_val"]
     if config["max_train_samples"]:

@@ -133,7 +133,8 @@ def tta_logits(forward, params, dataset, ids, batch, views, workers=4, seed=4242
                 x = np.zeros((batch, pp.FRAMES, pp.FEATURES), np.float32)
                 for j, idx in enumerate(chunk):
                     x[j] = pp.augmented_features(dataset.base.sample(idx), seed, view, int(idx), 8.0, 1,
-                                                hand_filter=getattr(dataset, "hand_filter", "none"))
+                                                hand_filter=getattr(dataset, "hand_filter", "none"),
+                                                body_align=getattr(dataset, "body_align", "none"))
                 return chunk, x
             out = np.zeros_like(total)
             futures = [pool.submit(prepare, i) for i in range(min(steps, workers + 1))]

@@ -32,6 +32,7 @@ from . import preprocessing as r5pp
 
 CACHE_VERSION = "nestsar-r5-hand-cache-v1"
 HAND_FILE = "hand.npy"
+FULL_FILE = "full.npy"          # [N, 16, 942] features, only for body-aligned caches (the R4 tokens change)
 
 
 def read_manifest(path):
@@ -65,7 +66,7 @@ def candidate_r4_caches(roots, preferred=()):
     return out
 
 
-def _signature(base, hand_filter="none"):
+def _signature(base, hand_filter="none", body_align="none"):
     sig = {
         "base_signature": base.meta["signature"],
         "base_files": base.meta["files"],
@@ -75,6 +76,8 @@ def _signature(base, hand_filter="none"):
     }
     if hand_filter != "none":          # absent == "none", so caches built before the filter keep loading
         sig["hand_filter"] = hand_filter
+    if body_align != "none":
+        sig["body_align"] = body_align
     return sig
 
 
@@ -86,8 +89,9 @@ def _existing(cache_dir, signature, base_dir):
     if meta.get("signature") != signature:
         raise ValueError(f"{cache_dir} holds a hand cache for another base cache/preprocessing. "
                          "Use a new hand-cache directory.")
-    path = Path(cache_dir) / HAND_FILE
-    if not path.is_file() or path.stat().st_size != meta["files"][HAND_FILE]:
+    name = FULL_FILE if "body_align" in meta.get("signature", {}) else HAND_FILE
+    path = Path(cache_dir) / name
+    if not path.is_file() or path.stat().st_size != meta["files"][name]:
         raise ValueError(f"Incomplete hand cache in {cache_dir}. Use a new directory.")
     if meta.get("base_dir") != str(base_dir):
         meta["base_dir"] = str(base_dir)
@@ -98,11 +102,14 @@ def _existing(cache_dir, signature, base_dir):
     return meta
 
 
-def build(base_dir, cache_dir, status=None, check_body=True, hand_filter="none"):
+def build(base_dir, cache_dir, status=None, check_body=True, hand_filter="none", body_align="none"):
     """Create (or validate) the derived hand cache for `base_dir` in `cache_dir`."""
     base_dir, cache_dir = Path(base_dir).resolve(), Path(cache_dir)
     base = r4_data.Dataset(base_dir)          # validates the R4 manifest and file sizes
-    signature = _signature(base, hand_filter)
+    signature = _signature(base, hand_filter, body_align)
+    aligned = body_align != "none"
+    out_file = FULL_FILE if aligned else HAND_FILE
+    width = r5pp.FEATURES if aligned else r5pp.HAND_FEATURES
     n = int(base.meta["samples"])
     done = _existing(cache_dir, signature, base_dir)
     if done is not None:
@@ -117,25 +124,25 @@ def build(base_dir, cache_dir, status=None, check_body=True, hand_filter="none")
             report(phase="R5 hand cache ready", current=n, total=n, done=True)
             return done
 
-        need = n * r5pp.FRAMES * r5pp.HAND_FEATURES * 4
+        need = n * r5pp.FRAMES * width * 4
         free = shutil.disk_usage(cache_dir).free
         if free < need + 512 * 2 ** 20:
             raise RuntimeError(f"Hand cache needs {need / 2**30:.2f} GiB (+0.5 GiB reserve); "
                                f"{free / 2**30:.2f} GiB free in {cache_dir}.")
-        tmp = cache_dir / (HAND_FILE + ".partial.npy")
+        tmp = cache_dir / (out_file + ".partial.npy")
         hand = np.lib.format.open_memmap(tmp, mode="w+", dtype=np.float32,
-                                         shape=(n, r5pp.FRAMES, r5pp.HAND_FEATURES))
+                                         shape=(n, r5pp.FRAMES, width))
         worst = 0.0
         t0 = time.time()
         for i in range(n):
-            tokens = r5pp.features(base.sample(i), hand_filter=hand_filter)
-            if check_body:
+            tokens = r5pp.features(base.sample(i), hand_filter=hand_filter, body_align=body_align)
+            if check_body and not aligned:   # aligned tokens differ from the R4 cache by design
                 diff = float(np.max(np.abs(tokens[:, :r5pp.R4_FEATURES] - base.canonical[i])))
                 worst = max(worst, diff)
                 if diff > 1e-5:
                     raise ValueError(f"Sample {i}: recomputed R4 tokens differ from {base_dir} by {diff:.3g}. "
                                      "The base cache was built with another preprocessing.")
-            hand[i] = tokens[:, r5pp.R4_FEATURES:]
+            hand[i] = tokens if aligned else tokens[:, r5pp.R4_FEATURES:]
             if (i + 1) % 2048 == 0:
                 hand.flush()
                 if hasattr(hand._mmap, "madvise") and hasattr(mmap, "MADV_DONTNEED"):
@@ -144,12 +151,12 @@ def build(base_dir, cache_dir, status=None, check_body=True, hand_filter="none")
                 report(phase="R5 hand cache", current=i + 1, total=n, elapsed_s=time.time() - t0)
         hand.flush()
         del hand
-        os.replace(tmp, cache_dir / HAND_FILE)
+        os.replace(tmp, cache_dir / out_file)
         meta = {
             "signature": signature,
             "samples": n,
             "base_dir": str(base_dir),
-            "files": {HAND_FILE: (cache_dir / HAND_FILE).stat().st_size},
+            "files": {out_file: (cache_dir / out_file).stat().st_size},
             "max_body_token_difference": worst,
             "build_seconds": time.time() - t0,
         }
@@ -185,13 +192,16 @@ class Dataset:
             raise ValueError(f"{cache} is not an R5 hand cache")
         if meta["signature"].get("preprocessing") != r5pp.VERSION:
             raise ValueError("Hand cache preprocessing/version mismatch")
-        path = cache / HAND_FILE
-        if not path.is_file() or path.stat().st_size != meta["files"][HAND_FILE]:
+        self.body_align = meta["signature"].get("body_align", "none")
+        name = FULL_FILE if self.body_align != "none" else HAND_FILE
+        path = cache / name
+        if not path.is_file() or path.stat().st_size != meta["files"][name]:
             raise ValueError(f"Incomplete hand cache: {path}")
         self.base_dir = locate_base(meta, [base] if base else [])
         self.base = r4_data.Dataset(self.base_dir)
         self.hand = np.load(path, mmap_mode="r")
-        if self.hand.shape != (meta["samples"], r5pp.FRAMES, r5pp.HAND_FEATURES):
+        width = r5pp.FEATURES if self.body_align != "none" else r5pp.HAND_FEATURES
+        if self.hand.shape != (meta["samples"], r5pp.FRAMES, width):
             raise ValueError(f"Unexpected hand cache shape {self.hand.shape}")
         if len(self.base.labels) != meta["samples"]:
             raise ValueError("Base cache and hand cache sample counts differ")
@@ -202,6 +212,8 @@ class Dataset:
 
     def canonical(self, indices):
         indices = np.asarray(indices, np.int64)
+        if self.body_align != "none":                    # full 942-feature tokens are stored
+            return np.array(self.hand[indices], np.float32)
         out = np.empty((len(indices), r5pp.FRAMES, r5pp.FEATURES), np.float32)
         out[..., :r5pp.R4_FEATURES] = self.base.canonical[indices]
         out[..., r5pp.R4_FEATURES:] = self.hand[indices]
@@ -226,19 +238,19 @@ class Dataset:
                     # canonical input that validation uses stays in the training distribution.
                     b["xa"][j] = r5pp.strong_augmented_features(
                         sample, protocol_seed, aug_epoch, int(position), strength, stream=1,
-                        shift=config["jitter_shift"], hand_filter=self.hand_filter,
+                        shift=config["jitter_shift"], hand_filter=self.hand_filter, body_align=self.body_align,
                         view_degrees=config.get("aug_view_degrees", 15.0))
                     keep_clean = np.random.default_rng(np.random.SeedSequence(
                         [protocol_seed, aug_epoch, int(position), 4177])).random() < config.get("aug_clean_prob", 0.2)
                     if not keep_clean:
                         b["x"][j] = r5pp.strong_augmented_features(
                             sample, protocol_seed, aug_epoch, int(position), strength, stream=0,
-                            shift=config["jitter_shift"], hand_filter=self.hand_filter,
+                            shift=config["jitter_shift"], hand_filter=self.hand_filter, body_align=self.body_align,
                         view_degrees=config.get("aug_view_degrees", 15.0))
                 else:
                     b["xa"][j] = r5pp.augmented_features(
                         sample, protocol_seed, aug_epoch, int(position),
-                        config["rotation_degrees"], config["jitter_shift"], hand_filter=self.hand_filter)
+                        config["rotation_degrees"], config["jitter_shift"], hand_filter=self.hand_filter, body_align=self.body_align)
         return b, time.perf_counter() - t0
 
     def batches(self, indices, size, config, epoch=0, training=False, protocol="xsub"):

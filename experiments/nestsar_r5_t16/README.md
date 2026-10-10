@@ -241,3 +241,28 @@ mean-logit / mean-softmax accuracy against the canonical view.
 the random viewpoint change in the strong augmentation (NTU records each action from three cameras).
 e.g. `{"aug_strength": 1.0, "aug_view_degrees": 45}`. It conflicts with body-frame alignment: with
 alignment, use a small value.
+
+## Body alignment and temporal CutMix (branch `experiment/nestsar-r5-align-mix`)
+
+**Body alignment** (`--body-align yaw`, config `body_align`): one rotation per clip about the vertical axis so
+the first actor's shoulder+hip line faces +x (taken from up to the first 8 frames where those four joints exist).
+Only the viewpoint is removed: motion, speed, gravity direction and the relative geometry of both actors are kept
+(the literature warns that per-frame alignment loses trajectory and speed; this is per clip). Missing joints stay
+zero; clips without a usable torso are left alone. The R4 tokens change, so the cache is a separate, larger
+`full.npy` ([N,16,942], ~6.8 GB for NTU120; name suffix `_yaw`) and the worker refuses a config/cache mismatch.
+With alignment the yaw augmentation is a small jitter around the aligned pose: use e.g.
+`{"rotation_degrees": 5}` (mild augmentation) or `{"aug_strength": 1.0, "aug_view_degrees": 5}` (strong).
+
+**Temporal CutMix** (`mix_prob`, default 0 = off): inside the jitted train step, with probability `mix_prob` a
+contiguous span (20–70 %) of the 16 segment tokens of a clip is replaced by the same span of another clip of the
+batch (same partner and span in both views); the label is mixed in proportion (soft target, label smoothing kept).
+Runs on the accelerator, so epoch time does not change. With `mix_prob=0` the loss and the key chain are the same as
+before. Hand/spatial mixing is not implemented.
+
+Short test (about 10 epochs, XSUB only), compare with R4 at E10 (73.61 % XSUB):
+
+    --epochs 38 --protocols xsub --ignore-kill --body-align yaw --extra-config '{"rotation_degrees": 5}'
+    --epochs 38 --protocols xsub --ignore-kill --extra-config '{"mix_prob": 0.5}'
+
+Note: every change to preprocessing.py/config.py/model.py changes the run identity, so a run started with another
+commit cannot be resumed with this branch.
