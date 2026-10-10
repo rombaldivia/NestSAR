@@ -164,8 +164,15 @@ def main(argv=None):
     b.add_argument("--seed", type=int, default=POOL_SEED)
     b.add_argument("--workers", type=int, default=None)
     a = ap.parse_args(argv)
-    out = build(a.cache, a.pool, a.views, a.strength, a.view_degrees, a.seed, a.workers,
-                log=lambda m: print(m, flush=True))
+    Path(a.pool).mkdir(parents=True, exist_ok=True)
+    logfile = Path(a.pool) / "progress.log"          # tail -f it from a terminal when the cell shows nothing
+
+    def log(message):
+        print(message, flush=True)
+        with logfile.open("a") as fh:
+            fh.write(time.strftime("%H:%M:%S ") + message + "\n")
+
+    out = build(a.cache, a.pool, a.views, a.strength, a.view_degrees, a.seed, a.workers, log=log)
     print(json.dumps({"complete": out["complete"], "views": a.views}))
 
 
