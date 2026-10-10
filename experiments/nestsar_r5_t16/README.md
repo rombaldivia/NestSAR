@@ -266,3 +266,20 @@ Short test (about 10 epochs, XSUB only), compare with R4 at E10 (73.61 % XSUB):
 
 Note: every change to preprocessing.py/config.py/model.py changes the run identity, so a run started with another
 commit cannot be resumed with this branch.
+
+## Augmentation pool (CPU bottleneck)
+
+Profiling (2 cores, synthetic clips of 40-130 frames): clean features 1.0-1.25 ms, strong augmentation ~2.2 ms per
+view, and a step needs two views per clip. The cost is thousands of tiny numpy calls, not one hot spot
+(vectorising the bone loop gained nothing). Threads make it *slower* (GIL: 2 threads 0.69x, 4 threads 0.56x);
+processes scale 1.8x on 2 cores, but a dual-protocol Kaggle run already uses both physical cores, so
+multiprocessing inside each protocol cannot help.
+
+`--aug-pool DIR --pool-views K` pays the cost once: K strong views per clip are written to DIR (6.9 GiB each,
+use `/tmp` on Kaggle) with every core, and training draws two *different* pooled views per clip and epoch
+(clean canonical view with `aug_clean_prob`). The pool is validated against the cache signature and
+preprocessing version, is resumable (a view is renamed into place only when complete) and is reused by every
+run that shares cache, strength, seed and view range. Trade-off: K finite views instead of fresh ones each epoch.
+
+    python -m experiments.nestsar_r5_t16.kaggle_run --aug-pool /tmp/NestSAR_AUGPOOL --pool-views 8 --epochs 38 \
+        --extra-config '{"aug_strength": 1.0}'

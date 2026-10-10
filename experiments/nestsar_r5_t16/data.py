@@ -209,6 +209,14 @@ class Dataset:
         self.meta = {"signature": meta["signature"], "samples": meta["samples"]}
         self.splits = self.base.splits
         self.labels = self.base.labels
+        self._pools = {}
+
+    def pool(self, path):
+        """Opened lazily and once per path; raises if it was built for another cache/preprocessing."""
+        if path not in self._pools:
+            from experiments.nestsar_r5_t16.augpool import Pool
+            self._pools[path] = Pool(path, self)
+        return self._pools[path]
 
     def canonical(self, indices):
         indices = np.asarray(indices, np.int64)
@@ -231,6 +239,10 @@ class Dataset:
             protocol_seed = config["seed"] + (100000 if protocol == "xset" else 0)
             strength = config.get("aug_strength", 0.0)
             aug_epoch = epoch if config["fresh_augmentation"] else 1
+            pool = self.pool(config["aug_pool"]) if strength > 0 and config.get("aug_pool") else None
+            if pool is not None:
+                self._batch_from_pool(b, pool, indices, positions, protocol_seed, aug_epoch, config)
+                return b, time.perf_counter() - t0
             for j, (index, position) in enumerate(zip(indices, positions)):
                 sample = self.base.sample(index)
                 if strength > 0:
@@ -252,6 +264,25 @@ class Dataset:
                         sample, protocol_seed, aug_epoch, int(position),
                         config["rotation_degrees"], config["jitter_shift"], hand_filter=self.hand_filter, body_align=self.body_align)
         return b, time.perf_counter() - t0
+
+    def _batch_from_pool(self, b, pool, indices, positions, protocol_seed, aug_epoch, config):
+        """xa = a pooled strong view; x = another pooled view (the clean canonical one with aug_clean_prob).
+        Views are chosen deterministically from (seed, epoch, position), so a resumed run repeats them."""
+        views_a, views_x, clean = [], [], []
+        for position in positions:
+            rng = np.random.default_rng(np.random.SeedSequence([protocol_seed, aug_epoch, int(position), 5531]))
+            va, vx = rng.choice(pool.views, 2, replace=False) if pool.views > 1 else (0, 0)
+            views_a.append(int(va)), views_x.append(int(vx))
+            clean.append(rng.random() < config.get("aug_clean_prob", 0.2))
+        indices = np.asarray(indices, np.int64)
+        views_a, views_x, clean = np.asarray(views_a), np.asarray(views_x), np.asarray(clean)
+        for v in np.unique(np.concatenate([views_a, views_x[~clean]])):
+            rows = np.flatnonzero(views_a == v)
+            if len(rows):
+                b["xa"][rows] = pool.get(v, indices[rows])
+            rows = np.flatnonzero((views_x == v) & ~clean)
+            if len(rows):
+                b["x"][rows] = pool.get(v, indices[rows])
 
     def batches(self, indices, size, config, epoch=0, training=False, protocol="xsub"):
         """``prefetch_workers`` producer threads, at most max(`prefetch_batches`, workers) prepared batches; errors propagate."""

@@ -35,7 +35,7 @@ DEFAULTS.update(MODEL_DEFAULTS)
 DEFAULTS.update(variant="full", early_stop_guard_epoch=14)
 # Strong training-only augmentation (preprocessing.strong_augmented_features). 0 = the R4 recipe
 # (yaw +-8 deg and +-1 frame boundary jitter on one augmented view).
-DEFAULTS.update(aug_strength=0.0, aug_clean_prob=0.2, prefetch_workers=1, hand_filter="none", aug_view_degrees=15.0, body_align="none", mix_prob=0.0)
+DEFAULTS.update(aug_strength=0.0, aug_clean_prob=0.2, prefetch_workers=1, hand_filter="none", aug_view_degrees=15.0, body_align="none", mix_prob=0.0, aug_pool="")
 
 
 def validate_config(config):
@@ -69,6 +69,8 @@ def validate_config(config):
         raise ValueError("aug_view_degrees must be in [0, 90]")
     if not 0 <= c["aug_clean_prob"] <= 1:
         raise ValueError("aug_clean_prob must be in [0, 1]")
+    if c["aug_pool"] and not c["aug_strength"] > 0:
+        raise ValueError("aug_pool needs aug_strength > 0 (it replaces the live strong augmentation)")
     if c["prefetch_workers"] not in (1, 2, 3, 4):
         raise ValueError("prefetch_workers must be 1..4")
     return c

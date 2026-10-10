@@ -228,6 +228,18 @@ def ensure_hand_cache(r4_cache, hand_cache, hand_filter="none", body_align="none
         raise SystemExit("Hand cache check failed:\n" + "\n".join((r.stderr or "").splitlines()[-20:]))
 
 
+def ensure_aug_pool(hand_cache, pool_dir, views, strength, view_degrees):
+    """Build (or resume) the augmentation pool with every CPU core; one view is ~7 GiB."""
+    print(f"Augmentation pool: {pool_dir} ({views} views, strength {strength})", flush=True)
+    t0 = time.time()
+    r = subprocess.run([sys.executable, "-u", "-m", "experiments.nestsar_r5_t16.augpool", "build", "--cache", hand_cache,
+                        "--pool", pool_dir, "--views", str(views), "--strength", str(strength),
+                        "--view-degrees", str(view_degrees)], cwd=REPO, env=cpu_env(), timeout=8 * 3600)
+    if r.returncode != 0:
+        raise SystemExit("Augmentation pool build failed (see the error above).")
+    print(f"  pool ready in {time.time() - t0:.0f} s", flush=True)
+
+
 def follow(log, offset, pid, proc):
     with open(log, "rb") as fh:
         fh.seek(offset)
@@ -310,6 +322,10 @@ def main(argv=None):
                     help="denoise the hand joints (builds/uses a separate hand cache)")
     ap.add_argument("--body-align", default="none", choices=["none", "yaw"],
                     help="rotate each clip so the torso faces +x (builds a separate, larger cache)")
+    ap.add_argument("--aug-pool", default=None,
+                    help="directory of a pre-computed strong-augmentation pool (built if missing; use /tmp on Kaggle). "
+                         "Turns on aug_strength=1.0 unless --extra-config sets it")
+    ap.add_argument("--pool-views", type=int, default=8, help="strong views stored per clip (6.9 GiB each)")
     ap.add_argument("--extra-config", default="{}", help='JSON merged into config, e.g. \'{"aug_strength": 1.0, "prefetch_workers": 2}\'')
     a = ap.parse_args(argv)
 
@@ -336,6 +352,13 @@ def main(argv=None):
     check_disk_for_cache(hand_cache, a.body_align, a.working, r4_cache)
     ensure_hand_cache(r4_cache, hand_cache, a.hand_filter, a.body_align)
 
+    extra = json.loads(a.extra_config)
+    if a.aug_pool:
+        extra.setdefault("aug_strength", 1.0)
+        extra["aug_pool"] = a.aug_pool
+        ensure_aug_pool(hand_cache, a.aug_pool, a.pool_views, extra["aug_strength"],
+                        extra.get("aug_view_degrees", 15.0))
+
     launch_argv = ["--cache", hand_cache, "--outdir", a.outdir, "--variant", a.variant,
                    "--protocols", a.protocols, "--micro-batch", str(a.micro_batch),
                    "--epochs", str(a.epochs), "--kill-epoch", str(a.kill_epoch),
@@ -347,7 +370,6 @@ def main(argv=None):
         launch_argv.append("--ignore-kill")
     if a.cpu_smoke:
         launch_argv.append("--cpu-smoke")
-    extra = json.loads(a.extra_config)
     if a.hand_filter != "none":
         extra["hand_filter"] = a.hand_filter
     if a.body_align != "none":
