@@ -184,13 +184,18 @@ def _dir_gib(path):
     return total / 2 ** 30
 
 
-def check_disk_for_cache(hand_cache, body_align, working):
+def check_disk_for_cache(hand_cache, body_align, working, r4_cache=None):
     """Fail early (with the exact cleanup command) when the new cache cannot fit."""
     import shutil
     from experiments.nestsar_r5_t16 import preprocessing as pp
     if (Path(hand_cache) / "manifest.json").is_file():
         return
-    n = 128_000                                    # NTU-120 upper bound, enough for a conservative estimate
+    n = 128_000                                    # NTU-120 upper bound unless the R4 manifest says otherwise
+    if r4_cache:
+        try:
+            n = int(json.loads((Path(r4_cache) / "manifest.json").read_text())["samples"])
+        except (OSError, KeyError, ValueError):
+            pass
     width = pp.FEATURES if body_align != "none" else pp.HAND_FEATURES
     need = n * pp.FRAMES * width * 4 / 2 ** 30 + 0.5
     Path(hand_cache).parent.mkdir(parents=True, exist_ok=True)
@@ -198,7 +203,8 @@ def check_disk_for_cache(hand_cache, body_align, working):
     print(f"Disk: {free:.1f} GiB free, new cache needs ~{need:.1f} GiB", flush=True)
     if free >= need:
         return
-    olds = [d for d in sorted(Path(working).glob(DEFAULT_HAND_CACHE + "*")) if d.is_dir() and str(d) != str(hand_cache)]
+    olds = [d for d in sorted(Path(working).iterdir()) if d.is_dir() and str(d) != str(hand_cache)
+            and not (d / "manifest.json").is_file() or (d.is_dir() and d.name.startswith("NestSAR_R5") and str(d) != str(hand_cache))]
     lines = [f"  {_dir_gib(d):5.1f} GiB  rm -rf {d}" for d in olds]
     raise SystemExit(f"Not enough disk for the new cache ({free:.1f} GiB free, ~{need:.1f} GiB needed).\n"
                      "Delete caches of finished/stopped runs, e.g.:\n" + ("\n".join(lines) or "  (none found)"))
@@ -323,7 +329,7 @@ def main(argv=None):
     r4_cache = find_r4_cache(a.r4_cache, a.working, a.inputs)
     print("R4 CACHE:", r4_cache, flush=True)
     hand_cache = a.hand_cache or str(Path(a.working) / default_hand_cache_name(r4_cache, a.hand_filter, a.body_align))
-    check_disk_for_cache(hand_cache, a.body_align, a.working)
+    check_disk_for_cache(hand_cache, a.body_align, a.working, r4_cache)
     ensure_hand_cache(r4_cache, hand_cache, a.hand_filter, a.body_align)
 
     launch_argv = ["--cache", hand_cache, "--outdir", a.outdir, "--variant", a.variant,
