@@ -363,3 +363,13 @@ output. Store it as **float16** (3.4 GiB per view) **split over two outputs** of
 Save Version (Save & Run All) both, add both outputs as inputs of the training notebook, and launch with
 `--pool-dtype float16 --aug-pool /tmp/NestSAR_AUGPOOL_F16` (fallback path). The launcher finds the saved hand
 cache and every pool part under `/kaggle/input` by signature and joins them (`'dirA:dirB'`); nothing is rebuilt.
+
+## Weak-class fine-tuning without freezing (HOPE continual-learning test)
+
+`finetune.py` starts from a run's best EMA weights and trains a few epochs with every weight trainable, a
+low LR and batches where 40% of the clips come from the 20 weakest classes. The weak classes are chosen on
+**training** clips (pooled strong views), never on the validation split. Each epoch reports top-1, weak-class
+recall, the recall of all other classes and their loss ("forgetting"). `--outer-cms on|off` is the HOPE test:
+does updating the slow levels every 4 / 8 steps reduce forgetting? Report the fixed last epoch.
+
+    python -m experiments.nestsar_r5_t16.finetune --run-dir OUT --protocol xsub --cache HAND_CACHE --outer-cms on
