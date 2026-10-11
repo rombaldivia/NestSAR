@@ -373,3 +373,21 @@ recall, the recall of all other classes and their loss ("forgetting"). `--outer-
 does updating the slow levels every 4 / 8 steps reduce forgetting? Report the fixed last epoch.
 
     python -m experiments.nestsar_r5_t16.finetune --run-dir OUT --protocol xsub --cache HAND_CACHE --outer-cms on
+
+### v2 options (branch `experiment/nestsar-r6-hope-v2`): bidirectional HOPE memory and spatial part attention
+
+- `memory_bidir`: the same self-referential memory (shared weights, fresh state) also reads the clip from the
+  last segment to the first; reads are aligned back to forward time and added with their own layer scale.
+  It restores the future context the R5 BiGRU had, without leaving HOPE.
+- `part_attention`: one SGN / CD-Former-style spatial attention over the 28 part tokens of a frame (14 parts x
+  2 persons, learned part and person embeddings, absent parts masked), single head, q/k width 16, values =
+  the tokens themselves. In Nested Learning terms: an associative memory over space; time stays HOPE.
+
+| Variant | Params | Strict MFLOPs |
+|---|---:|---:|
+| full (R5) | 1,146,656 | 59.16 |
+| hope_core | 771,056 | 51.45 |
+| hope_core_bi | 771,760 | 57.50 |
+| hope_core_attn | 773,504 | 54.43 |
+| **hope_core_bi_attn** | **774,208** | **60.48** |
+| hope_core_wide (bi + attn + 2x CMS chain) | 1,022,720 | 64.20 |

@@ -41,6 +41,16 @@ VARIANTS = {
     "hope_core": {"temporal": "hope", "level_mixer": "conv", "selfref_dim": 64, "deep_memory": True,
                   "memory_hidden": 64, "cms_chain": True},
 }
+_CORE = VARIANTS["hope_core"]
+VARIANTS.update({
+    # Bidirectional HOPE memory (the clip is read both ways, shared weights): recovers the BiGRU's future context.
+    "hope_core_bi": dict(_CORE, memory_bidir=True),
+    # Spatial associative memory: attention over the 28 part tokens (both persons) in the tokenizer.
+    "hope_core_attn": dict(_CORE, part_attention=True),
+    "hope_core_bi_attn": dict(_CORE, memory_bidir=True, part_attention=True),
+    # bi + attn with a 2x wider CMS chain (hidden 88): the most parameters per FLOP (+248 K params, +3.7 MFLOPs).
+    "hope_core_wide": dict(_CORE, memory_bidir=True, part_attention=True, cms_chain_div=2),
+})
 
 # Outer CMS: parameter tier of each temporal level = its in-clip period (optimizer steps per update).
 # Inside a level, a CMS-chain MLP named mlp_p<f> uses its own period f instead.

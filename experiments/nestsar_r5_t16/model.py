@@ -428,6 +428,36 @@ class ShortConv(nn.Module):
         return nn.LayerNorm(epsilon=HOPE_LN_EPS, name="norm")(x + scale * nn.silu(y))
 
 
+class PartAttention(nn.Module):
+    """Spatial associative memory over the body parts of BOTH persons in a frame (SGN-style attention).
+
+    Tokens = the 14 part features of each person (+ learned part and person embeddings), masked when the
+    part has no valid joint. Single head, small query/key width; values are the token features themselves
+    (no V / output projection, as in SGN's softmax(theta(x) phi(x)^T) x), added back with a layer scale.
+    """
+
+    qk_dim: int = 16
+    scale_init: float = 0.1
+
+    @nn.compact
+    def __call__(self, parts: jnp.ndarray, valid: jnp.ndarray) -> jnp.ndarray:
+        b, t, m, q, d = parts.shape                        # [B, T, persons, parts, D]
+        x = parts.reshape(b, t, m * q, d)
+        part_e = self.param("part_embed", nn.initializers.normal(0.02), (q, d))
+        person_e = self.param("person_embed", nn.initializers.normal(0.02), (m, d))
+        tok = x + (person_e[:, None, :] + part_e[None, :, :]).reshape(m * q, d)
+        z = nn.LayerNorm(epsilon=HOPE_LN_EPS, name="norm")(tok)
+        qk = nn.Dense(2 * self.qk_dim, use_bias=False, name="qk")(z)
+        qry, key = qk[..., :self.qk_dim], qk[..., self.qk_dim:]
+        scores = jnp.einsum("btid,btjd->btij", qry, key) / np.sqrt(self.qk_dim)
+        vmask = valid.reshape(b, t, m * q)
+        scores = jnp.where(vmask[:, :, None, :], scores, -1e9)
+        mixed = jnp.einsum("btij,btjd->btid", jax.nn.softmax(scores, axis=-1), z)
+        gamma = self.param("attn_scale", nn.initializers.constant(self.scale_init), (d,))
+        out = (x + gamma * mixed) * vmask[..., None].astype(x.dtype)
+        return out.reshape(b, t, m, q, d)
+
+
 class HopeLevel(nn.Module):
     """One HOPE block: [local mixer: BiGRU or short conv] -> memory (self-referential or R5 fast) -> [CMS MLP]."""
 
@@ -441,6 +471,8 @@ class HopeLevel(nn.Module):
     deep: bool = False
     mem_hidden: int = 64
     chain: bool = False         # CMS chain of MLPs at periods 1/2/4/8 instead of one MLP
+    bidir: bool = False         # the same memory also reads the clip backwards (shared weights)
+    chain_div: int = 4          # CMS-chain MLP hidden width = dim // chain_div
 
     @nn.compact
     def __call__(self, x: jnp.ndarray):
@@ -453,14 +485,21 @@ class HopeLevel(nn.Module):
         else:
             raise ValueError(f"Unknown mixer {self.mixer!r}")
         if self.selfref:
-            reads, eta, alpha = SelfRefMemory(self.dim, self.inner, self.deep, self.mem_hidden,
-                                              name="selfref")(base)
+            memory = SelfRefMemory(self.dim, self.inner, self.deep, self.mem_hidden, name="selfref")
         else:
-            reads, eta, alpha = FastMemory(self.dim, self.fast_rank, name="fast")(base)
+            memory = FastMemory(self.dim, self.fast_rank, name="fast")
+        reads, eta, alpha = memory(base)
         scale = self.param("fast_scale", nn.initializers.constant(0.1), (self.dim,))
-        h = nn.LayerNorm(epsilon=HOPE_LN_EPS, name="norm")(base + scale * reads)
+        mixed = base + scale * reads
+        if self.bidir:
+            # Bidirectional HOPE: the same self-modifying memory (shared weights, fresh state) reads the clip
+            # from the last segment to the first; its reads are aligned back to forward time.
+            back, _, _ = memory(base[:, ::-1])
+            back_scale = self.param("back_scale", nn.initializers.constant(0.1), (self.dim,))
+            mixed = mixed + back_scale * back[:, ::-1]
+        h = nn.LayerNorm(epsilon=HOPE_LN_EPS, name="norm")(mixed)
         if self.mlp and self.chain:
-            h = CMSChain(self.dim, self.dim // 4, name="cms_chain")(h)
+            h = CMSChain(self.dim, self.dim // self.chain_div, name="cms_chain")(h)
         elif self.mlp:
             h = CMSMLP(self.dim, self.dim // 2, name="cms_mlp")(h)
         return h, eta, alpha, jnp.mean(jnp.abs(scale))
@@ -551,6 +590,10 @@ class NestSARR5T16(nn.Module):
     deep_memory: bool = False      # hope_core: Titans deep memory with momentum
     memory_hidden: int = 64
     cms_chain: bool = False        # hope_core: HOPE CMS chain (4 MLPs, periods 1/2/4/8) in every level
+    memory_bidir: bool = False     # HOPE memory reads the clip in both directions (shared weights)
+    cms_chain_div: int = 4         # CMS-chain MLP hidden = model_dim // cms_chain_div
+    part_attention: bool = False   # spatial attention over the 28 part tokens of a frame (tokenizer)
+    part_attn_dim: int = 16
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = False) -> Mapping[str, jnp.ndarray]:
@@ -606,6 +649,8 @@ class NestSARR5T16(nn.Module):
         parts = jnp.asarray(part_matrix(FOURTEEN_PARTS if self.fine_parts else TEN_PARTS))
         weight = jnp.einsum("btpv,qv->btpq", joint_valid.astype(dtype), parts)
         part_feat = jnp.einsum("btpvd,qv->btpqd", s, parts) / jnp.maximum(weight, 1.0)[..., None]
+        if self.part_attention:
+            part_feat = PartAttention(self.part_attn_dim, name="part_attention")(part_feat, weight > 0)
         person_in = [part_feat.reshape(b, FRAMES, PERSONS, -1),
                      self_relations(pose, joint_valid)]
 
@@ -676,7 +721,7 @@ class NestSARR5T16(nn.Module):
             level = lambda name, local: HopeLevel(self.model_dim, local, self.selfref, self.cms_mlp,
                                                   self.selfref_dim, self.fast_rank, self.level_mixer,
                                                   self.deep_memory, self.memory_hidden, self.cms_chain,
-                                                  name=name)
+                                                  self.memory_bidir, self.cms_chain_div, name=name)
             m4, eta, alpha, fast_scale = level("m4", True)(f)
             level_means = [m4.mean(axis=1)]
             if self.cms_levels:

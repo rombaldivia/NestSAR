@@ -49,6 +49,10 @@ EXPECTED_PARAMS = {
     "hope_no_levels": 1_231_888,
     "hope_no_mlp": 1_262_920,
     "hope_core": 771_056,
+    "hope_core_bi": 771_760,
+    "hope_core_attn": 773_504,
+    "hope_core_bi_attn": 774_208,
+    "hope_core_wide": 1_022_720,
 }
 # Strict MFLOPs per clip (jaxpr dot MACs x 2, scan bodies x length, batch 1).
 STRICT_MFLOPS = {
@@ -64,6 +68,10 @@ STRICT_MFLOPS = {
     "hope_no_levels": 61.177216,
     "hope_no_mlp": 60.5984,
     "hope_core": 51.44736,
+    "hope_core_bi": 57.50304,
+    "hope_core_attn": 54.429248,
+    "hope_core_bi_attn": 60.484928,
+    "hope_core_wide": 64.202048,
 }
 
 # R4-FMSE+Geometry per-class recall of its weakest classes (EXPERIMENT_REPORT, best checkpoints).

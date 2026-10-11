@@ -194,3 +194,40 @@ def test_hope_core_gradients_finite_on_real_and_all_zero_clips():
     for x in (real_batch(3), jnp.zeros((1,) + real_batch(1).shape[1:])):
         g = jax.grad(lambda p: jnp.mean(jax.nn.logsumexp(model.apply({"params": p}, x, training=False)["logits"])))(params)
         assert all(np.isfinite(np.asarray(a)).all() for a in jax.tree.leaves(g))
+
+
+# ----------------------------------------------------------------------------- v2: bidirectional memory, part attention
+def test_bidirectional_level_sees_the_future_and_forward_level_does_not():
+    x = jax.random.normal(jax.random.PRNGKey(0), (2, 16, 32))
+    x2 = x.at[:, 12:].add(3.0)
+    for bidir in (False, True):
+        lvl = m5.HopeLevel(32, True, True, True, 16, 8, "conv", True, 16, True, bidir)
+        p = lvl.init(jax.random.PRNGKey(1), x)["params"]
+        a = lvl.apply({"params": p}, x)[0]
+        b = lvl.apply({"params": p}, x2)[0]
+        early = float(jnp.max(jnp.abs(a[:, :8] - b[:, :8])))           # conv sees only +-1 step
+        assert (early > 1e-5) == bidir
+        if bidir:
+            assert "back_scale" in p and "selfref" in p                    # one shared memory, two directions
+
+
+def test_part_attention_ignores_absent_parts_and_mixes_present_ones():
+    att = m5.PartAttention(8)
+    parts = jax.random.normal(jax.random.PRNGKey(0), (2, 4, 2, 14, 12))
+    valid = jnp.ones((2, 4, 2, 14), bool).at[:, :, 1].set(False)          # second person absent
+    p = att.init(jax.random.PRNGKey(1), parts, valid)["params"]
+    out = att.apply({"params": p}, parts, valid)
+    junk = parts.at[:, :, 1].set(50.0)
+    out2 = att.apply({"params": p}, junk, valid)
+    np.testing.assert_allclose(out[:, :, 0], out2[:, :, 0], atol=1e-5)    # absent person never leaks in
+    assert float(jnp.max(jnp.abs(out[:, :, 1]))) == 0.0
+    single = att.apply({"params": p}, parts.at[:, :, 0, 5].set(0.0), valid)
+    assert float(jnp.max(jnp.abs(single[:, :, 0, 0] - out[:, :, 0, 0]))) > 0   # parts do talk to each other
+
+
+@pytest.mark.parametrize("variant", ["hope_core_bi_attn", "hope_core_wide"])
+def test_v2_variants_finite_on_real_and_empty_clips(variant):
+    model, params = build(variant)
+    for x in (real_batch(2), jnp.zeros((1,) + real_batch(1).shape[1:])):
+        g = jax.grad(lambda p: jnp.mean(jax.nn.logsumexp(model.apply({"params": p}, x, training=False)["logits"])))(params)
+        assert all(np.isfinite(np.asarray(a)).all() for a in jax.tree.leaves(g))
