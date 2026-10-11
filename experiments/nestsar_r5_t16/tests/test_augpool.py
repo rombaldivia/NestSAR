@@ -77,3 +77,37 @@ def test_clean_prob_one_keeps_canonical_x_and_pool_is_validated(env, tmp_path):
         augpool.Pool(tmp_path, ds)
     with pytest.raises(ValueError):
         validate_config({"aug_pool": "/x"})                  # needs aug_strength > 0
+
+
+def test_float16_pool_split_in_two_parts_is_found_and_joined(env, tmp_path):
+    """A pool saved as two Kaggle outputs (views 0-1 and 2, float16) is discovered and read as one pool."""
+    root, ds = env
+    kw = dict(views=3, strength=1.0, workers=2, chunk=7, log=lambda m: None, dtype="float16")
+    augpool.build(root / "hand", tmp_path / "input" / "out_a" / "pool", only_views=[0, 1], **kw)
+    augpool.build(root / "hand", tmp_path / "input" / "out_b" / "pool", only_views=[2], **kw)
+    sig = augpool.signature(r5data.read_manifest(root / "hand"), 3, 1.0, 15.0, augpool.POOL_SEED, "float16")
+    found = augpool.find_parts([tmp_path / "input"], sig)
+    assert sorted(found) == [0, 1, 2] and found[0] != found[2]
+    spec = ":".join(sorted({str(d) for d in found.values()}))
+    pool = augpool.Pool(spec, ds)
+    full = augpool.Pool(root / "pool", ds)                                   # float32 reference pool
+    for v in range(3):
+        a, b = pool.get(v, [0, 4]), full.get(v, [0, 4])
+        assert a.dtype == np.float32
+        np.testing.assert_allclose(a, b, rtol=2e-3, atol=2e-3)              # float16 rounding only
+    assert augpool.find_parts([tmp_path / "input"], augpool.signature(
+        r5data.read_manifest(root / "hand"), 3, 1.0, 15.0, augpool.POOL_SEED)) == {}   # float32 signature differs
+    with pytest.raises(ValueError, match="missing"):
+        augpool.Pool(str(found[0]), ds)                                       # one part alone is incomplete
+    assert augpool.parse_views("0-3", 8) == [0, 1, 2, 3] and augpool.parse_views("", 2) == [0, 1]
+
+
+def test_ensure_aug_pool_reuses_saved_parts(env, tmp_path, monkeypatch):
+    from experiments.nestsar_r5_t16 import kaggle_run
+    root, ds = env
+    kw = dict(views=3, strength=1.0, workers=2, chunk=7, log=lambda m: None, dtype="float16")
+    augpool.build(root / "hand", tmp_path / "input" / "a", only_views=[0, 1, 2], **kw)
+    monkeypatch.setattr(kaggle_run.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("rebuilt")))
+    spec = kaggle_run.ensure_aug_pool(str(root / "hand"), str(tmp_path / "tmp_pool"), 3, 1.0, 15.0, "float16",
+                                      "", [str(tmp_path / "input")])
+    assert spec == str(tmp_path / "input" / "a")

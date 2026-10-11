@@ -350,3 +350,16 @@ the temporal levels (they held 63% of the parameters) and keeps only HOPE / Tita
 | **hope_core** | **771,056** | **51.45** | **57.6% of params** |
 
 Run two one-protocol variants side by side with `--protocols xsub --gpu-offset 0|1`.
+
+### Keep the augmentation pool between Kaggle sessions (no rebuild)
+
+`/tmp` is wiped with the session, and an 8-view float32 pool (~55 GiB) does not fit a 20 GB notebook
+output. Store it as **float16** (3.4 GiB per view) **split over two outputs** of builder notebooks
+(CPU accelerator is enough), each with `--prepare-only`:
+
+    part A: --pool-views 8 --pool-dtype float16 --pool-only-views 0-3 --aug-pool /kaggle/working/NestSAR_AUGPOOL_F16_A --r4-build-dir /tmp
+    part B: --pool-views 8 --pool-dtype float16 --pool-only-views 4-7 --aug-pool /kaggle/working/NestSAR_AUGPOOL_F16_B --r4-build-dir /tmp
+
+Save Version (Save & Run All) both, add both outputs as inputs of the training notebook, and launch with
+`--pool-dtype float16 --aug-pool /tmp/NestSAR_AUGPOOL_F16` (fallback path). The launcher finds the saved hand
+cache and every pool part under `/kaggle/input` by signature and joins them (`'dirA:dirB'`); nothing is rebuilt.

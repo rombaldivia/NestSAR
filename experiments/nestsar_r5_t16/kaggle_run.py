@@ -136,14 +136,14 @@ def r4_cache_usable(path):
     return r.returncode == 0, last_line(r.stderr)
 
 
-def find_r4_cache(explicit, working, inputs):
+def find_r4_cache(explicit, working, inputs, build_dir=None):
     if explicit:
         ok, why = r4_cache_usable(explicit)
         if not ok:
             raise SystemExit(f"--r4-cache {explicit} is not usable: {why}")
         return explicit
     from experiments.nestsar_r5_t16.data import candidate_r4_caches
-    roots = [r for r in (working, inputs) if Path(r).is_dir()]
+    roots = [r for r in (working, inputs, build_dir) if r and Path(r).is_dir()]
     for d in candidate_r4_caches(roots, PREFERRED_R4_CACHES):
         ok, why = r4_cache_usable(str(d))
         print(f"  R4 cache {'OK' if ok else 'NO'}  {d}" + ("" if ok else f"  ({why})"), flush=True)
@@ -154,7 +154,7 @@ def find_r4_cache(explicit, working, inputs):
     if not pkls:
         raise SystemExit(f"No R4 cache under {working} or {inputs} and no ntu120*.pkl under {inputs}. "
                          "Add the NTU120 dataset as a notebook input.")
-    target = Path(working) / "NestSAR_canonical_cache"
+    target = Path(build_dir or working) / "NestSAR_canonical_cache"
     print(f"No R4 cache found. Building it from {pkls[0]} -> {target} (several minutes)...", flush=True)
     r = cpu_python(R4_CACHE_BUILD, pkls[0], target, capture=False, timeout=6 * 3600)
     if r.returncode != 0:
@@ -228,16 +228,41 @@ def ensure_hand_cache(r4_cache, hand_cache, hand_filter="none", body_align="none
         raise SystemExit("Hand cache check failed:\n" + "\n".join((r.stderr or "").splitlines()[-20:]))
 
 
-def ensure_aug_pool(hand_cache, pool_dir, views, strength, view_degrees):
-    """Build (or resume) the augmentation pool with every CPU core; one view is ~7 GiB."""
-    print(f"Augmentation pool: {pool_dir} ({views} views, strength {strength})", flush=True)
+def ensure_aug_pool(hand_cache, pool_dir, views, strength, view_degrees, dtype="float32", only_views="",
+                    search=()):
+    """Reuse a finished pool found under ``search`` (e.g. /kaggle/input: a pool saved as a notebook output or
+    dataset, possibly split in parts), else build (or resume) it in ``pool_dir`` with every CPU core.
+    Returns the pool spec for the config: one directory or 'dir1:dir2'."""
+    from experiments.nestsar_r5_t16 import augpool
+    from experiments.nestsar_r5_t16.data import read_manifest
+    sig = augpool.signature(read_manifest(Path(hand_cache)), views, strength, view_degrees, augpool.POOL_SEED, dtype)
+    wanted = augpool.parse_views(only_views, views)
+    found = augpool.find_parts([r for r in search if r], sig)
+    if not only_views and set(found) >= set(range(views)):
+        dirs = sorted({str(found[v]) for v in range(views)})
+        print(f"Augmentation pool: reusing {', '.join(dirs)} ({views} views, {dtype}) - no rebuild", flush=True)
+        return os.pathsep.join(dirs)
+    if found:
+        print(f"  pool parts found for views {sorted(found)}; building the rest in {pool_dir}", flush=True)
+        wanted = [v for v in wanted if v not in found]
+    print(f"Augmentation pool: {pool_dir} (views {wanted} of {views}, {dtype}, strength {strength})", flush=True)
     t0 = time.time()
     r = subprocess.run([sys.executable, "-u", "-m", "experiments.nestsar_r5_t16.augpool", "build", "--cache", hand_cache,
                         "--pool", pool_dir, "--views", str(views), "--strength", str(strength),
-                        "--view-degrees", str(view_degrees)], cwd=REPO, env=cpu_env(), timeout=8 * 3600)
+                        "--view-degrees", str(view_degrees), "--dtype", dtype,
+                        "--only-views", ",".join(map(str, wanted))], cwd=REPO, env=cpu_env(), timeout=8 * 3600)
     if r.returncode != 0:
         raise SystemExit("Augmentation pool build failed (see the error above).")
     print(f"  pool ready in {time.time() - t0:.0f} s", flush=True)
+    dirs = sorted({str(found[v]) for v in found} | {str(pool_dir)})
+    return os.pathsep.join(dirs)
+
+
+def find_saved_hand_cache(name, inputs):
+    """A finished hand cache with the expected name saved under /kaggle/input (notebook output / dataset)."""
+    for mf in sorted(Path(inputs).glob(f"**/{name}/manifest.json")) if Path(inputs).is_dir() else []:
+        return str(mf.parent)
+    return None
 
 
 def follow(log, offset, pid, proc):
@@ -307,6 +332,8 @@ def main(argv=None):
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--outdir", default=DEFAULT_OUTDIR)
     ap.add_argument("--r4-cache", default=None, help="R4 canonical cache dir (auto-detected if omitted)")
+    ap.add_argument("--r4-build-dir", default=None,
+                    help="where to build the R4 cache when none is found (default --working; /tmp keeps it out of the output)")
     ap.add_argument("--hand-cache", default=None, help=f"default: <working>/{DEFAULT_HAND_CACHE}")
     ap.add_argument("--working", default="/kaggle/working")
     ap.add_argument("--inputs", default="/kaggle/input")
@@ -326,12 +353,19 @@ def main(argv=None):
     ap.add_argument("--aug-pool", default=None,
                     help="directory of a pre-computed strong-augmentation pool (built if missing; use /tmp on Kaggle). "
                          "Turns on aug_strength=1.0 unless --extra-config sets it")
-    ap.add_argument("--pool-views", type=int, default=8, help="strong views stored per clip (6.9 GiB each)")
+    ap.add_argument("--pool-views", type=int, default=8, help="strong views stored per clip (6.9 GiB each, float32)")
+    ap.add_argument("--pool-dtype", default="float32", choices=["float32", "float16"],
+                    help="float16 halves the pool (3.4 GiB per view) so it fits a 20 GB Kaggle output")
+    ap.add_argument("--pool-only-views", default="", help="build only these views (e.g. 0-3) - one part of a split pool")
+    ap.add_argument("--pool-search", default=None,
+                    help="where to look for a saved pool / hand cache before building (default: --inputs)")
+    ap.add_argument("--prepare-only", action="store_true",
+                    help="build caches and pool, then stop (pool-builder notebook; Save Version keeps the output)")
     ap.add_argument("--extra-config", default="{}", help='JSON merged into config, e.g. \'{"aug_strength": 1.0, "prefetch_workers": 2}\'')
     a = ap.parse_args(argv)
 
     print(f"{MODEL_NAME}  variant={a.variant}  micro_batch={a.micro_batch}  out={a.outdir}", flush=True)
-    if not a.cpu_smoke:
+    if not a.cpu_smoke and not a.prepare_only:
         gpus = visible_gpus()
         print("GPUs:", gpus, flush=True)
         n_needed = len([p for p in a.protocols.split(",") if p.strip()]) + a.gpu_offset
@@ -347,18 +381,24 @@ def main(argv=None):
     print(f"Model OK: {info['params']:,} params, {info['mflops']:.2f} strict MFLOPs per clip "
           f"(R4-FMSE: 1,831,932 params, 60.87 MFLOPs), JAX {info['jax']}", flush=True)
 
-    r4_cache = find_r4_cache(a.r4_cache, a.working, a.inputs)
+    r4_cache = find_r4_cache(a.r4_cache, a.working, a.inputs, a.r4_build_dir)
     print("R4 CACHE:", r4_cache, flush=True)
-    hand_cache = a.hand_cache or str(Path(a.working) / default_hand_cache_name(r4_cache, a.hand_filter, a.body_align))
+    search = a.pool_search if a.pool_search is not None else a.inputs
+    name = default_hand_cache_name(r4_cache, a.hand_filter, a.body_align)
+    hand_cache = a.hand_cache or find_saved_hand_cache(name, search) or str(Path(a.working) / name)
     check_disk_for_cache(hand_cache, a.body_align, a.working, r4_cache)
     ensure_hand_cache(r4_cache, hand_cache, a.hand_filter, a.body_align)
 
     extra = json.loads(a.extra_config)
     if a.aug_pool:
         extra.setdefault("aug_strength", 1.0)
-        extra["aug_pool"] = a.aug_pool
-        ensure_aug_pool(hand_cache, a.aug_pool, a.pool_views, extra["aug_strength"],
-                        extra.get("aug_view_degrees", 15.0))
+        extra["aug_pool"] = ensure_aug_pool(hand_cache, a.aug_pool, a.pool_views, extra["aug_strength"],
+                                            extra.get("aug_view_degrees", 15.0), a.pool_dtype,
+                                            a.pool_only_views, [search])
+    if a.prepare_only:
+        print(f"Prepared: hand cache {hand_cache}" + (f", pool {extra.get('aug_pool')}" if a.aug_pool else "")
+              + ". Stopping (--prepare-only).", flush=True)
+        return 0
 
     launch_argv = ["--cache", hand_cache, "--outdir", a.outdir, "--variant", a.variant,
                    "--protocols", a.protocols, "--gpu-offset", str(a.gpu_offset),
