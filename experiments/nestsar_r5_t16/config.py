@@ -35,13 +35,15 @@ VARIANTS = {
     "hope_no_selfref": {"temporal": "hope", "selfref": False},
     "hope_no_levels": {"temporal": "hope", "cms_levels": False},
     "hope_no_mlp": {"temporal": "hope", "cms_mlp": False},
-    # HOPE-dominant core: Titans short conv instead of the level BiGRUs (the largest R5 block),
-    # wider self-referential memory and a Titans deep (MLP) memory with momentum surprise.
+    # Full HOPE backbone: Titans short conv instead of the level BiGRUs (the largest R5 block), wider
+    # self-referential memory, Titans deep (MLP) memory with momentum surprise, and the HOPE CMS chain
+    # (MLPs updated every 1/2/4/8 optimizer steps) in every level.
     "hope_core": {"temporal": "hope", "level_mixer": "conv", "selfref_dim": 64, "deep_memory": True,
-                  "memory_hidden": 64},
+                  "memory_hidden": 64, "cms_chain": True},
 }
 
 # Outer CMS: parameter tier of each temporal level = its in-clip period (optimizer steps per update).
+# Inside a level, a CMS-chain MLP named mlp_p<f> uses its own period f instead.
 OUTER_CMS_PERIODS = {"m4": 1, "l2": 2, "g4": 4, "l8": 8}
 
 DEFAULTS = {k: v for k, v in r4_launch.DEFAULTS.items() if k not in R4_MODEL_KEYS}

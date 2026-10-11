@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from flax import serialization
+from flax import serialization, traverse_util
 from flax.training import train_state
 
 from experiments.nestsar_sm_all_t16.streaming import worker as r4_worker
@@ -48,6 +48,7 @@ EXPECTED_PARAMS = {
     "hope_no_selfref": 1_346_600,
     "hope_no_levels": 1_231_888,
     "hope_no_mlp": 1_262_920,
+    "hope_core": 771_056,
 }
 # Strict MFLOPs per clip (jaxpr dot MACs x 2, scan bodies x length, batch 1).
 STRICT_MFLOPS = {
@@ -62,6 +63,7 @@ STRICT_MFLOPS = {
     "hope_no_selfref": 61.29152,
     "hope_no_levels": 61.177216,
     "hope_no_mlp": 60.5984,
+    "hope_core": 51.44736,
 }
 
 # R4-FMSE+Geometry per-class recall of its weakest classes (EXPERIMENT_REPORT, best checkpoints).
@@ -224,9 +226,17 @@ def dmgd_l2(momentum=0.90, memory_lr=0.01, mix=0.10, cap=2.0, eps=1e-6):
 
 
 def tier_labels(params):
-    """Outer-CMS tier of every parameter: the period of its temporal level, 1 for everything else."""
-    return {name: jax.tree.map(lambda _: f"p{OUTER_CMS_PERIODS.get(name, 1)}", sub)
-            for name, sub in params.items()}
+    """Outer-CMS tier of every parameter: the period of its temporal level (1 outside the levels); a
+    CMS-chain MLP ``mlp_p<f>`` uses its own period f."""
+    flat = traverse_util.flatten_dict(dict(params))
+    labels = {}
+    for path in flat:
+        period = OUTER_CMS_PERIODS.get(path[0], 1)
+        for part in path:
+            if isinstance(part, str) and part.startswith("mlp_p") and part[5:].isdigit():
+                period = int(part[5:])
+        labels[path] = f"p{period}"
+    return traverse_util.unflatten_dict(labels)
 
 
 def make_optimizer(config, schedule, params):
@@ -243,10 +253,11 @@ def make_optimizer(config, schedule, params):
 
     if not config["outer_cms"]:
         return inner(1)
-    periods = sorted({OUTER_CMS_PERIODS.get(name, 1) for name in params})
+    labels = tier_labels(params)
+    periods = sorted({int(x[1:]) for x in jax.tree.leaves(labels)})
     transforms = {f"p{p}": inner(p) if p == 1 else
                   optax.MultiSteps(inner(p), every_k_schedule=p, use_grad_mean=True) for p in periods}
-    return optax.multi_transform(transforms, tier_labels(params))
+    return optax.multi_transform(transforms, labels)
 
 
 def create_state(config, steps_per_epoch):

@@ -150,3 +150,47 @@ def test_hope_gradients_finite_on_an_all_zero_clip_without_mask():
     x = jnp.zeros((1,) + real_batch(1).shape[1:])
     g = jax.grad(lambda p: jnp.mean(jax.nn.logsumexp(model.apply({"params": p}, x, training=False)["logits"])))(params)
     assert all(np.isfinite(np.asarray(a)).all() for a in jax.tree.leaves(g))
+
+
+# ----------------------------------------------------------------------------- hope_core (full HOPE backbone)
+def test_deep_memory_error_matches_autodiff():
+    k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(5), 4)
+    w1 = jax.random.normal(k1, (2, 6, 4)); w2 = jax.random.normal(k2, (2, 4, 6))
+    k = jax.random.normal(k3, (2, 4)); v = jax.random.normal(k4, (2, 4))
+    err, act, back = m5.deep_memory_error(w1, w2, k, v)
+    loss = lambda a, b: 0.5 * jnp.sum(jnp.square(jnp.einsum("bdh,bh->bd", b, jnp.tanh(jnp.einsum("bhd,bd->bh", a, k))) - v))
+    g1, g2 = jax.grad(loss, argnums=(0, 1))(w1, w2)
+    np.testing.assert_allclose(-np.asarray(g2), np.asarray(jnp.einsum("bd,bh->bdh", err, act)), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(-np.asarray(g1), np.asarray(jnp.einsum("bh,bd->bhd", back, k)), rtol=1e-5, atol=1e-5)
+
+
+def test_deep_selfref_is_causal_bounded_and_finite():
+    mem = m5.SelfRefMemory(24, 8, deep=True, mem_hidden=8)
+    x = 20.0 * jax.random.normal(jax.random.PRNGKey(0), (2, 64, 24))
+    params = mem.init(jax.random.PRNGKey(1), x)["params"]
+    out, eta, alpha = mem.apply({"params": params}, x)
+    x2 = x.at[:, 30:].set(0.0)
+    out2, _, _ = mem.apply({"params": params}, x2)
+    np.testing.assert_allclose(out[:, :30], out2[:, :30], atol=1e-5)
+    assert np.isfinite(np.asarray(out)).all()
+    grad = jax.grad(lambda p: jnp.sum(mem.apply({"params": p}, x)[0] ** 2))(params)
+    assert all(np.isfinite(np.asarray(g)).all() for g in jax.tree.leaves(grad))
+
+
+def test_hope_core_has_no_bigru_and_a_cms_chain_per_level():
+    _, p = build("hope_core")
+    for name in OUTER_CMS_PERIODS:
+        assert "base" not in p[name] and "mixer" in p[name]                       # Titans short conv, no BiGRU
+        assert set(p[name]["cms_chain"]) == {"mlp_p1", "mlp_p2", "mlp_p4", "mlp_p8"}
+        assert {"memory_w1", "memory_w2"} <= set(p[name]["selfref"])              # deep memory
+    labels = tier_labels(p)
+    assert labels["l2"]["cms_chain"]["mlp_p8"]["up"]["kernel"] == "p8"          # chain period wins
+    assert labels["l8"]["cms_chain"]["mlp_p1"]["up"]["kernel"] == "p1"
+    assert labels["l8"]["selfref"]["memory_w1"] == "p8"                          # level period otherwise
+
+
+def test_hope_core_gradients_finite_on_real_and_all_zero_clips():
+    model, params = build("hope_core")
+    for x in (real_batch(3), jnp.zeros((1,) + real_batch(1).shape[1:])):
+        g = jax.grad(lambda p: jnp.mean(jax.nn.logsumexp(model.apply({"params": p}, x, training=False)["logits"])))(params)
+        assert all(np.isfinite(np.asarray(a)).all() for a in jax.tree.leaves(g))

@@ -302,6 +302,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--variant", default="full")
     ap.add_argument("--protocols", default="xsub,xset")
+    ap.add_argument("--gpu-offset", type=int, default=0, help="first GPU (run two one-protocol variants side by side)")
     ap.add_argument("--micro-batch", type=int, default=64)
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--outdir", default=DEFAULT_OUTDIR)
@@ -333,7 +334,7 @@ def main(argv=None):
     if not a.cpu_smoke:
         gpus = visible_gpus()
         print("GPUs:", gpus, flush=True)
-        n_needed = len([p for p in a.protocols.split(",") if p.strip()])
+        n_needed = len([p for p in a.protocols.split(",") if p.strip()]) + a.gpu_offset
         if len(gpus) < n_needed:
             raise SystemExit(f"Need {n_needed} GPUs: Notebook settings -> Accelerator -> GPU T4 x2.")
         gpu_runtime_ok(n_needed)
@@ -360,7 +361,8 @@ def main(argv=None):
                         extra.get("aug_view_degrees", 15.0))
 
     launch_argv = ["--cache", hand_cache, "--outdir", a.outdir, "--variant", a.variant,
-                   "--protocols", a.protocols, "--micro-batch", str(a.micro_batch),
+                   "--protocols", a.protocols, "--gpu-offset", str(a.gpu_offset),
+                   "--micro-batch", str(a.micro_batch),
                    "--epochs", str(a.epochs), "--kill-epoch", str(a.kill_epoch),
                    "--kill-margin-pp", str(a.kill_margin_pp), "--working-root", a.working,
                    "--poll-seconds", str(a.poll_seconds), "--heartbeat-minutes", str(a.heartbeat_minutes)]

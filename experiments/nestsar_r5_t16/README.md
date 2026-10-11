@@ -329,3 +329,24 @@ Cost (strict counter, batch 1):
 # in the AUGPOOL launch cell: BRANCH = "experiment/nestsar-r6-hope", new OUT, and add
 "--variant", "hope",
 ```
+
+### hope_core: the full HOPE backbone (`--variant hope_core`)
+
+NestSAR = skeleton tokenizer (the R5 front end) + HOPE backbone. `hope_core` removes the R5 BiGRUs from
+the temporal levels (they held 63% of the parameters) and keeps only HOPE / Titans pieces there:
+
+- Titans short conv (depthwise, kernel 3) as the local mixer of every level, plus a learned segment-position
+  embedding (the BiGRU carried order implicitly).
+- Self-referential memory, inner width 64, with a **Titans deep memory** M(k) = W2 tanh(W1 k) written by its
+  own gradient with momentum: S <- beta S - eta grad, W <- alpha W + S (beta is a self-modifying gate too).
+- **HOPE CMS chain** in every level: MLP_p1 -> MLP_p2 -> MLP_p4 -> MLP_p8, each updated every 1/2/4/8
+  optimizer steps (`mlp_p<f>` sets the tier); other level weights use the level period.
+- Outer CMS + DMGD-L2 as in `hope`.
+
+| Variant | Params | Strict MFLOPs | HOPE backbone share |
+|---|---:|---:|---:|
+| full (R5) | 1,146,656 | 59.16 | - |
+| hope | 1,389,992 | 62.46 | 14% of params |
+| **hope_core** | **771,056** | **51.45** | **57.6% of params** |
+
+Run two one-protocol variants side by side with `--protocols xsub --gpu-offset 0|1`.

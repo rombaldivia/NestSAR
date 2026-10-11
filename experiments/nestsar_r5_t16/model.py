@@ -284,6 +284,18 @@ def _cap(x: jnp.ndarray, cap: float, axes) -> jnp.ndarray:
     return x * jnp.minimum(1.0, cap / norm)
 
 
+def deep_memory_error(w1, w2, k, v):
+    """Titans deep memory  M(k) = W2 tanh(W1 k),  l = 1/2 |M(k) - v|^2.
+
+    Returns (err = v - M(k), act = tanh(W1 k), back = (W2^T err) * (1 - act^2)) so that
+    -dl/dW2 = err act^T  and  -dl/dW1 = back k^T  (checked against jax.grad in the tests).
+    """
+    act = jnp.tanh(jnp.einsum("bhd,bd->bh", w1, k))
+    err = v - jnp.einsum("bdh,bh->bd", w2, act)
+    back = jnp.einsum("bdh,bd->bh", w2, err) * (1.0 - jnp.square(act))
+    return err, act, back
+
+
 class SelfRefMemory(nn.Module):
     """Self-referential associative memory (HOPE / self-modifying Titans), small inner width d.
 
@@ -332,11 +344,9 @@ class SelfRefMemory(nn.Module):
             k, v, q = safe_unit(r[:, 0]), r[:, 1], safe_unit(r[:, 2])
             if self.deep:
                 w1, w2, s1, s2 = mem
-                act = jnp.tanh(jnp.einsum("bhd,bd->bh", w1, k))
-                pred = jnp.einsum("bdh,bh->bd", w2, act)
+                err, act, back = deep_memory_error(w1, w2, k, v)
             else:
-                pred = jnp.einsum("bij,bj->bi", mem, k)
-            err = v - pred
+                err = v - jnp.einsum("bij,bj->bi", mem, k)
             surprise = jnp.sqrt(jnp.maximum(jnp.mean(jnp.square(err), axis=-1), EPS * EPS))
             logits = jnp.einsum("bci,bi->bc", gate, u_t) + surprise[:, None] * surprise_w + bias
             eta = jax.nn.sigmoid(logits[:, 0])
@@ -345,7 +355,6 @@ class SelfRefMemory(nn.Module):
             if self.deep:
                 # Titans: S <- beta S - eta grad l(M; k, v);  M <- alpha M + S,  l = 1/2 |W2 tanh(W1 k) - v|^2
                 mom = jax.nn.sigmoid(logits[:, 2])[:, None, None]
-                back = jnp.einsum("bdh,bd->bh", w2, err) * (1.0 - jnp.square(act))
                 s2 = _cap(mom * s2 + e3 * jnp.einsum("bd,bh->bdh", err, act), SELFREF_MAIN_CAP, (-2, -1))
                 s1 = _cap(mom * s1 + e3 * jnp.einsum("bh,bd->bhd", back, k), SELFREF_MAIN_CAP, (-2, -1))
                 w2 = _cap(a3 * w2 + s2, SELFREF_MAIN_CAP, (-2, -1))
@@ -391,6 +400,21 @@ class CMSMLP(nn.Module):
         return nn.LayerNorm(epsilon=HOPE_LN_EPS, name="norm")(x + scale * h)
 
 
+class CMSChain(nn.Module):
+    """HOPE continuum memory system: MLP_(f1) -> MLP_(f2) -> ... ; the weights of mlp_p<f> are updated every
+    f optimizer steps (worker.tier_labels reads the 'mlp_p<f>' name)."""
+
+    dim: int
+    hidden: int
+    periods: tuple = CMS_PERIODS
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        for p in self.periods:
+            x = CMSMLP(self.dim, self.hidden, name=f"mlp_p{p}")(x)
+        return x
+
+
 class ShortConv(nn.Module):
     """Titans-style local mixer: LN(x + s * silu(depthwise temporal conv(x))), kernel 3, centred."""
 
@@ -416,6 +440,7 @@ class HopeLevel(nn.Module):
     mixer: str = "bigru"        # "bigru" (R5 sweep) | "conv" (Titans short conv)
     deep: bool = False
     mem_hidden: int = 64
+    chain: bool = False         # CMS chain of MLPs at periods 1/2/4/8 instead of one MLP
 
     @nn.compact
     def __call__(self, x: jnp.ndarray):
@@ -434,7 +459,9 @@ class HopeLevel(nn.Module):
             reads, eta, alpha = FastMemory(self.dim, self.fast_rank, name="fast")(base)
         scale = self.param("fast_scale", nn.initializers.constant(0.1), (self.dim,))
         h = nn.LayerNorm(epsilon=HOPE_LN_EPS, name="norm")(base + scale * reads)
-        if self.mlp:
+        if self.mlp and self.chain:
+            h = CMSChain(self.dim, self.dim // 4, name="cms_chain")(h)
+        elif self.mlp:
             h = CMSMLP(self.dim, self.dim // 2, name="cms_mlp")(h)
         return h, eta, alpha, jnp.mean(jnp.abs(scale))
 
@@ -523,6 +550,7 @@ class NestSARR5T16(nn.Module):
     level_mixer: str = "bigru"     # hope_core: "conv" in every level (no BiGRU)
     deep_memory: bool = False      # hope_core: Titans deep memory with momentum
     memory_hidden: int = 64
+    cms_chain: bool = False        # hope_core: HOPE CMS chain (4 MLPs, periods 1/2/4/8) in every level
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = False) -> Mapping[str, jnp.ndarray]:
@@ -641,9 +669,14 @@ class NestSARR5T16(nn.Module):
         elif self.temporal == "hope":
             # ---- HOPE continuum: nested chain of levels, period 1 -> 2 -> 4 -> 8 (16/8/4/2 steps) ----
             conv = self.level_mixer == "conv"          # a short conv is cheap enough for every level
+            if conv:
+                # Learned segment-position embedding (the BiGRU it replaces carried order implicitly). It also
+                # keeps an empty clip off the exact-zero point where chained LayerNorms blow up the backward.
+                f = f + self.param("time_embed", nn.initializers.normal(0.02), (FRAMES, self.model_dim))
             level = lambda name, local: HopeLevel(self.model_dim, local, self.selfref, self.cms_mlp,
                                                   self.selfref_dim, self.fast_rank, self.level_mixer,
-                                                  self.deep_memory, self.memory_hidden, name=name)
+                                                  self.deep_memory, self.memory_hidden, self.cms_chain,
+                                                  name=name)
             m4, eta, alpha, fast_scale = level("m4", True)(f)
             level_means = [m4.mean(axis=1)]
             if self.cms_levels:

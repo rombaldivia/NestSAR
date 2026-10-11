@@ -184,6 +184,8 @@ def main(argv=None):
     ap.add_argument("--outdir", default="/kaggle/working/NestSAR_R5_T16_v1")
     ap.add_argument("--variant", default="full")
     ap.add_argument("--protocols", default="xsub,xset", help="comma list; GPU i runs the i-th protocol")
+    ap.add_argument("--gpu-offset", type=int, default=0,
+                    help="first GPU index (two one-protocol runs side by side: 0 and 1)")
     ap.add_argument("--micro-batch", type=int, default=64)
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--reference-dir", default=None)
@@ -266,7 +268,7 @@ def main(argv=None):
         return proc
 
     for i, p in enumerate(protocols):
-        gpus[p] = None if a.cpu_smoke else i
+        gpus[p] = None if a.cpu_smoke else i + a.gpu_offset
         cmds[p] = [sys.executable, "-m", WORKER, "--config", str(cfg_path), "--protocol", p,
                    "--cache", a.cache, "--outdir", str(out)] + (["--allow-cpu"] if a.cpu_smoke else [])
         if alive(pids.get(p), WORKER):
@@ -278,7 +280,7 @@ def main(argv=None):
             print(f"{p}: already finished (best {100 * done.get('best_val_accuracy', 0):.3f}%)")
             continue
         proc = start(p)
-        print(f"{p}: started pid {proc.pid} on {'CPU' if a.cpu_smoke else 'GPU' + str(i)}")
+        print(f"{p}: started pid {proc.pid} on {'CPU' if a.cpu_smoke else 'GPU' + str(gpus[p])}")
     write_json(out / "pids.json", pids)
     sys.stdout.flush()
 
