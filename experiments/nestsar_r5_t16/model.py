@@ -301,34 +301,61 @@ class SelfRefMemory(nn.Module):
 
     dim: int
     inner: int = 32
+    deep: bool = False          # Titans deep memory: 2-layer MLP written by gradient + momentum
+    mem_hidden: int = 64
 
     @nn.compact
     def __call__(self, x: jnp.ndarray):
-        d = self.inner
+        d, h = self.inner, self.mem_hidden
+        n_gates = 3 if self.deep else 2                                  # eta, alpha (+ momentum beta)
         u = nn.Dense(d, use_bias=False, name="in_proj")(nn.LayerNorm(epsilon=HOPE_LN_EPS, name="in_norm")(x)) / np.sqrt(d)
         comp0 = self.param("components0", lambda k, s: 0.12 * jax.random.normal(k, s) / np.sqrt(d),
                            (3, d, d))                                   # A_k, A_v, A_q
-        gate0 = self.param("gates0", nn.initializers.zeros, (2, d))      # a_eta, a_alpha
-        main0 = self.param("memory0", nn.initializers.normal(0.01), (d, d))
-        surprise_w = self.param("surprise", nn.initializers.zeros, (2,))
-        bias = self.param("gate_bias", lambda *_: jnp.asarray([np.log(0.1 / 0.9), np.log(0.94 / 0.06)],
-                                                             jnp.float32), (2,))
+        gate0 = self.param("gates0", nn.initializers.zeros, (n_gates, d))  # a_eta, a_alpha (, a_beta)
+        if self.deep:
+            w1_0 = self.param("memory_w1", lambda k, s: jax.random.normal(k, s) / np.sqrt(d), (h, d))
+            w2_0 = self.param("memory_w2", nn.initializers.normal(0.01), (d, h))
+            mem0 = (w1_0, w2_0)
+        else:
+            mem0 = self.param("memory0", nn.initializers.normal(0.01), (d, d))
+        surprise_w = self.param("surprise", nn.initializers.zeros, (n_gates,))
+        bias_values = [np.log(0.1 / 0.9), np.log(0.94 / 0.06)] + ([np.log(0.9 / 0.1)] if self.deep else [])
+        bias = self.param("gate_bias", lambda *_: jnp.asarray(bias_values, jnp.float32), (n_gates,))
         b = x.shape[0]
 
+        def deep_read(w1, w2, z):
+            return jnp.einsum("bdh,bh->bd", w2, jnp.tanh(jnp.einsum("bhd,bd->bh", w1, z)))
+
         def step(carry, u_t):
-            comp, gate, mem = carry                                       # [B,3,d,d] [B,2,d] [B,d,d]
+            comp, gate, mem = carry                                       # [B,3,d,d] [B,G,d] memory state
             r = u_t[:, None, :] + SELFREF_BETA * jnp.tanh(jnp.einsum("bcij,bj->bci", comp, u_t))
             k, v, q = safe_unit(r[:, 0]), r[:, 1], safe_unit(r[:, 2])
-            pred = jnp.einsum("bij,bj->bi", mem, k)
+            if self.deep:
+                w1, w2, s1, s2 = mem
+                act = jnp.tanh(jnp.einsum("bhd,bd->bh", w1, k))
+                pred = jnp.einsum("bdh,bh->bd", w2, act)
+            else:
+                pred = jnp.einsum("bij,bj->bi", mem, k)
             err = v - pred
             surprise = jnp.sqrt(jnp.maximum(jnp.mean(jnp.square(err), axis=-1), EPS * EPS))
             logits = jnp.einsum("bci,bi->bc", gate, u_t) + surprise[:, None] * surprise_w + bias
             eta = jax.nn.sigmoid(logits[:, 0])
             alpha = 0.5 + 0.5 * jax.nn.sigmoid(logits[:, 1])
             e3, a3 = eta[:, None, None], alpha[:, None, None]
-            # Titans main memory: M(alpha I - eta k k^T) + eta v k^T  ==  alpha M + eta (v - M k) k^T
-            mem = _cap(a3 * mem + e3 * jnp.einsum("bi,bj->bij", err, k), SELFREF_MAIN_CAP, (-2, -1))
-            y = jnp.einsum("bij,bj->bi", mem, q)
+            if self.deep:
+                # Titans: S <- beta S - eta grad l(M; k, v);  M <- alpha M + S,  l = 1/2 |W2 tanh(W1 k) - v|^2
+                mom = jax.nn.sigmoid(logits[:, 2])[:, None, None]
+                back = jnp.einsum("bdh,bd->bh", w2, err) * (1.0 - jnp.square(act))
+                s2 = _cap(mom * s2 + e3 * jnp.einsum("bd,bh->bdh", err, act), SELFREF_MAIN_CAP, (-2, -1))
+                s1 = _cap(mom * s1 + e3 * jnp.einsum("bh,bd->bhd", back, k), SELFREF_MAIN_CAP, (-2, -1))
+                w2 = _cap(a3 * w2 + s2, SELFREF_MAIN_CAP, (-2, -1))
+                w1 = _cap(a3 * w1 + s1, SELFREF_MAIN_CAP * np.sqrt(h / d), (-2, -1))
+                mem = (w1, w2, s1, s2)
+                y = deep_read(w1, w2, q)
+            else:
+                # Titans main memory: M(alpha I - eta k k^T) + eta v k^T  ==  alpha M + eta (v - M k) k^T
+                mem = _cap(a3 * mem + e3 * jnp.einsum("bi,bj->bij", err, k), SELFREF_MAIN_CAP, (-2, -1))
+                y = jnp.einsum("bij,bj->bi", mem, q)
             # self-reference: components regress onto their own reading of v_t (v_hat = A v_t)
             ec = SELFREF_COMPONENT_RATE * eta
             c_err = jnp.einsum("bcij,bj->bci", comp, v) - jnp.einsum("bcij,bj->bci", comp, k)
@@ -340,8 +367,12 @@ class SelfRefMemory(nn.Module):
                         SELFREF_VECTOR_CAP, (-1,))
             return (comp, gate, mem), (y, eta, alpha)
 
-        carry0 = (jnp.broadcast_to(comp0[None], (b, 3, d, d)), jnp.broadcast_to(gate0[None], (b, 2, d)),
-                  jnp.broadcast_to(main0[None], (b, d, d)))
+        tile = lambda a: jnp.broadcast_to(a[None], (b,) + a.shape)
+        if self.deep:
+            mem_state = (tile(mem0[0]), tile(mem0[1]), jnp.zeros((b, h, d), x.dtype), jnp.zeros((b, d, h), x.dtype))
+        else:
+            mem_state = tile(mem0)
+        carry0 = (tile(comp0), tile(gate0), mem_state)
         _, (ys, eta, alpha) = jax.lax.scan(step, carry0, jnp.swapaxes(u, 0, 1))
         out = nn.Dense(self.dim, use_bias=False, name="out_proj")(jnp.swapaxes(ys, 0, 1))
         return out, jnp.swapaxes(eta, 0, 1), jnp.swapaxes(alpha, 0, 1)
@@ -360,8 +391,21 @@ class CMSMLP(nn.Module):
         return nn.LayerNorm(epsilon=HOPE_LN_EPS, name="norm")(x + scale * h)
 
 
+class ShortConv(nn.Module):
+    """Titans-style local mixer: LN(x + s * silu(depthwise temporal conv(x))), kernel 3, centred."""
+
+    dim: int
+    kernel: int = 3
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        y = nn.Conv(self.dim, (self.kernel,), padding="SAME", feature_group_count=self.dim, name="conv")(x)
+        scale = self.param("conv_scale", nn.initializers.constant(0.5), (self.dim,))
+        return nn.LayerNorm(epsilon=HOPE_LN_EPS, name="norm")(x + scale * nn.silu(y))
+
+
 class HopeLevel(nn.Module):
-    """One HOPE block: [BiGRU local mixer] -> memory (self-referential or R5 fast) -> [CMS MLP]."""
+    """One HOPE block: [local mixer: BiGRU or short conv] -> memory (self-referential or R5 fast) -> [CMS MLP]."""
 
     dim: int
     local: bool
@@ -369,12 +413,23 @@ class HopeLevel(nn.Module):
     mlp: bool = True
     inner: int = 32
     fast_rank: int = 8
+    mixer: str = "bigru"        # "bigru" (R5 sweep) | "conv" (Titans short conv)
+    deep: bool = False
+    mem_hidden: int = 64
 
     @nn.compact
     def __call__(self, x: jnp.ndarray):
-        base = Sweep(self.dim, bidirectional=True, name="base")(x) if self.local else x
+        if not self.local:
+            base = x
+        elif self.mixer == "bigru":
+            base = Sweep(self.dim, bidirectional=True, name="base")(x)
+        elif self.mixer == "conv":
+            base = ShortConv(self.dim, name="mixer")(x)
+        else:
+            raise ValueError(f"Unknown mixer {self.mixer!r}")
         if self.selfref:
-            reads, eta, alpha = SelfRefMemory(self.dim, self.inner, name="selfref")(base)
+            reads, eta, alpha = SelfRefMemory(self.dim, self.inner, self.deep, self.mem_hidden,
+                                              name="selfref")(base)
         else:
             reads, eta, alpha = FastMemory(self.dim, self.fast_rank, name="fast")(base)
         scale = self.param("fast_scale", nn.initializers.constant(0.1), (self.dim,))
@@ -465,6 +520,9 @@ class NestSARR5T16(nn.Module):
     cms_levels: bool = True
     cms_mlp: bool = True
     selfref_dim: int = 32
+    level_mixer: str = "bigru"     # hope_core: "conv" in every level (no BiGRU)
+    deep_memory: bool = False      # hope_core: Titans deep memory with momentum
+    memory_hidden: int = 64
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = False) -> Mapping[str, jnp.ndarray]:
@@ -582,14 +640,16 @@ class NestSARR5T16(nn.Module):
             level_means = [m4.mean(axis=1), g4.mean(axis=1)]
         elif self.temporal == "hope":
             # ---- HOPE continuum: nested chain of levels, period 1 -> 2 -> 4 -> 8 (16/8/4/2 steps) ----
+            conv = self.level_mixer == "conv"          # a short conv is cheap enough for every level
             level = lambda name, local: HopeLevel(self.model_dim, local, self.selfref, self.cms_mlp,
-                                                  self.selfref_dim, self.fast_rank, name=name)
+                                                  self.selfref_dim, self.fast_rank, self.level_mixer,
+                                                  self.deep_memory, self.memory_hidden, name=name)
             m4, eta, alpha, fast_scale = level("m4", True)(f)
             level_means = [m4.mean(axis=1)]
             if self.cms_levels:
-                l2, _, _, _ = level("l2", False)(chunk_mean(m4, 2))
+                l2, _, _, _ = level("l2", conv)(chunk_mean(m4, 2))
                 g4, eta_g, alpha_g, fast_scale_g = level("g4", True)(chunk_mean(l2, 2))
-                l8, _, _, _ = level("l8", False)(chunk_mean(g4, 2))
+                l8, _, _, _ = level("l8", conv)(chunk_mean(g4, 2))
                 level_means += [l2.mean(axis=1), g4.mean(axis=1), l8.mean(axis=1)]
             else:
                 g4, eta_g, alpha_g, fast_scale_g = level("g4", True)(chunk_mean(m4, 4))

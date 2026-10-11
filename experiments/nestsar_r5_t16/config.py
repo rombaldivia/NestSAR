@@ -35,6 +35,10 @@ VARIANTS = {
     "hope_no_selfref": {"temporal": "hope", "selfref": False},
     "hope_no_levels": {"temporal": "hope", "cms_levels": False},
     "hope_no_mlp": {"temporal": "hope", "cms_mlp": False},
+    # HOPE-dominant core: Titans short conv instead of the level BiGRUs (the largest R5 block),
+    # wider self-referential memory and a Titans deep (MLP) memory with momentum surprise.
+    "hope_core": {"temporal": "hope", "level_mixer": "conv", "selfref_dim": 64, "deep_memory": True,
+                  "memory_hidden": 64},
 }
 
 # Outer CMS: parameter tier of each temporal level = its in-clip period (optimizer steps per update).
