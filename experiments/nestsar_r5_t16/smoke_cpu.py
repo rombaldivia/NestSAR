@@ -64,6 +64,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True)
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--variant", default="full")
     a = ap.parse_args(argv)
     root = Path(a.root)
     if root.exists() and not a.keep:
@@ -79,7 +80,8 @@ def main(argv=None):
                         "progress_every": 1, "patience": 5})
     cmd = [sys.executable, "-m", "experiments.nestsar_r5_t16.kaggle_run", "--cpu-smoke",
            "--working", str(working), "--inputs", str(inputs), "--outdir", str(outdir),
-           "--micro-batch", "2", "--kill-epoch", "1", "--poll-seconds", "2", "--extra-config", extra]
+           "--micro-batch", "2", "--kill-epoch", "1", "--poll-seconds", "2", "--extra-config", extra,
+           "--variant", a.variant]
     log1 = run(cmd, env)
     print(log1[-3000:])
     assert "Model OK" in log1 and "hand cache OK" in log1, "preflight/cache messages missing"
@@ -90,7 +92,8 @@ def main(argv=None):
         hist = json.loads((outdir / p / "history.json").read_text())
         pc = json.loads((outdir / p / "per_class.json").read_text())
         assert res["epochs_run"] == 2 and len(hist) == 2, (p, res, len(hist))
-        assert res["params"] == 1_146_656 and res["variant"] == "full"
+        from experiments.nestsar_r5_t16.worker import EXPECTED_PARAMS
+        assert res["params"] == EXPECTED_PARAMS[a.variant] and res["variant"] == a.variant
         assert (outdir / p / "best.msgpack").exists()
         assert 0.0 <= pc["top1"] <= 1.0 and set(pc["r4_weak_classes"]) and len(pc["recall"]) == 120
         for row in hist:
@@ -115,11 +118,12 @@ def main(argv=None):
 
     # A different variant must refuse the same output folder.
     bad = subprocess.run([sys.executable, "-m", "experiments.nestsar_r5_t16.launch", "--cache", str(hand_cache),
-                          "--outdir", str(outdir), "--variant", "no_hand_branch", "--cpu-smoke",
+                          "--outdir", str(outdir), "--variant", "no_hand_branch" if a.variant != "no_hand_branch" else "full",
+                          "--cpu-smoke",
                           "--micro-batch", "2", "--extra-config", extra],
                          cwd=REPO, env=env, capture_output=True, text=True, timeout=600)
     assert bad.returncode != 0 and "different config" in (bad.stdout + bad.stderr), bad.stdout + bad.stderr
-    report = {"passed": True, "protocols": ["xsub", "xset"], "epochs": 2, "kill_decision": decision,
+    report = {"passed": True, "variant": a.variant, "protocols": ["xsub", "xset"], "epochs": 2, "kill_decision": decision,
               "resume_completed": True, "variant_guard": True}
     (root / "smoke_report.json").write_text(json.dumps(report, indent=2))
     print(json.dumps(report, indent=2))

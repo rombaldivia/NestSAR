@@ -261,6 +261,134 @@ class NestedMemory(nn.Module):
         return out, eta, alpha, jnp.mean(jnp.abs(scale))
 
 
+# --------------------------------------------------------------------------- R6-HOPE temporal core
+# HOPE (Nested Learning, Behrouz et al., NeurIPS 2025) = self-modifying Titans + a continuum memory
+# system (CMS). Here: four levels with in-clip periods 1/2/4/8 (16, 8, 4, 2 steps); every level is a
+# HOPE block (local mixer -> self-referential memory -> CMS MLP), and in training the parameters of the
+# level with period p are updated every p optimizer steps (worker.make_optimizer).
+CMS_PERIODS = (1, 2, 4, 8)
+LEVEL_NAMES = ("m4", "l2", "g4", "l8")          # m4/g4 keep the R5 names (and their BiGRU local mixer)
+SELFREF_BETA = 0.10          # bounded residual read  M(x) = x + beta * tanh(A x)
+SELFREF_COMPONENT_RATE = 0.10  # component memories learn at 0.1 x the main-memory eta
+SELFREF_MATRIX_CAP = 4.0     # Frobenius cap of every component matrix (stability, not part of HOPE)
+SELFREF_VECTOR_CAP = 1.0
+SELFREF_MAIN_CAP = 8.0
+# LayerNorm epsilon of the HOPE blocks. Their inputs are already normalised (variance ~1), so 1e-2 is
+# negligible on data; on an all-zero (padding / empty) clip every activation is exactly 0 and the
+# default 1e-6 makes each of the ~12 chained LayerNorms amplify the backward pass by 1e3 (-> inf).
+HOPE_LN_EPS = 1e-2
+
+
+def _cap(x: jnp.ndarray, cap: float, axes) -> jnp.ndarray:
+    norm = jnp.sqrt(jnp.sum(jnp.square(x), axis=axes, keepdims=True) + EPS * EPS)
+    return x * jnp.minimum(1.0, cap / norm)
+
+
+class SelfRefMemory(nn.Module):
+    """Self-referential associative memory (HOPE / self-modifying Titans), small inner width d.
+
+    u_t = W_in LN(x_t) / sqrt(d). Every component is itself a memory, re-initialised per clip from a
+    learned (meta-learned) initial state and written in-context:
+        k_t = unit(u_t + beta tanh(A_k u_t))     v_t = u_t + beta tanh(A_v u_t)
+        q_t = unit(u_t + beta tanh(A_q u_t))     eta/alpha logits = a_eta . u_t, a_alpha . u_t
+    Main memory (Titans, L2 / delta rule, surprise s_t = rms(v_t - M k_t) also drives eta and alpha):
+        M <- M (alpha I - eta k k^T) + eta v k^T,       y_t = M q_t
+    Component memories (HOPE self-reference: each one generates its own value  v_hat = A v_t):
+        A <- A (alpha I - eta_c k k^T) + eta_c (A v_t) k^T,   eta_c = 0.1 eta   (same for a_eta, a_alpha)
+    eta in (0, 1), alpha in (0.5, 1); unit keys keep (alpha I - eta k k^T) non-expansive. Frobenius caps
+    on A / a / M are a stability addition (not in HOPE). Output: W_out y_t, [B, L, dim].
+    """
+
+    dim: int
+    inner: int = 32
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray):
+        d = self.inner
+        u = nn.Dense(d, use_bias=False, name="in_proj")(nn.LayerNorm(epsilon=HOPE_LN_EPS, name="in_norm")(x)) / np.sqrt(d)
+        comp0 = self.param("components0", lambda k, s: 0.12 * jax.random.normal(k, s) / np.sqrt(d),
+                           (3, d, d))                                   # A_k, A_v, A_q
+        gate0 = self.param("gates0", nn.initializers.zeros, (2, d))      # a_eta, a_alpha
+        main0 = self.param("memory0", nn.initializers.normal(0.01), (d, d))
+        surprise_w = self.param("surprise", nn.initializers.zeros, (2,))
+        bias = self.param("gate_bias", lambda *_: jnp.asarray([np.log(0.1 / 0.9), np.log(0.94 / 0.06)],
+                                                             jnp.float32), (2,))
+        b = x.shape[0]
+
+        def step(carry, u_t):
+            comp, gate, mem = carry                                       # [B,3,d,d] [B,2,d] [B,d,d]
+            r = u_t[:, None, :] + SELFREF_BETA * jnp.tanh(jnp.einsum("bcij,bj->bci", comp, u_t))
+            k, v, q = safe_unit(r[:, 0]), r[:, 1], safe_unit(r[:, 2])
+            pred = jnp.einsum("bij,bj->bi", mem, k)
+            err = v - pred
+            surprise = jnp.sqrt(jnp.maximum(jnp.mean(jnp.square(err), axis=-1), EPS * EPS))
+            logits = jnp.einsum("bci,bi->bc", gate, u_t) + surprise[:, None] * surprise_w + bias
+            eta = jax.nn.sigmoid(logits[:, 0])
+            alpha = 0.5 + 0.5 * jax.nn.sigmoid(logits[:, 1])
+            e3, a3 = eta[:, None, None], alpha[:, None, None]
+            # Titans main memory: M(alpha I - eta k k^T) + eta v k^T  ==  alpha M + eta (v - M k) k^T
+            mem = _cap(a3 * mem + e3 * jnp.einsum("bi,bj->bij", err, k), SELFREF_MAIN_CAP, (-2, -1))
+            y = jnp.einsum("bij,bj->bi", mem, q)
+            # self-reference: components regress onto their own reading of v_t (v_hat = A v_t)
+            ec = SELFREF_COMPONENT_RATE * eta
+            c_err = jnp.einsum("bcij,bj->bci", comp, v) - jnp.einsum("bcij,bj->bci", comp, k)
+            comp = _cap(alpha[:, None, None, None] * comp
+                        + ec[:, None, None, None] * jnp.einsum("bci,bj->bcij", c_err, k),
+                        SELFREF_MATRIX_CAP, (-2, -1))
+            g_err = jnp.einsum("bci,bi->bc", gate, v) - jnp.einsum("bci,bi->bc", gate, k)
+            gate = _cap(alpha[:, None, None] * gate + ec[:, None, None] * g_err[..., None] * k[:, None, :],
+                        SELFREF_VECTOR_CAP, (-1,))
+            return (comp, gate, mem), (y, eta, alpha)
+
+        carry0 = (jnp.broadcast_to(comp0[None], (b, 3, d, d)), jnp.broadcast_to(gate0[None], (b, 2, d)),
+                  jnp.broadcast_to(main0[None], (b, d, d)))
+        _, (ys, eta, alpha) = jax.lax.scan(step, carry0, jnp.swapaxes(u, 0, 1))
+        out = nn.Dense(self.dim, use_bias=False, name="out_proj")(jnp.swapaxes(ys, 0, 1))
+        return out, jnp.swapaxes(eta, 0, 1), jnp.swapaxes(alpha, 0, 1)
+
+
+class CMSMLP(nn.Module):
+    """CMS block of a HOPE level: LN(x + s * MLP(x)); its weights live in the level's update tier."""
+
+    dim: int
+    hidden: int
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        h = nn.Dense(self.dim, name="down")(nn.gelu(nn.Dense(self.hidden, name="up")(x)))
+        scale = self.param("mlp_scale", nn.initializers.constant(0.1), (self.dim,))
+        return nn.LayerNorm(epsilon=HOPE_LN_EPS, name="norm")(x + scale * h)
+
+
+class HopeLevel(nn.Module):
+    """One HOPE block: [BiGRU local mixer] -> memory (self-referential or R5 fast) -> [CMS MLP]."""
+
+    dim: int
+    local: bool
+    selfref: bool = True
+    mlp: bool = True
+    inner: int = 32
+    fast_rank: int = 8
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray):
+        base = Sweep(self.dim, bidirectional=True, name="base")(x) if self.local else x
+        if self.selfref:
+            reads, eta, alpha = SelfRefMemory(self.dim, self.inner, name="selfref")(base)
+        else:
+            reads, eta, alpha = FastMemory(self.dim, self.fast_rank, name="fast")(base)
+        scale = self.param("fast_scale", nn.initializers.constant(0.1), (self.dim,))
+        h = nn.LayerNorm(epsilon=HOPE_LN_EPS, name="norm")(base + scale * reads)
+        if self.mlp:
+            h = CMSMLP(self.dim, self.dim // 2, name="cms_mlp")(h)
+        return h, eta, alpha, jnp.mean(jnp.abs(scale))
+
+
+def chunk_mean(x: jnp.ndarray, period: int) -> jnp.ndarray:
+    b, t, d = x.shape
+    return x.reshape(b, t // period, period, d).mean(axis=2)
+
+
 def hand_shape(hands: jnp.ndarray) -> jnp.ndarray:
     """[..., 24] hand block -> [..., 14] scale-free hand-shape scalars."""
     feats = []
@@ -331,6 +459,12 @@ class NestSARR5T16(nn.Module):
     bidirectional_sweep: bool = True
     interaction: bool = True
     fast_mode: str = "surprise"
+    # R6-HOPE temporal core (temporal="r5" keeps R5 bit-for-bit).
+    temporal: str = "r5"
+    selfref: bool = True
+    cms_levels: bool = True
+    cms_mlp: bool = True
+    selfref_dim: int = 32
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = False) -> Mapping[str, jnp.ndarray]:
@@ -438,14 +572,32 @@ class NestSARR5T16(nn.Module):
         f = nn.LayerNorm(name="frame_norm")(nn.gelu(f))
         f = nn.Dropout(self.dropout)(f, deterministic=not training)                  # [B,T,D]
 
-        # ---- nested temporal memory: M4 over 16 segments, G4 over 4 chunks ----
-        m4, eta, alpha, fast_scale = NestedMemory(self.model_dim, self.fast_rank, self.fast_mode,
-                                                  name="m4")(f)
-        chunks = m4.reshape(b, 4, FRAMES // 4, self.model_dim).mean(axis=2)
-        g4, eta_g, alpha_g, fast_scale_g = NestedMemory(self.model_dim, self.fast_rank, self.fast_mode,
-                                                        name="g4")(chunks)
-        m4_mean = m4.mean(axis=1)
-        desc = nn.Dense(self.model_dim, name="descriptor")(jnp.concatenate([m4_mean, g4.mean(axis=1)], -1))
+        if self.temporal == "r5":
+            # ---- nested temporal memory: M4 over 16 segments, G4 over 4 chunks ----
+            m4, eta, alpha, fast_scale = NestedMemory(self.model_dim, self.fast_rank, self.fast_mode,
+                                                      name="m4")(f)
+            chunks = m4.reshape(b, 4, FRAMES // 4, self.model_dim).mean(axis=2)
+            g4, eta_g, alpha_g, fast_scale_g = NestedMemory(self.model_dim, self.fast_rank, self.fast_mode,
+                                                            name="g4")(chunks)
+            level_means = [m4.mean(axis=1), g4.mean(axis=1)]
+        elif self.temporal == "hope":
+            # ---- HOPE continuum: nested chain of levels, period 1 -> 2 -> 4 -> 8 (16/8/4/2 steps) ----
+            level = lambda name, local: HopeLevel(self.model_dim, local, self.selfref, self.cms_mlp,
+                                                  self.selfref_dim, self.fast_rank, name=name)
+            m4, eta, alpha, fast_scale = level("m4", True)(f)
+            level_means = [m4.mean(axis=1)]
+            if self.cms_levels:
+                l2, _, _, _ = level("l2", False)(chunk_mean(m4, 2))
+                g4, eta_g, alpha_g, fast_scale_g = level("g4", True)(chunk_mean(l2, 2))
+                l8, _, _, _ = level("l8", False)(chunk_mean(g4, 2))
+                level_means += [l2.mean(axis=1), g4.mean(axis=1), l8.mean(axis=1)]
+            else:
+                g4, eta_g, alpha_g, fast_scale_g = level("g4", True)(chunk_mean(m4, 4))
+                level_means += [g4.mean(axis=1)]
+        else:
+            raise ValueError(f"Unknown temporal core {self.temporal!r}")
+        m4_mean = level_means[0]
+        desc = nn.Dense(self.model_dim, name="descriptor")(jnp.concatenate(level_means, -1))
         desc = nn.LayerNorm(name="descriptor_norm")(nn.gelu(desc))
         desc = nn.Dropout(self.dropout)(desc, deterministic=not training)
         logits = nn.Dense(NUM_CLASSES, name="classifier")(desc)

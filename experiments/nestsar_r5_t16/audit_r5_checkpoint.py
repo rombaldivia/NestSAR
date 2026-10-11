@@ -11,7 +11,7 @@ Per protocol, on the full official validation split (inference only, no training
   calibration      confidence of right vs wrong predictions
   counterfactuals  one change at a time on the trained weights:
                      hand_zeroed       hand block set to 0 (the model sees only R4 tokens)
-                     fast_scale_zero   fast-memory residual removed (M4 and G4)
+                     fast_scale_zero   fast/self-referential memory residual removed (every level)
                      fast_frozen       eta = 0, alpha = 1: fast memory read-only at its S0
                      pair_message_off  person-to-person message scale = 0
                    A drop is a counterfactual on a model trained WITH the component; it is
@@ -53,7 +53,7 @@ def counterfactual_params(params, mode):
         return params
     p = copy.deepcopy(params)
     if mode == "fast_scale_zero":
-        for level in ("m4", "g4"):
+        for level in ("m4", "l2", "g4", "l8"):          # l2 / l8 exist only in the HOPE variants
             if level in p and "fast_scale" in p[level]:
                 p[level]["fast_scale"] = np.zeros_like(np.asarray(p[level]["fast_scale"]))
         return p

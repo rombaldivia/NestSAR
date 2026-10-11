@@ -16,6 +16,7 @@ import math
 import time
 from contextlib import closing
 from pathlib import Path
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -29,7 +30,7 @@ from experiments.nestsar_sm_all_t16.streaming.io_utils import Reporter, atomic_b
 
 from . import MODEL_IDENTITY as BASE_IDENTITY, MODEL_NAME, VERSION
 from .mixing import mix_batch
-from .config import model_kwargs, validate_config
+from .config import OUTER_CMS_PERIODS, model_kwargs, validate_config
 from .data import Dataset
 from .model import NUM_CLASSES, NestSARR5T16
 from .preprocessing import FEATURES, FRAMES, VERSION as PREPROCESSING_VERSION
@@ -43,6 +44,10 @@ EXPECTED_PARAMS = {
     "no_interaction": 1_131_072,
     "capped_fast_memory": 1_146_296,
     "no_fast_memory": 1_135_736,
+    "hope": 1_389_992,
+    "hope_no_selfref": 1_346_600,
+    "hope_no_levels": 1_231_888,
+    "hope_no_mlp": 1_262_920,
 }
 # Strict MFLOPs per clip (jaxpr dot MACs x 2, scan bodies x length, batch 1).
 STRICT_MFLOPS = {
@@ -53,6 +58,10 @@ STRICT_MFLOPS = {
     "no_interaction": 58.31232,
     "capped_fast_memory": 59.161216,
     "no_fast_memory": 58.865536,
+    "hope": 62.45696,
+    "hope_no_selfref": 61.29152,
+    "hope_no_levels": 61.177216,
+    "hope_no_mlp": 60.5984,
 }
 
 # R4-FMSE+Geometry per-class recall of its weakest classes (EXPERIMENT_REPORT, best checkpoints).
@@ -185,18 +194,72 @@ def build_steps(model, config):
     return train_step, eval_step, predict_step
 
 
+class DMGDState(NamedTuple):
+    momentum: object
+    projection: object
+
+
+def dmgd_l2(momentum=0.90, memory_lr=0.01, mix=0.10, cap=2.0, eps=1e-6):
+    """Optimizer as an associative memory (HOPE's deep momentum GD, diagonal L2 form, as in NestSAR-HOPE v4.1).
+
+    Per parameter, a diagonal predictor p maps the gradient to the momentum: pred = tanh(p) g. It is
+    written with a normalised L2 / delta rule, p <- clip(p - lr_m (pred - m) g / (g^2 + eps)), and the
+    gradient passed on is g + mix * pred. Training-only state; zero inference parameters.
+    """
+    def init_fn(params):
+        zeros = jax.tree.map(jnp.zeros_like, params)
+        return DMGDState(momentum=zeros, projection=zeros)
+
+    def update_fn(updates, state, params=None):
+        del params
+        m = jax.tree.map(lambda m_, g: momentum * m_ + (1 - momentum) * g, state.momentum, updates)
+        pred = jax.tree.map(lambda p, g: jnp.tanh(p) * g, state.projection, updates)
+        proj = jax.tree.map(lambda p, g, pr, t: jnp.clip(p - memory_lr * (pr - t) * g / (jnp.square(g) + eps),
+                                                         -cap, cap),
+                            state.projection, updates, pred, m)
+        out = jax.tree.map(lambda g, pr: g + mix * pr, updates, pred)
+        return out, DMGDState(momentum=m, projection=proj)
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+def tier_labels(params):
+    """Outer-CMS tier of every parameter: the period of its temporal level, 1 for everything else."""
+    return {name: jax.tree.map(lambda _: f"p{OUTER_CMS_PERIODS.get(name, 1)}", sub)
+            for name, sub in params.items()}
+
+
+def make_optimizer(config, schedule, params):
+    """R5: clip + AdamW. HOPE: optional DMGD-L2 and outer CMS (tier p updated every p steps, mean grad)."""
+    def inner(period):
+        sched = schedule if period == 1 else (lambda count: schedule(count * period))
+        parts = []
+        if config["dmgd"]:
+            parts.append(dmgd_l2(config["dmgd_momentum"], config["dmgd_memory_lr"], config["dmgd_mix"],
+                                 config["dmgd_cap"]))
+        parts += [optax.clip_by_global_norm(config["grad_clip"]),
+                  optax.adamw(sched, weight_decay=config["weight_decay"])]
+        return optax.chain(*parts)
+
+    if not config["outer_cms"]:
+        return inner(1)
+    periods = sorted({OUTER_CMS_PERIODS.get(name, 1) for name in params})
+    transforms = {f"p{p}": inner(p) if p == 1 else
+                  optax.MultiSteps(inner(p), every_k_schedule=p, use_grad_mean=True) for p in periods}
+    return optax.multi_transform(transforms, tier_labels(params))
+
+
 def create_state(config, steps_per_epoch):
     total = config["epochs"] * steps_per_epoch
     warm = max(1, int(total * config["warmup_fraction"]))
     warm = min(warm, max(total - 1, 1))
     schedule = optax.warmup_cosine_decay_schedule(
         0, config["learning_rate"], warm, max(total, warm + 1), end_value=config["min_learning_rate"])
-    optimizer = optax.chain(optax.clip_by_global_norm(config["grad_clip"]),
-                            optax.adamw(schedule, weight_decay=config["weight_decay"]))
     model = make_model(config)
     key, init = jax.random.split(jax.random.PRNGKey(config["seed"]))
     params = model.init({"params": init, "dropout": init},
                         jnp.zeros((1, FRAMES, FEATURES), jnp.float32), training=False)["params"]
+    optimizer = make_optimizer(config, schedule, params)
     count = sum(x.size for x in jax.tree.leaves(params))
     expected = EXPECTED_PARAMS[config["variant"]]
     if count != expected:

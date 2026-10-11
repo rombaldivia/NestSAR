@@ -283,3 +283,49 @@ run that shares cache, strength, seed and view range. Trade-off: K finite views 
 
     python -m experiments.nestsar_r5_t16.kaggle_run --aug-pool /tmp/NestSAR_AUGPOOL --pool-views 8 --epochs 38 \
         --extra-config '{"aug_strength": 1.0}'
+
+## R6-HOPE: a HOPE temporal core on the R5 front end (branch `experiment/nestsar-r6-hope`)
+
+The R5 front end (early-fused joints, bidirectional joint sweep, 14 parts, 4x-rate hand branch,
+person-person interaction) is unchanged; the temporal core becomes HOPE-style (Nested Learning,
+self-modifying Titans + continuum memory system). `--variant full` is bit-for-bit R5 (tested).
+
+| HOPE element | R5 | R6-HOPE |
+|---|---|---|
+| Titans memory written in-clip, surprise-gated | yes | yes |
+| Self-referential memory: K, V, Q, eta, alpha and the main memory all self-modify | no | **yes** (`SelfRefMemory`) |
+| CMS levels by frequency, in the clip | 2 levels (1, 4) | **4 levels, periods 1/2/4/8** (16/8/4/2 steps, nested chain) |
+| HOPE block = memory + CMS MLP | no | **yes** (`HopeLevel` = BiGRU local mixer -> memory -> MLP) |
+| CMS in training: level with period p updated every p optimizer steps | no | **yes** (`outer_cms`, mean gradient of the window) |
+| Optimizer as associative memory (DMGD, diagonal L2) | no | **yes** (`dmgd`, training-only) |
+| Own L2 objective per memory (delta rule in-clip) | main only | **every component** |
+
+Update rules (per token t, `SelfRefMemory`, inner width d = 32):
+
+    k = unit(M_k(u)),  v = M_v(u),  q = unit(M_q(u)),  M_c(u) = u + 0.1 tanh(A_c u)
+    eta = sigmoid(a_eta.u + w s + b),  alpha = 0.5 + 0.5 sigmoid(a_alpha.u + w' s + b'),  s = rms(v - M k)
+    main:        M   <- M (alpha I - eta k k^T) + eta v k^T          read y = M q
+    components:  A_c <- A_c (alpha I - eta_c k k^T) + eta_c (A_c v) k^T,   eta_c = 0.1 eta   (same for a_eta, a_alpha)
+    outer CMS:   theta_level(p) <- AdamW step on mean grad of the last p steps, every p steps
+    DMGD-L2:     pred = tanh(P) g,  P <- clip(P - lr_m (pred - m) g / (g^2 + eps)),  g' = g + 0.1 pred
+
+Not HOPE, added for stability: bounded residual reads, unit keys/queries, Frobenius caps
+(4 / 1 / 8), component rate 0.1 x eta; tier-wise gradient clipping when `outer_cms` is on.
+
+Cost (strict counter, batch 1):
+
+| Variant | Params | Strict MFLOPs |
+|---|---:|---:|
+| full (R5) | 1,146,656 | 59.16 |
+| **hope** | **1,389,992** | **62.46** |
+| hope_no_selfref (R5 fast memory in every level) | 1,346,600 | 61.29 |
+| hope_no_levels (only periods 1 and 4) | 1,231,888 | 61.18 |
+| hope_no_mlp | 1,262,920 | 60.60 |
+
+`outer_cms` and `dmgd` are optimizer keys (`"auto"` = on for `hope*`); ablate them with
+`--extra-config '{"outer_cms": false}'` / `'{"dmgd": false}'`. Same data, pool and launcher as R5:
+
+```python
+# in the AUGPOOL launch cell: BRANCH = "experiment/nestsar-r6-hope", new OUT, and add
+"--variant", "hope",
+```

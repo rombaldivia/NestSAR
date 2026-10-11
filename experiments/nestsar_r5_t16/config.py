@@ -28,7 +28,17 @@ VARIANTS = {
     "no_interaction": {"interaction": False},
     "capped_fast_memory": {"fast_mode": "capped"},
     "no_fast_memory": {"fast_mode": "off"},
+    # R6-HOPE: R5 front end + HOPE temporal core (self-referential memories, CMS levels 1/2/4/8,
+    # CMS MLPs). Outer multi-frequency updates and DMGD-L2 are optimizer keys (outer_cms / dmgd,
+    # "auto" = on for hope* variants). Each hope_no_* removes exactly one HOPE component.
+    "hope": {"temporal": "hope"},
+    "hope_no_selfref": {"temporal": "hope", "selfref": False},
+    "hope_no_levels": {"temporal": "hope", "cms_levels": False},
+    "hope_no_mlp": {"temporal": "hope", "cms_mlp": False},
 }
+
+# Outer CMS: parameter tier of each temporal level = its in-clip period (optimizer steps per update).
+OUTER_CMS_PERIODS = {"m4": 1, "l2": 2, "g4": 4, "l8": 8}
 
 DEFAULTS = {k: v for k, v in r4_launch.DEFAULTS.items() if k not in R4_MODEL_KEYS}
 DEFAULTS.update(MODEL_DEFAULTS)
@@ -36,6 +46,9 @@ DEFAULTS.update(variant="full", early_stop_guard_epoch=14)
 # Strong training-only augmentation (preprocessing.strong_augmented_features). 0 = the R4 recipe
 # (yaw +-8 deg and +-1 frame boundary jitter on one augmented view).
 DEFAULTS.update(aug_strength=0.0, aug_clean_prob=0.2, prefetch_workers=1, hand_filter="none", aug_view_degrees=15.0, body_align="none", mix_prob=0.0, aug_pool="")
+# HOPE optimizer side: "auto" = on for hope* variants, off otherwise (R5 keeps its exact optimizer).
+DEFAULTS.update(outer_cms="auto", dmgd="auto", dmgd_momentum=0.90, dmgd_memory_lr=0.01, dmgd_mix=0.10,
+                dmgd_cap=2.0)
 
 
 def validate_config(config):
@@ -73,6 +86,18 @@ def validate_config(config):
         raise ValueError("aug_pool needs aug_strength > 0 (it replaces the live strong augmentation)")
     if c["prefetch_workers"] not in (1, 2, 3, 4):
         raise ValueError("prefetch_workers must be 1..4")
+    hope = c["variant"].startswith("hope")
+    for key in ("outer_cms", "dmgd"):
+        if c[key] == "auto":
+            c[key] = hope
+        if not isinstance(c[key], bool):
+            raise ValueError(f"{key} must be true, false or \"auto\"")
+    if not 0 <= c["dmgd_momentum"] < 1:
+        raise ValueError("dmgd_momentum must be in [0, 1)")
+    if not 0 <= c["dmgd_mix"] <= 0.5:
+        raise ValueError("dmgd_mix must be in [0, 0.5]")
+    if not (c["dmgd_memory_lr"] > 0 and c["dmgd_cap"] > 0):
+        raise ValueError("dmgd_memory_lr and dmgd_cap must be > 0")
     return c
 
 
