@@ -238,6 +238,76 @@ class FastMemory(nn.Module):
         return jnp.swapaxes(reads, 0, 1), jnp.swapaxes(eta, 0, 1), jnp.swapaxes(alpha, 0, 1)
 
 
+def _skeleton_hops(parents, max_hop=6):
+    """[V,V] hop distance on the NTU kinematic tree, clipped at max_hop."""
+    v = len(parents)
+    adj = np.zeros((v, v), bool)
+    for j, q in enumerate(parents):
+        if j != q:
+            adj[j, q] = adj[q, j] = True
+    hops = np.full((v, v), max_hop, np.int32)
+    for src in range(v):
+        hops[src, src] = 0
+        frontier, seen, d = [src], {src}, 0
+        while frontier and d < max_hop:
+            d += 1
+            nxt = []
+            for a in frontier:
+                for b in np.flatnonzero(adj[a]):
+                    if b not in seen:
+                        seen.add(b); hops[src, b] = d; nxt.append(b)
+            frontier = nxt
+    return hops
+
+
+SKELETON_HOPS = _skeleton_hops(PARENTS)
+_A = (SKELETON_HOPS <= 1).astype(np.float32)                         # self + bone neighbours
+SKELETON_ADJ = (_A / np.sqrt(np.outer(_A.sum(1), _A.sum(1)))).astype(np.float32)   # D^-1/2 A D^-1/2
+
+
+class GraphMix(nn.Module):
+    """Spatial mixer over the 25 joints of a frame: fixed normalised skeleton adjacency plus a learned
+    residual adjacency (zero-init, lets e.g. the two hands talk), then a pointwise Dense; `layers` residual
+    blocks. Parallel over joints (no recurrence). x: [N,V,C] in NTU joint order, invalid joints = 0."""
+
+    layers: int = 2
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, valid: jnp.ndarray) -> jnp.ndarray:
+        vf = valid[..., None].astype(x.dtype)
+        for i in range(self.layers):
+            learned = self.param(f"adj_{i}", nn.initializers.zeros, SKELETON_ADJ.shape)
+            mixed = jnp.einsum("uv,nvc->nuc", jnp.asarray(SKELETON_ADJ) + learned, x * vf)
+            y = nn.Dense(x.shape[-1], name=f"mix_{i}")(mixed)
+            x = nn.LayerNorm(name=f"norm_{i}")(x + nn.gelu(y)) * vf
+        return x
+
+
+class SkeletonAttention(nn.Module):
+    """Single-head attention over the 25 joints with a learned bias per skeleton hop distance
+    (Graphormer-style), then a pointwise feed-forward; both residual. Missing joints are never attended."""
+
+    qk_dim: int = 16
+    max_hop: int = 6
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, valid: jnp.ndarray) -> jnp.ndarray:
+        c = x.shape[-1]
+        vf = valid[..., None].astype(x.dtype)
+        h = nn.LayerNorm(name="norm_in")(x)
+        qk = nn.Dense(2 * self.qk_dim, name="qk")(h)
+        q, k = qk[..., :self.qk_dim], qk[..., self.qk_dim:]
+        hop_bias = self.param("hop_bias", nn.initializers.zeros, (self.max_hop + 1,))
+        bias = jnp.take(hop_bias, jnp.asarray(np.minimum(SKELETON_HOPS, self.max_hop)))      # [V,V]
+        scores = jnp.einsum("nud,nvd->nuv", q, k) / np.sqrt(self.qk_dim) + bias
+        scores = jnp.where(valid[:, None, :], scores, -1e9)
+        attn = jax.nn.softmax(scores, axis=-1)
+        y = nn.Dense(c, name="out")(jnp.einsum("nuv,nvc->nuc", attn, h))
+        x = (x + y) * vf
+        y = nn.Dense(c, name="ffn")(nn.gelu(nn.LayerNorm(name="norm_ffn")(x)))
+        return nn.LayerNorm(name="norm_out")(x + y) * vf
+
+
 class NestedMemory(nn.Module):
     """BiMemory (GRU fwd/bwd) + self-modifying fast memory with a learnable layer scale."""
 
@@ -598,6 +668,11 @@ class NestSARR5T16(nn.Module):
     # tokens of masked segments. Parameters always exist; the head runs only when training=True, so the
     # inference graph (and its strict FLOPs) is exactly the base model's.
     masked_recon: bool = False
+    # R8: spatial mixer of the joints in a frame ("sweep" = R5 BiGRU chain, "graph", "attn") and an optional
+    # second residual BiGRU over the 16 segments after m4 (temporal_stack=2, hidden stack_hidden).
+    spatial_mixer: str = "sweep"
+    temporal_stack: int = 1
+    stack_hidden: int = 176
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = False) -> Mapping[str, jnp.ndarray]:
@@ -643,11 +718,20 @@ class NestSARR5T16(nn.Module):
         e = nn.gelu(e + joint_embed + person_embed[:, None, :]) * jv
 
         # ---- (bi)directional sweep over the joints of each person and segment ----
-        order = jnp.asarray(JOINT_ORDER)
-        inverse = jnp.asarray(np.argsort(JOINT_ORDER))
-        seq = jnp.take(e, order, axis=3).reshape(b * FRAMES * PERSONS, JOINTS, self.spatial_dim)
-        seq = Sweep(self.spatial_hidden, bidirectional=self.bidirectional_sweep, name="joint_sweep")(seq)
-        s = jnp.take(seq.reshape(b, FRAMES, PERSONS, JOINTS, self.spatial_dim), inverse, axis=3) * jv
+        if self.spatial_mixer == "sweep":
+            order = jnp.asarray(JOINT_ORDER)
+            inverse = jnp.asarray(np.argsort(JOINT_ORDER))
+            seq = jnp.take(e, order, axis=3).reshape(b * FRAMES * PERSONS, JOINTS, self.spatial_dim)
+            seq = Sweep(self.spatial_hidden, bidirectional=self.bidirectional_sweep, name="joint_sweep")(seq)
+            s = jnp.take(seq.reshape(b, FRAMES, PERSONS, JOINTS, self.spatial_dim), inverse, axis=3) * jv
+        elif self.spatial_mixer in ("graph", "attn"):
+            flat = e.reshape(b * FRAMES * PERSONS, JOINTS, self.spatial_dim)
+            fv = joint_valid.reshape(b * FRAMES * PERSONS, JOINTS)
+            mixer = GraphMix(name="joint_graph") if self.spatial_mixer == "graph" else \
+                SkeletonAttention(name="joint_attn")
+            s = mixer(flat, fv).reshape(b, FRAMES, PERSONS, JOINTS, self.spatial_dim) * jv
+        else:
+            raise ValueError(f"Unknown spatial_mixer {self.spatial_mixer!r}")
 
         # ---- parts: thumb and hand tip are not averaged with the wrist ----
         parts = jnp.asarray(part_matrix(FOURTEEN_PARTS if self.fine_parts else TEN_PARTS))
@@ -711,6 +795,10 @@ class NestSARR5T16(nn.Module):
             # ---- nested temporal memory: M4 over 16 segments, G4 over 4 chunks ----
             m4, eta, alpha, fast_scale = NestedMemory(self.model_dim, self.fast_rank, self.fast_mode,
                                                       name="m4")(f)
+            if self.temporal_stack == 2:      # second residual BiGRU over the 16 segments
+                m4 = Sweep(self.stack_hidden, bidirectional=True, name="m4_stack")(m4)
+            elif self.temporal_stack != 1:
+                raise ValueError("temporal_stack must be 1 or 2")
             chunks = m4.reshape(b, 4, FRAMES // 4, self.model_dim).mean(axis=2)
             g4, eta_g, alpha_g, fast_scale_g = NestedMemory(self.model_dim, self.fast_rank, self.fast_mode,
                                                             name="g4")(chunks)

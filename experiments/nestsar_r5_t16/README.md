@@ -406,3 +406,18 @@ same dropout key chain and loss (the per-sample loss now lives in `worker.make_l
 
 Tests: `tests/test_masked_recon.py` (unchanged inference logits, no recon output at eval, recon loss
 adds and trains only the head, finite gradients on empty clips, base loss independent of recon keys).
+
+## R8: parallel spatial mixers + second temporal BiGRU (`graph2_mr`, `attn2_mr`)
+
+Strict FLOP breakdown of R5 `full` (59.16 MFLOPs): `joint_sweep` 29.49 (50%), `m4` 14.11 (24%),
+`person_proj` 4.45, `g4` 3.53, `hand_sweep` 2.46, rest 5.1. The joint sweep is a BiGRU along a fixed chain
+of the 25 joints (sequential, with false neighbours at limb boundaries). R8 replaces it with a parallel mixer
+and spends the saving on a second residual BiGRU over the 16 segments after `m4` (hidden 176):
+
+| variant | spatial mixer | MFLOPs | params (incl. 166,734 training-only recon head) |
+|---|---|---|---|
+| `graph2_mr` | `GraphMix`: 2 blocks of (normalised skeleton adjacency + learned zero-init residual adjacency) then Dense, residual + LN | 54.76 | 1,736,016 |
+| `attn2_mr` | `SkeletonAttention`: 1 head (qk 16) with a learned bias per skeleton hop distance (0..6), residual FFN | 55.94 | 1,736,437 |
+
+Both keep masked reconstruction. Missing joints are never mixed or attended (tested: garbage on missing joints
+does not change valid outputs). Tests: `tests/test_spatial_mixers.py`.

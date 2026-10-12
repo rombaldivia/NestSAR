@@ -56,6 +56,8 @@ EXPECTED_PARAMS = {
     # +166,734 training-only reconstruction head (absent from the inference graph).
     "full_mr": 1_313_390,
     "hope_mr": 1_556_726,
+    "graph2_mr": 1_736_016,
+    "attn2_mr": 1_736_437,
 }
 # Strict MFLOPs per clip (jaxpr dot MACs x 2, scan bodies x length, batch 1).
 STRICT_MFLOPS = {
@@ -77,6 +79,8 @@ STRICT_MFLOPS = {
     "hope_core_wide": 64.202048,
     "full_mr": 59.161216,
     "hope_mr": 62.45696,
+    "graph2_mr": 54.760064,
+    "attn2_mr": 55.937664,
 }
 
 # R4-FMSE+Geometry per-class recall of its weakest classes (EXPERIMENT_REPORT, best checkpoints).
