@@ -52,6 +52,10 @@ VARIANTS.update({
     "hope_core_wide": dict(_CORE, memory_bidir=True, part_attention=True, cms_chain_div=2),
 })
 
+# R7: training-only masked reconstruction on top of R5 (zero inference cost; see worker.build_steps).
+VARIANTS["full_mr"] = {"masked_recon": True}
+VARIANTS["hope_mr"] = {"temporal": "hope", "masked_recon": True}
+
 # Outer CMS: parameter tier of each temporal level = its in-clip period (optimizer steps per update).
 # Inside a level, a CMS-chain MLP named mlp_p<f> uses its own period f instead.
 OUTER_CMS_PERIODS = {"m4": 1, "l2": 2, "g4": 4, "l8": 8}
@@ -65,6 +69,9 @@ DEFAULTS.update(aug_strength=0.0, aug_clean_prob=0.2, prefetch_workers=1, hand_f
 # HOPE optimizer side: "auto" = on for hope* variants, off otherwise (R5 keeps its exact optimizer).
 DEFAULTS.update(outer_cms="auto", dmgd="auto", dmgd_momentum=0.90, dmgd_memory_lr=0.01, dmgd_mix=0.10,
                 dmgd_cap=2.0)
+# Masked reconstruction (only used by variants with masked_recon): fraction of the 16 segments of the
+# augmented view zeroed at the input, and the weight of the relative-MSE reconstruction loss.
+DEFAULTS.update(recon_weight=0.5, recon_mask_ratio=0.3)
 
 
 def validate_config(config):
@@ -112,6 +119,10 @@ def validate_config(config):
         raise ValueError("dmgd_momentum must be in [0, 1)")
     if not 0 <= c["dmgd_mix"] <= 0.5:
         raise ValueError("dmgd_mix must be in [0, 0.5]")
+    if not 0 <= c["recon_weight"] <= 5:
+        raise ValueError("recon_weight must be in [0, 5]")
+    if not 0 < c["recon_mask_ratio"] < 1:
+        raise ValueError("recon_mask_ratio must be in (0, 1)")
     if not (c["dmgd_memory_lr"] > 0 and c["dmgd_cap"] > 0):
         raise ValueError("dmgd_memory_lr and dmgd_cap must be > 0")
     return c

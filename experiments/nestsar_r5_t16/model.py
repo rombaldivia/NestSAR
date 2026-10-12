@@ -594,6 +594,10 @@ class NestSARR5T16(nn.Module):
     cms_chain_div: int = 4         # CMS-chain MLP hidden = model_dim // cms_chain_div
     part_attention: bool = False   # spatial attention over the 28 part tokens of a frame (tokenizer)
     part_attn_dim: int = 16
+    # Masked reconstruction (training-only): a linear head on the per-segment states rebuilds the input
+    # tokens of masked segments. Parameters always exist; the head runs only when training=True, so the
+    # inference graph (and its strict FLOPs) is exactly the base model's.
+    masked_recon: bool = False
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = False) -> Mapping[str, jnp.ndarray]:
@@ -735,6 +739,12 @@ class NestSARR5T16(nn.Module):
         else:
             raise ValueError(f"Unknown temporal core {self.temporal!r}")
         m4_mean = level_means[0]
+        frame_recon = None
+        if self.masked_recon:
+            recon_w = self.param("recon_w", nn.initializers.lecun_normal(), (self.model_dim, FEATURES))
+            recon_b = self.param("recon_b", nn.initializers.zeros, (FEATURES,))
+            if training:
+                frame_recon = m4 @ recon_w + recon_b                                   # [B,T,F]
         desc = nn.Dense(self.model_dim, name="descriptor")(jnp.concatenate(level_means, -1))
         desc = nn.LayerNorm(name="descriptor_norm")(nn.gelu(desc))
         desc = nn.Dropout(self.dropout)(desc, deterministic=not training)
@@ -742,7 +752,8 @@ class NestSARR5T16(nn.Module):
         stream_logits.insert(0, nn.Dense(NUM_CLASSES, name="m4_aux_head")(m4_mean))
 
         ones = jnp.ones((b,), dtype)
-        return {
+        extra = {} if frame_recon is None else {"frame_recon": frame_recon}
+        return {**extra,
             "logits": logits,
             "main_logits": logits,
             "stream_logits": jnp.stack(stream_logits, axis=1),     # [B, S_aux, C] training-only heads

@@ -53,6 +53,9 @@ EXPECTED_PARAMS = {
     "hope_core_attn": 773_504,
     "hope_core_bi_attn": 774_208,
     "hope_core_wide": 1_022_720,
+    # +166,734 training-only reconstruction head (absent from the inference graph).
+    "full_mr": 1_313_390,
+    "hope_mr": 1_556_726,
 }
 # Strict MFLOPs per clip (jaxpr dot MACs x 2, scan bodies x length, batch 1).
 STRICT_MFLOPS = {
@@ -72,6 +75,8 @@ STRICT_MFLOPS = {
     "hope_core_attn": 54.429248,
     "hope_core_bi_attn": 60.484928,
     "hope_core_wide": 64.202048,
+    "full_mr": 59.161216,
+    "hope_mr": 62.45696,
 }
 
 # R4-FMSE+Geometry per-class recall of its weakest classes (EXPERIMENT_REPORT, best checkpoints).
@@ -119,13 +124,22 @@ def ce(logits, labels, smoothing, labels2=None, lam=None):
     return -jnp.sum(target * jax.nn.log_softmax(logits), axis=-1)
 
 
-def build_steps(model, config):
-    n_metrics = len(TRAIN_METRICS)
+def make_loss(model, config):
+    """Per-sample training metrics [B, len(TRAIN_METRICS)] (column 0 = loss) for one micro-batch."""
+    use_mr = bool(getattr(model, "masked_recon", False)) and config["recon_weight"] > 0
 
     def per_sample(params, key, batch):
-        k1, k2 = jax.random.split(key)
+        k1, k2 = jax.random.split(key)          # unchanged key chain for every non-MR variant
+        if use_mr:
+            k2, k3 = jax.random.split(k2)
         out = model.apply({"params": params}, batch["x"], training=True, rngs={"dropout": k1})
-        aug = model.apply({"params": params}, batch["xa"], training=True, rngs={"dropout": k2})
+        xa = batch["xa"]
+        if use_mr:   # zero a random subset of the augmented view's segments; rebuild them from context
+            seg_mask = jax.random.bernoulli(k3, config["recon_mask_ratio"], xa.shape[:2]).astype(xa.dtype)
+            xa_in = xa * (1 - seg_mask)[..., None]
+        else:
+            xa_in = xa
+        aug = model.apply({"params": params}, xa_in, training=True, rngs={"dropout": k2})
         y, smooth = batch["y"], config["label_smoothing"]
         y2, lam = batch["y2"], batch["lam"]
         main = (ce(out["logits"], y, smooth, y2, lam) + ce(aug["logits"], y, smooth, y2, lam)) / 2
@@ -136,6 +150,11 @@ def build_steps(model, config):
         logq = jax.nn.log_softmax(aug["logits"] / temperature)
         kl = 0.5 * temperature ** 2 * jnp.sum((jnp.exp(logp) - jnp.exp(logq)) * (logp - logq), -1)
         loss = main + config["stream_aux_weight"] * aux + config["consistency_weight"] * kl
+        if use_mr:   # relative MSE on the masked segments only (scale-free across clips)
+            err = jnp.mean((aug["frame_recon"] - xa) ** 2, axis=-1)                 # [B,T]
+            power = jnp.mean(xa ** 2, axis=-1)
+            loss = loss + config["recon_weight"] * (jnp.sum(err * seg_mask, 1)
+                                                    / (jnp.sum(power * seg_mask, 1) + 1e-3))
         hit = lambda logits: (logits.argmax(-1) == y).astype(jnp.float32)
         sl = out["stream_logits"]
         hand_acc = hit(sl[:, 1]) if sl.shape[1] > 1 else jnp.zeros_like(main)
@@ -146,6 +165,14 @@ def build_steps(model, config):
             out["fast_scale_m4"], out["fast_scale_g4"], out["pair_scale"], hit(sl[:, 0]), hand_acc,
         ], axis=-1)
         return metrics
+
+    return per_sample
+
+
+def build_steps(model, config):
+    n_metrics = len(TRAIN_METRICS)
+
+    per_sample = make_loss(model, config)
 
     @jax.jit
     def train_step(state, key, batch):
