@@ -391,3 +391,18 @@ does updating the slow levels every 4 / 8 steps reduce forgetting? Report the fi
 | hope_core_attn | 773,504 | 54.43 |
 | **hope_core_bi_attn** | **774,208** | **60.48** |
 | hope_core_wide (bi + attn + 2x CMS chain) | 1,022,720 | 64.20 |
+
+## R7: masked reconstruction (`full_mr`, `hope_mr`)
+
+Training-only auxiliary task on top of R5 / HOPE. In every training step 30% of the 16 segments of the
+augmented view are zeroed at the input (`recon_mask_ratio`), and a linear head on the per-segment
+states (`m4`, `[B,16,176]`) rebuilds their full 942-dim tokens. Loss: relative MSE on the masked
+segments only, weight `recon_weight` = 0.5. The head (`recon_w`, `recon_b`, 166,734 params) is
+created at init but applied only when `training=True`, so the inference graph, logits and strict
+FLOPs are exactly the base model's (`full_mr` 59.161216 MFLOPs = `full`). Non-MR variants keep the
+same dropout key chain and loss (the per-sample loss now lives in `worker.make_loss`).
+
+    python -m experiments.nestsar_r5_t16.kaggle_run --variant full_mr --protocols xsub ...
+
+Tests: `tests/test_masked_recon.py` (unchanged inference logits, no recon output at eval, recon loss
+adds and trains only the head, finite gradients on empty clips, base loss independent of recon keys).
