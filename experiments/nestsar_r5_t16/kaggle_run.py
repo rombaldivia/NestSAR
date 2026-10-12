@@ -118,6 +118,27 @@ print(json.dumps({"jax": jax.__version__, "flax": flax.__version__, "optax": opt
 """
 
 
+TPU_PROBE = """
+import json, jax, jax.numpy as jnp, flax, optax
+assert jax.default_backend() == "tpu", f"JAX backend is {jax.default_backend()}, not tpu"
+float(jnp.ones((256, 256)).sum().block_until_ready())
+print(json.dumps({"jax": jax.__version__, "flax": flax.__version__, "optax": optax.__version__,
+                  "devices": jax.local_device_count(), "kind": jax.devices()[0].device_kind}))
+"""
+
+
+def tpu_runtime_ok():
+    """JAX must see the TPU chips (one process owns them all); fail before building caches."""
+    env = dict(os.environ, PYTHONPATH=str(REPO), JAX_PLATFORMS="tpu", CUDA_VISIBLE_DEVICES="",
+               TF_CPP_MIN_LOG_LEVEL="2")
+    r = subprocess.run([sys.executable, "-c", TPU_PROBE], cwd=REPO, env=env, capture_output=True,
+                       text=True, timeout=900)
+    if r.returncode != 0:
+        raise SystemExit("JAX cannot use the TPU (is another process holding it? restart the kernel):\n"
+                         + "\n".join((r.stderr or r.stdout or "").splitlines()[-15:]))
+    print(f"  TPU runtime OK: {last_line(r.stdout)}", flush=True)
+
+
 def gpu_runtime_ok(n_gpus):
     """JAX must see exactly one GPU per isolated worker; fail before building caches."""
     for gpu in range(n_gpus):
@@ -328,6 +349,8 @@ def main(argv=None):
     ap.add_argument("--variant", default="full")
     ap.add_argument("--protocols", default="xsub,xset")
     ap.add_argument("--gpu-offset", type=int, default=0, help="first GPU (run two one-protocol variants side by side)")
+    ap.add_argument("--accelerator", default="gpu", choices=["gpu", "tpu"],
+                    help="tpu: Kaggle TPU v5e-8, ONE protocol per launch using every chip (batch 256 split)")
     ap.add_argument("--micro-batch", type=int, default=64)
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--outdir", default=DEFAULT_OUTDIR)
@@ -365,7 +388,13 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     print(f"{MODEL_NAME}  variant={a.variant}  micro_batch={a.micro_batch}  out={a.outdir}", flush=True)
-    if not a.cpu_smoke and not a.prepare_only:
+    if a.accelerator == "tpu" and not a.cpu_smoke and not a.prepare_only:
+        if len([p for p in a.protocols.split(",") if p.strip()]) != 1:
+            raise SystemExit("--accelerator tpu: give ONE protocol (--protocols xsub); it uses all TPU chips")
+        if a.micro_batch == 64:
+            a.micro_batch = 256           # no accumulation: the 256 batch is split across the chips
+        tpu_runtime_ok()
+    elif not a.cpu_smoke and not a.prepare_only:
         gpus = visible_gpus()
         print("GPUs:", gpus, flush=True)
         n_needed = len([p for p in a.protocols.split(",") if p.strip()]) + a.gpu_offset
@@ -401,7 +430,7 @@ def main(argv=None):
         return 0
 
     launch_argv = ["--cache", hand_cache, "--outdir", a.outdir, "--variant", a.variant,
-                   "--protocols", a.protocols, "--gpu-offset", str(a.gpu_offset),
+                   "--protocols", a.protocols, "--gpu-offset", str(a.gpu_offset), "--accelerator", a.accelerator,
                    "--micro-batch", str(a.micro_batch),
                    "--epochs", str(a.epochs), "--kill-epoch", str(a.kill_epoch),
                    "--kill-margin-pp", str(a.kill_margin_pp), "--working-root", a.working,

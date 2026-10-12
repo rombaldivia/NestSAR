@@ -421,3 +421,12 @@ and spends the saving on a second residual BiGRU over the 16 segments after `m4`
 
 Both keep masked reconstruction. Missing joints are never mixed or attended (tested: garbage on missing joints
 does not change valid outputs). Tests: `tests/test_spatial_mixers.py`.
+
+## Kaggle TPU v5e-8 (`--accelerator tpu`)
+
+One process owns every TPU chip (Kaggle does not allow one process per chip), so a TPU launch runs ONE
+protocol and its worker is data parallel: state replicated, the 256 batch split across the chips
+(`--micro-batch` defaults to 256, no accumulation). Verified on 8 simulated devices: the sharded train step
+matches the single-device step (params identical, metrics within 3e-5).
+
+    python -m experiments.nestsar_r5_t16.kaggle_run --accelerator tpu --protocols xsub --variant graph2_mr ...

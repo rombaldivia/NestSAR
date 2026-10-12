@@ -132,6 +132,8 @@ def worker_env(repo, gpu):
                MALLOC_ARENA_MAX="2", CUDA_DEVICE_ORDER="PCI_BUS_ID", PYTHONPATH=str(repo))
     if gpu is None:
         env.update(CUDA_VISIBLE_DEVICES="", JAX_PLATFORMS="cpu")
+    elif gpu == "tpu":
+        env.update(CUDA_VISIBLE_DEVICES="", JAX_PLATFORMS="tpu", TF_CPP_MIN_LOG_LEVEL="2")
     else:
         env.update(CUDA_VISIBLE_DEVICES=str(gpu), JAX_PLATFORMS="cuda")
     return env
@@ -197,10 +199,14 @@ def main(argv=None):
     ap.add_argument("--poll-seconds", type=int, default=60)
     ap.add_argument("--heartbeat-minutes", type=float, default=10.0)
     ap.add_argument("--cpu-smoke", action="store_true", help="local test only")
+    ap.add_argument("--accelerator", default="gpu", choices=("gpu", "tpu"),
+                    help="tpu: ONE protocol per launch, its worker uses every TPU chip (data parallel)")
     ap.add_argument("--extra-config", default="{}", help="JSON merged into config (smoke tests)")
     a = ap.parse_args(argv)
 
     protocols = tuple(p.strip() for p in a.protocols.split(",") if p.strip())
+    if a.accelerator == "tpu" and len(protocols) != 1:
+        raise SystemExit("--accelerator tpu runs ONE protocol per launch (the worker uses every chip)")
     if not protocols or len(set(protocols)) != len(protocols) or set(protocols) - set(PROTOCOLS):
         raise SystemExit(f"--protocols must be a subset of {PROTOCOLS}")
     repo = Path(__file__).resolve().parents[2]
@@ -268,9 +274,10 @@ def main(argv=None):
         return proc
 
     for i, p in enumerate(protocols):
-        gpus[p] = None if a.cpu_smoke else i + a.gpu_offset
+        gpus[p] = None if a.cpu_smoke else ("tpu" if a.accelerator == "tpu" else i + a.gpu_offset)
         cmds[p] = [sys.executable, "-m", WORKER, "--config", str(cfg_path), "--protocol", p,
-                   "--cache", a.cache, "--outdir", str(out)] + (["--allow-cpu"] if a.cpu_smoke else [])
+                   "--cache", a.cache, "--outdir", str(out), "--accelerator", a.accelerator] + \
+                  (["--allow-cpu"] if a.cpu_smoke else [])
         if alive(pids.get(p), WORKER):
             print(f"{p}: already running (pid {pids[p]}), attaching")
             attached.add(p)
@@ -280,7 +287,7 @@ def main(argv=None):
             print(f"{p}: already finished (best {100 * done.get('best_val_accuracy', 0):.3f}%)")
             continue
         proc = start(p)
-        print(f"{p}: started pid {proc.pid} on {'CPU' if a.cpu_smoke else 'GPU' + str(gpus[p])}")
+        print(f"{p}: started pid {proc.pid} on {'CPU' if a.cpu_smoke else ('TPU (all chips)' if gpus[p] == 'tpu' else 'GPU' + str(gpus[p]))}")
     write_json(out / "pids.json", pids)
     sys.stdout.flush()
 

@@ -414,13 +414,17 @@ def per_class_report(out, protocol, dataset, val_ids, config, predict_step, repo
     })
 
 
-def run(config, protocol, cache, outdir, allow_cpu=False):
+def run(config, protocol, cache, outdir, allow_cpu=False, accelerator="gpu"):
     config = validate_config(config)
     if protocol not in ("xsub", "xset"):
         raise ValueError("Expected xsub or xset")
     out = Path(outdir) / protocol
     out.mkdir(parents=True, exist_ok=True)
-    if not allow_cpu and (jax.default_backend() != "gpu" or len(jax.local_devices()) != 1):
+    if accelerator == "tpu":
+        # One process owns every TPU chip; the batch is split across them (data parallel).
+        if jax.default_backend() != "tpu" and not allow_cpu:
+            raise RuntimeError(f"Expected TPU; backend={jax.default_backend()}, devices={jax.local_devices()}")
+    elif not allow_cpu and (jax.default_backend() != "gpu" or len(jax.local_devices()) != 1):
         raise RuntimeError(f"Expected one isolated GPU; backend={jax.default_backend()}, "
                            f"devices={jax.local_devices()}")
 
@@ -469,6 +473,18 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
         atomic_json(out / "history.json", metadata["history"])
     report(best=metadata["best"] if metadata["best_epoch"] else None,
            best_epoch=metadata["best_epoch"], completed_epoch=metadata["epoch"])
+    put_batch = jax.device_put
+    n_dev = jax.local_device_count()
+    if accelerator == "tpu" and n_dev > 1:
+        # Data parallel over all local chips: replicated state, batch split on its leading axis (GSPMD).
+        from jax.sharding import Mesh, NamedSharding, PartitionSpec
+        mesh = Mesh(np.asarray(jax.local_devices()), ("d",))
+        replicated, split = NamedSharding(mesh, PartitionSpec()), NamedSharding(mesh, PartitionSpec("d"))
+        for size in (batch_size, config["eval_batch"]):
+            if size % n_dev:
+                raise ValueError(f"Batch {size} is not divisible by {n_dev} devices")
+        state, key = jax.device_put(state, replicated), jax.device_put(key, replicated)
+        put_batch = lambda b: jax.device_put(b, split)
 
     train_step, eval_step, predict_step = build_steps(model, config)
     if metadata["epoch"] >= config["epochs"] or metadata["stopped_early"]:
@@ -495,7 +511,7 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
                 timing["data_wait_s"] += time.perf_counter() - t
                 timing["prepare_service_s"] += prep_s
                 t = time.perf_counter()
-                device_batch = jax.block_until_ready(jax.device_put(batch))
+                device_batch = jax.block_until_ready(put_batch(batch))
                 timing["h2d_s"] += time.perf_counter() - t
                 if compiled_train is None:
                     report(phase="Compile train", current=0, total=steps)
@@ -528,7 +544,7 @@ def run(config, protocol, cache, outdir, allow_cpu=False):
                 batch, prep_s = next(batches)
                 timing["data_wait_s"] += time.perf_counter() - t
                 timing["prepare_service_s"] += prep_s
-                device_batch = jax.block_until_ready(jax.device_put(batch))
+                device_batch = jax.block_until_ready(put_batch(batch))
                 if compiled_eval is None:
                     report(phase="Compile validation", current=0, total=val_steps)
                     t = time.perf_counter()
@@ -606,9 +622,10 @@ def main():
     p.add_argument("--cache", required=True, help="R5 hand-cache directory")
     p.add_argument("--outdir", required=True)
     p.add_argument("--allow-cpu", action="store_true")
+    p.add_argument("--accelerator", default="gpu", choices=("gpu", "tpu"))
     a = p.parse_args()
     print(MODEL_NAME, flush=True)
-    run(json.loads(Path(a.config).read_text()), a.protocol, a.cache, a.outdir, a.allow_cpu)
+    run(json.loads(Path(a.config).read_text()), a.protocol, a.cache, a.outdir, a.allow_cpu, a.accelerator)
 
 
 if __name__ == "__main__":
