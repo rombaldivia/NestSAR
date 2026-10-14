@@ -430,3 +430,16 @@ protocol and its worker is data parallel: state replicated, the 256 batch split 
 matches the single-device step (params identical, metrics within 3e-5).
 
     python -m experiments.nestsar_r5_t16.kaggle_run --accelerator tpu --protocols xsub --variant graph2_mr ...
+
+## Segment count: T16 / T24 / T32 (`NESTSAR_FRAMES`)
+
+Set `NESTSAR_FRAMES=24` (or 32) in the environment BEFORE launching: every segment still summarises all its raw
+frames, segments are just finer. Caches, pools and runs are separated automatically (the preprocessing version
+gets a `-T24` suffix; T16 versions are unchanged, so existing T16 caches stay valid). Use new cache/pool paths.
+
+| variant | T16 | T24 | T32 (strict MFLOPs) |
+|---|---|---|---|
+| `graph_mr` (graph mixer + MR, one temporal BiGRU) | 40.88 | **59.45** | 78.01 |
+| `graph2_mr` (+ second temporal BiGRU) | 54.76 | 80.26 | 105.77 |
+
+`graph_mr` at T24 costs the same as R5 `full` at T16 (59.16). CPU smoke at T24 passes end to end.

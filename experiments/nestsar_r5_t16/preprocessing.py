@@ -43,8 +43,8 @@ HAND_FEATURES = SUB * PERSONS * HAND_CHANNELS  # 192 per segment
 FEATURES = R4_FEATURES + HAND_FEATURES        # 942
 VERSION = f"r5-hand4x-v2+{pp.VERSION}"
 
-if (FRAMES, PERSONS, JOINTS, TOKEN_CHANNELS) != (16, 2, 25, 15):
-    raise RuntimeError("R5 expects the R4 T16/M2/V25/C15 token contract")
+if FRAMES not in (16, 24, 32) or (PERSONS, JOINTS, TOKEN_CHANNELS) != (2, 25, 15):
+    raise RuntimeError("R5 expects the R4 T16|24|32/M2/V25/C15 token contract")
 
 
 def representative_pose(local, valid, starts, ends):

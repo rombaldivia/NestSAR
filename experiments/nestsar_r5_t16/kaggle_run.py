@@ -33,7 +33,7 @@ PREFLIGHT = """
 import sys, json
 import jax, jax.numpy as jnp, numpy as np
 from experiments.nestsar_r5_t16.config import validate_config
-from experiments.nestsar_r5_t16.worker import EXPECTED_PARAMS, STRICT_MFLOPS, make_model
+from experiments.nestsar_r5_t16.worker import expected_params, strict_mflops, make_model
 from experiments.nestsar_r5_t16.preprocessing import FRAMES, FEATURES
 variant = sys.argv[1]
 cfg = validate_config({"variant": variant})
@@ -41,7 +41,7 @@ m = make_model(cfg)
 x = jnp.zeros((2, FRAMES, FEATURES))
 p = m.init({"params": jax.random.PRNGKey(0), "dropout": jax.random.PRNGKey(1)}, x, training=False)["params"]
 n = int(sum(np.prod(a.shape) for a in jax.tree_util.tree_leaves(p)))
-assert n == EXPECTED_PARAMS[variant], f"params {n} != expected {EXPECTED_PARAMS[variant]}"
+assert n == expected_params(variant), f"params {n} != expected {expected_params(variant)}"
 xr = x.at[0].set(jax.random.normal(jax.random.PRNGKey(2), x.shape[1:]) * 0.3)
 def loss(q):
     out = m.apply({"params": q}, xr, training=True, rngs={"dropout": jax.random.PRNGKey(3)})
@@ -51,7 +51,7 @@ assert bool(jnp.isfinite(v)), "non-finite loss"
 assert all(bool(jnp.isfinite(a).all()) for a in jax.tree_util.tree_leaves(g)), "non-finite gradients"
 out = m.apply({"params": p}, xr, training=False)
 assert bool(jnp.isfinite(out["logits"]).all()), "non-finite logits"
-print(json.dumps({"params": n, "mflops": STRICT_MFLOPS[variant], "jax": jax.__version__}))
+print(json.dumps({"params": n, "mflops": strict_mflops(variant), "frames": FRAMES, "jax": jax.__version__}))
 """
 
 R4_CACHE_CHECK = """

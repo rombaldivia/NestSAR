@@ -11,11 +11,18 @@ The neural input contract stays exactly [16, 750].
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
-FRAMES, PERSONS, JOINTS, TOKEN_CHANNELS = 16, 2, 25, 15
+# Number of temporal segments. 16 is the original contract; NESTSAR_FRAMES=24/32 gives finer segments
+# (each segment still summarises ALL its raw frames). Read once at import: set it before importing.
+FRAMES = int(os.environ.get("NESTSAR_FRAMES", "16"))
+if FRAMES not in (16, 24, 32):
+    raise ValueError(f"NESTSAR_FRAMES must be 16, 24 or 32, got {FRAMES}")
+PERSONS, JOINTS, TOKEN_CHANNELS = 2, 25, 15
 FEATURES = PERSONS * JOINTS * TOKEN_CHANNELS
-VERSION = "sm-all-personaware-p2-segmentpose-v2"
+VERSION = "sm-all-personaware-p2-segmentpose-v2" + ("" if FRAMES == 16 else f"-T{FRAMES}")  # T16 caches unchanged
 
 
 def ordered_raw(keypoints, layout="MTVC"):

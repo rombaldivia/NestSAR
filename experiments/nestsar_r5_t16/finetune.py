@@ -32,7 +32,7 @@ from experiments.nestsar_sm_all_t16.streaming.io_utils import atomic_bytes, atom
 from .config import validate_config
 from .data import Dataset
 from .model import NUM_CLASSES
-from .worker import EXPECTED_PARAMS, build_steps, create_state
+from .worker import build_steps, create_state, expected_params
 
 NAMES = [f"A{c + 1:03d}" for c in range(NUM_CLASSES)]
 
@@ -142,7 +142,7 @@ def run(run_dir, protocol, cache, outdir=None, epochs=4, lr_scale=0.1, weak_k=20
 
     model, state, key, schedule, _ = create_state(config, steps)
     params = jax.tree.map(jnp.asarray, params)
-    if sum(x.size for x in jax.tree.leaves(params)) != EXPECTED_PARAMS[config["variant"]]:
+    if sum(x.size for x in jax.tree.leaves(params)) != expected_params(config["variant"]):
         raise ValueError("Checkpoint does not match the variant of its own config")
     state = state.replace(params=params, ema_params=params,
                           opt_state=state.tx.init(params))          # fresh optimizer, every weight trainable

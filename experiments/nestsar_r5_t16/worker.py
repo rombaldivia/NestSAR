@@ -58,6 +58,7 @@ EXPECTED_PARAMS = {
     "hope_mr": 1_556_726,
     "graph2_mr": 1_736_016,
     "attn2_mr": 1_736_437,
+    "graph_mr": 1_300_768,
 }
 # Strict MFLOPs per clip (jaxpr dot MACs x 2, scan bodies x length, batch 1).
 STRICT_MFLOPS = {
@@ -81,7 +82,32 @@ STRICT_MFLOPS = {
     "hope_mr": 62.45696,
     "graph2_mr": 54.760064,
     "attn2_mr": 55.937664,
+    "graph_mr": 40.882816,
 }
+# The tables above are for the T16 contract. Other segment counts (NESTSAR_FRAMES=24/32) keep every parameter
+# count except the conv-mixer time embedding, and their strict FLOPs are measured with the same counter.
+
+
+def expected_params(variant):
+    from .config import VARIANTS
+    v = VARIANTS[variant]
+    extra = (FRAMES - 16) * 176 if v.get("temporal") == "hope" and v.get("level_mixer") == "conv" else 0
+    return EXPECTED_PARAMS[variant] + extra
+
+
+_FLOPS_CACHE = {}
+
+
+def strict_mflops(variant):
+    if FRAMES == 16:
+        return STRICT_MFLOPS[variant]
+    if variant not in _FLOPS_CACHE:
+        from .audit_flops import audit
+        from .config import model_kwargs, validate_config
+        from .model import NestSARR5T16
+        _FLOPS_CACHE[variant] = audit(NestSARR5T16(**model_kwargs(validate_config({"variant": variant}))),
+                                      variant, FEATURES, frames=FRAMES)["strict_mflops"]
+    return _FLOPS_CACHE[variant]
 
 # R4-FMSE+Geometry per-class recall of its weakest classes (EXPERIMENT_REPORT, best checkpoints).
 R4_WEAK_CLASS_RECALL = {
@@ -311,7 +337,7 @@ def create_state(config, steps_per_epoch):
                         jnp.zeros((1, FRAMES, FEATURES), jnp.float32), training=False)["params"]
     optimizer = make_optimizer(config, schedule, params)
     count = sum(x.size for x in jax.tree.leaves(params))
-    expected = EXPECTED_PARAMS[config["variant"]]
+    expected = expected_params(config["variant"])
     if count != expected:
         raise RuntimeError(f"Model parameter mismatch for {config['variant']}: {count} != {expected}")
     state = State.create(apply_fn=model.apply, params=params, tx=optimizer, ema_params=params)
@@ -357,7 +383,7 @@ def write_result(out, protocol, metadata, digest, params_count, resumed=False):
         "last_epoch": metadata["epoch"],
         "epochs_run": metadata["epoch"],
         "params": params_count,
-        "strict_mflops": STRICT_MFLOPS[variant],
+        "strict_mflops": strict_mflops(variant), "segments": FRAMES,
         "backend": jax.default_backend(),
         "devices": [str(d) for d in jax.local_devices()],
         "config_hash": digest,
@@ -429,7 +455,7 @@ def run(config, protocol, cache, outdir, allow_cpu=False, accelerator="gpu"):
                            f"devices={jax.local_devices()}")
 
     variant = config["variant"]
-    params_count = EXPECTED_PARAMS[variant]
+    params_count = expected_params(variant)
     identity = implementation_identity(variant)
     dataset = Dataset(cache)
     if config.get("hand_filter", "none") != dataset.hand_filter:

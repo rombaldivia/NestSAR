@@ -59,6 +59,8 @@ VARIANTS["hope_mr"] = {"temporal": "hope", "masked_recon": True}
 # saving on a second temporal BiGRU. Both keep masked reconstruction (R7).
 VARIANTS["graph2_mr"] = {"spatial_mixer": "graph", "temporal_stack": 2, "masked_recon": True}
 VARIANTS["attn2_mr"] = {"spatial_mixer": "attn", "temporal_stack": 2, "masked_recon": True}
+# Graph mixer + MR without the second temporal BiGRU: the T24 candidate at the R5 budget (~59 MFLOPs at T24).
+VARIANTS["graph_mr"] = {"spatial_mixer": "graph", "masked_recon": True}
 
 # Outer CMS: parameter tier of each temporal level = its in-clip period (optimizer steps per update).
 # Inside a level, a CMS-chain MLP named mlp_p<f> uses its own period f instead.
