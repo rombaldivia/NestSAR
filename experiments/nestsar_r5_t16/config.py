@@ -63,6 +63,8 @@ VARIANTS["attn2_mr"] = {"spatial_mixer": "attn", "temporal_stack": 2, "masked_re
 VARIANTS["graph_mr"] = {"spatial_mixer": "graph", "masked_recon": True}
 # Ablation of the nested fast memory on the graph_mr candidate: BiGRU levels only (fast_mode off).
 VARIANTS["graph_mr_no_fast"] = {"spatial_mixer": "graph", "masked_recon": True, "fast_mode": "off"}
+# graph_mr + part-temporal route (each of the 14 parts keeps its own 16-segment trajectory before pooling).
+VARIANTS["graph_mr_pt"] = {"spatial_mixer": "graph", "masked_recon": True, "part_temporal": True}
 
 # Outer CMS: parameter tier of each temporal level = its in-clip period (optimizer steps per update).
 # Inside a level, a CMS-chain MLP named mlp_p<f> uses its own period f instead.

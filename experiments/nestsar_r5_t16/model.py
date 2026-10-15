@@ -673,6 +673,12 @@ class NestSARR5T16(nn.Module):
     spatial_mixer: str = "sweep"
     temporal_stack: int = 1
     stack_hidden: int = 176
+    # Part-temporal route: every anatomical part (14 per person) gets its own trajectory through the 16
+    # segments (shared narrow BiGRU over time) BEFORE the parts are flattened into the per-frame person
+    # vector. Added back with a zero-initialised projection, so at init the model equals the base model.
+    part_temporal: bool = False
+    part_temporal_dim: int = 24
+    part_temporal_hidden: int = 16
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = False) -> Mapping[str, jnp.ndarray]:
@@ -739,6 +745,16 @@ class NestSARR5T16(nn.Module):
         part_feat = jnp.einsum("btpvd,qv->btpqd", s, parts) / jnp.maximum(weight, 1.0)[..., None]
         if self.part_attention:
             part_feat = PartAttention(self.part_attn_dim, name="part_attention")(part_feat, weight > 0)
+        if self.part_temporal:
+            n_parts = part_feat.shape[3]
+            pv = (weight > 0)[..., None].astype(dtype)                                # [B,T,P,Q,1]
+            pt = nn.Dense(self.part_temporal_dim, name="pt_in")(part_feat)
+            pt = pt + self.param("pt_part_embed", nn.initializers.normal(0.02), (n_parts, self.part_temporal_dim))
+            pt = nn.gelu(pt) * pv
+            seq = jnp.transpose(pt, (0, 2, 3, 1, 4)).reshape(b * PERSONS * n_parts, FRAMES, self.part_temporal_dim)
+            seq = Sweep(self.part_temporal_hidden, bidirectional=True, name="pt_sweep")(seq)
+            pt = jnp.transpose(seq.reshape(b, PERSONS, n_parts, FRAMES, self.part_temporal_dim), (0, 3, 1, 2, 4)) * pv
+            part_feat = part_feat + nn.Dense(self.spatial_dim, kernel_init=nn.initializers.zeros, name="pt_out")(pt) * pv
         person_in = [part_feat.reshape(b, FRAMES, PERSONS, -1),
                      self_relations(pose, joint_valid)]
 
