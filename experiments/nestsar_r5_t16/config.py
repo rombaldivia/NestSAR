@@ -78,6 +78,9 @@ DEFAULTS.update(outer_cms="auto", dmgd="auto", dmgd_momentum=0.90, dmgd_memory_l
 # Masked reconstruction (only used by variants with masked_recon): fraction of the 16 segments of the
 # augmented view zeroed at the input, and the weight of the relative-MSE reconstruction loss.
 DEFAULTS.update(recon_weight=0.5, recon_mask_ratio=0.3)
+# Logit distillation from a precomputed teacher cache (npz with ids/logits/labels, aligned by sample ID).
+# Training-only: the student graph and its FLOPs are unchanged. kd_weight 0 = off.
+DEFAULTS.update(kd_teacher="", kd_weight=0.0, kd_temperature=1.0)
 
 
 def validate_config(config):
@@ -131,6 +134,14 @@ def validate_config(config):
         raise ValueError("recon_mask_ratio must be in (0, 1)")
     if not (c["dmgd_memory_lr"] > 0 and c["dmgd_cap"] > 0):
         raise ValueError("dmgd_memory_lr and dmgd_cap must be > 0")
+    if not 0 <= c["kd_weight"] <= 10:
+        raise ValueError("kd_weight must be in [0, 10]")
+    if not 0 < c["kd_temperature"] <= 20:
+        raise ValueError("kd_temperature must be in (0, 20]")
+    if c["kd_weight"] > 0 and not c["kd_teacher"]:
+        raise ValueError("kd_weight > 0 needs kd_teacher (path to the teacher logits npz)")
+    if c["kd_weight"] > 0 and c["mix_prob"] > 0:
+        raise ValueError("kd with mix_prob > 0 is not supported (teacher targets are per clip, not per mix)")
     return c
 
 

@@ -210,6 +210,31 @@ class Dataset:
         self.splits = self.base.splits
         self.labels = self.base.labels
         self._pools = {}
+        self._teachers = {}
+
+    def teacher(self, path):
+        """Teacher logits [N, 120] in this cache's sample order, aligned by sample ID (never by position).
+        Raises if any cached sample is missing from the teacher file or if any label disagrees."""
+        if path not in self._teachers:
+            z = np.load(path, allow_pickle=False)
+            index = {str(s): i for i, s in enumerate(z["ids"].tolist())}
+            if len(index) != len(z["ids"]):
+                raise ValueError("Teacher sample IDs are not unique")
+            ids = json.loads((Path(self.base_dir) / "ids.json").read_text())
+            if len(ids) != len(self.labels):
+                raise ValueError("ids.json does not match the cache sample count")
+            missing = [s for s in ids if str(s) not in index]
+            if missing:
+                raise ValueError(f"Teacher file lacks {len(missing)} cached samples, e.g. {missing[:3]}")
+            pos = np.asarray([index[str(s)] for s in ids], np.int64)
+            logits = np.asarray(z["logits"][pos], np.float32)
+            bad = np.flatnonzero(np.asarray(z["labels"][pos], np.int64) != np.asarray(self.labels, np.int64))
+            if len(bad):
+                raise ValueError(f"Teacher/cache label mismatch at {len(bad)} samples, e.g. {bad[:5].tolist()}")
+            if logits.shape != (len(ids), 120) or not np.isfinite(logits).all():
+                raise ValueError(f"Bad teacher logits {logits.shape}")
+            self._teachers[path] = logits
+        return self._teachers[path]
 
     def pool(self, path):
         """Opened lazily and once per path; raises if it was built for another cache/preprocessing."""
@@ -234,6 +259,9 @@ class Dataset:
         b["x"][:len(indices)] = self.canonical(indices)
         b["y"][:len(indices)] = self.labels[indices]
         b["mask"][:len(indices)] = 1
+        if training and config.get("kd_weight", 0.0) > 0:
+            b["t"] = np.zeros((size, 120), np.float32)
+            b["t"][:len(indices)] = self.teacher(config["kd_teacher"])[np.asarray(indices, np.int64)]
         if training:
             b["xa"] = np.zeros_like(b["x"])
             protocol_seed = config["seed"] + (100000 if protocol == "xset" else 0)

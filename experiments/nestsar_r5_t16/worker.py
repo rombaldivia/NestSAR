@@ -119,7 +119,7 @@ R4_WEAK_CLASS_RECALL = {
 
 TRAIN_METRICS = ("loss", "main", "aux", "kl", "acc", "aug_acc", "agreement", "eta", "alpha",
                  "g4_eta", "g4_alpha", "fast_scale_m4", "fast_scale_g4", "pair_scale",
-                 "aux_m4_acc", "aux_hand_acc")
+                 "aux_m4_acc", "aux_hand_acc", "kd")
 EVAL_COLUMNS = ("val_loss", "val_acc", "val_top5", "eta", "alpha", "aux_m4_acc", "aux_hand_acc", "count")
 
 
@@ -157,6 +157,7 @@ def ce(logits, labels, smoothing, labels2=None, lam=None):
 def make_loss(model, config):
     """Per-sample training metrics [B, len(TRAIN_METRICS)] (column 0 = loss) for one micro-batch."""
     use_mr = bool(getattr(model, "masked_recon", False)) and config["recon_weight"] > 0
+    use_kd = config.get("kd_weight", 0.0) > 0
 
     def per_sample(params, key, batch):
         k1, k2 = jax.random.split(key)          # unchanged key chain for every non-MR variant
@@ -180,6 +181,16 @@ def make_loss(model, config):
         logq = jax.nn.log_softmax(aug["logits"] / temperature)
         kl = 0.5 * temperature ** 2 * jnp.sum((jnp.exp(logp) - jnp.exp(logq)) * (logp - logq), -1)
         loss = main + config["stream_aux_weight"] * aux + config["consistency_weight"] * kl
+        if use_kd:   # KL(teacher || student) at temperature T on both views, x T^2 (Hinton et al.)
+            tkd = config["kd_temperature"]
+            t_logp = jax.nn.log_softmax(batch["t"] / tkd)
+            kd = 0.0
+            for logits in (out["logits"], aug["logits"]):
+                kd = kd + jnp.sum(jnp.exp(t_logp) * (t_logp - jax.nn.log_softmax(logits / tkd)), -1)
+            kd = 0.5 * tkd ** 2 * kd
+            loss = loss + config["kd_weight"] * kd
+        else:
+            kd = jnp.zeros_like(main)
         if use_mr:   # relative MSE on the masked segments only (scale-free across clips)
             err = jnp.mean((aug["frame_recon"] - xa) ** 2, axis=-1)                 # [B,T]
             power = jnp.mean(xa ** 2, axis=-1)
@@ -192,7 +203,7 @@ def make_loss(model, config):
             loss, main, aux, kl, hit(out["logits"]), hit(aug["logits"]),
             (out["logits"].argmax(-1) == aug["logits"].argmax(-1)).astype(jnp.float32),
             out["sm_eta_mean"], out["sm_alpha_mean"], out["g4_eta_mean"], out["g4_alpha_mean"],
-            out["fast_scale_m4"], out["fast_scale_g4"], out["pair_scale"], hit(sl[:, 0]), hand_acc,
+            out["fast_scale_m4"], out["fast_scale_g4"], out["pair_scale"], hit(sl[:, 0]), hand_acc, kd,
         ], axis=-1)
         return metrics
 
