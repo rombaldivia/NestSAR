@@ -61,6 +61,8 @@ VARIANTS["graph2_mr"] = {"spatial_mixer": "graph", "temporal_stack": 2, "masked_
 VARIANTS["attn2_mr"] = {"spatial_mixer": "attn", "temporal_stack": 2, "masked_recon": True}
 # Graph mixer + MR without the second temporal BiGRU: the T24 candidate at the R5 budget (~59 MFLOPs at T24).
 VARIANTS["graph_mr"] = {"spatial_mixer": "graph", "masked_recon": True}
+# Ablation of the nested fast memory on the graph_mr candidate: BiGRU levels only (fast_mode off).
+VARIANTS["graph_mr_no_fast"] = {"spatial_mixer": "graph", "masked_recon": True, "fast_mode": "off"}
 
 # Outer CMS: parameter tier of each temporal level = its in-clip period (optimizer steps per update).
 # Inside a level, a CMS-chain MLP named mlp_p<f> uses its own period f instead.

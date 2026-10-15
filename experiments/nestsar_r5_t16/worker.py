@@ -59,6 +59,7 @@ EXPECTED_PARAMS = {
     "graph2_mr": 1_736_016,
     "attn2_mr": 1_736_437,
     "graph_mr": 1_300_768,
+    "graph_mr_no_fast": 1_289_848,
 }
 # Strict MFLOPs per clip (jaxpr dot MACs x 2, scan bodies x length, batch 1).
 STRICT_MFLOPS = {
@@ -83,6 +84,7 @@ STRICT_MFLOPS = {
     "graph2_mr": 54.760064,
     "attn2_mr": 55.937664,
     "graph_mr": 40.882816,
+    "graph_mr_no_fast": 40.587136,
 }
 # The tables above are for the T16 contract. Other segment counts (NESTSAR_FRAMES=24/32) keep every parameter
 # count except the conv-mixer time embedding, and their strict FLOPs are measured with the same counter.
