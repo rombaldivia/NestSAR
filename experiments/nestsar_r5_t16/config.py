@@ -77,7 +77,8 @@ DEFAULTS.update(MODEL_DEFAULTS)
 DEFAULTS.update(variant="full", early_stop_guard_epoch=14)
 # Strong training-only augmentation (preprocessing.strong_augmented_features). 0 = the R4 recipe
 # (yaw +-8 deg and +-1 frame boundary jitter on one augmented view).
-DEFAULTS.update(aug_strength=0.0, aug_clean_prob=0.2, prefetch_workers=1, hand_filter="none", aug_view_degrees=15.0, body_align="none", mix_prob=0.0, aug_pool="")
+DEFAULTS.update(aug_strength=0.0, aug_clean_prob=0.2, prefetch_workers=1, hand_filter="none", aug_view_degrees=15.0, body_align="none", mix_prob=0.0, aug_pool="",
+                aug_pool_views_use=0)   # 0 = draw from every pooled view; K>0 = only the first K (view-count ablation)
 # HOPE optimizer side: "auto" = on for hope* variants, off otherwise (R5 keeps its exact optimizer).
 DEFAULTS.update(outer_cms="auto", dmgd="auto", dmgd_momentum=0.90, dmgd_memory_lr=0.01, dmgd_mix=0.10,
                 dmgd_cap=2.0)
@@ -103,8 +104,10 @@ def validate_config(config):
 
     if c["variant"] not in VARIANTS:
         raise ValueError(f"variant must be one of {sorted(VARIANTS)}")
-    from .preprocessing import BODY_DCT
-    if bool(VARIANTS[c["variant"]].get("body_dct")) != (BODY_DCT > 0):
+    from .preprocessing import BODY_DCT, IGNORE_DCT
+    if IGNORE_DCT and (BODY_DCT == 0 or VARIANTS[c["variant"]].get("body_dct")):
+        raise ValueError("NESTSAR_IGNORE_DCT=1 needs NESTSAR_BODY_DCT=K>0 (the DCT-width cache) and a non-DCT variant")
+    if not IGNORE_DCT and bool(VARIANTS[c["variant"]].get("body_dct")) != (BODY_DCT > 0):
         raise ValueError(f"variant {c['variant']} with NESTSAR_BODY_DCT={BODY_DCT}: body_dct variants need "
                          "NESTSAR_BODY_DCT=K>0 and every other variant needs it unset (0)")
     for k, v in MODEL_DEFAULTS.items():
@@ -126,6 +129,9 @@ def validate_config(config):
         raise ValueError("aug_clean_prob must be in [0, 1]")
     if c["aug_pool"] and not c["aug_strength"] > 0:
         raise ValueError("aug_pool needs aug_strength > 0 (it replaces the live strong augmentation)")
+    if not isinstance(c["aug_pool_views_use"], int) or isinstance(c["aug_pool_views_use"], bool) \
+            or c["aug_pool_views_use"] < 0:
+        raise ValueError("aug_pool_views_use must be a nonnegative integer (0 = all pooled views)")
     if c["prefetch_workers"] not in (1, 2, 3, 4):
         raise ValueError("prefetch_workers must be 1..4")
     hope = c["variant"].startswith("hope")

@@ -41,6 +41,7 @@ from experiments.nestsar_r5_t16.preprocessing import (
     FEATURES,
     FRAMES,
     HAND_CHANNELS,
+    IGNORE_DCT,
     JOINTS,
     PERSONS,
     R4_FEATURES,
@@ -695,7 +696,7 @@ class NestSARR5T16(nn.Module):
         dtype = x.dtype
         tok = x[..., :R4_FEATURES].reshape(b, FRAMES, PERSONS, JOINTS, TOKEN_CHANNELS)
         hands = x[..., R4_FEATURES:BASE_FEATURES].reshape(b, FRAMES, SUB, PERSONS, HAND_CHANNELS)
-        if self.body_dct != (DCT_CHANNELS > 0):
+        if self.body_dct != (DCT_CHANNELS > 0 and not (IGNORE_DCT and not self.body_dct)):
             raise ValueError(f"body_dct={self.body_dct} needs NESTSAR_BODY_DCT {'> 0' if self.body_dct else '= 0'}")
 
         # ---- validity (a root-centred P1 root can be exactly zero) ----

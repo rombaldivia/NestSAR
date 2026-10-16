@@ -299,9 +299,11 @@ class Dataset:
         """xa = a pooled strong view; x = another pooled view (the clean canonical one with aug_clean_prob).
         Views are chosen deterministically from (seed, epoch, position), so a resumed run repeats them."""
         views_a, views_x, clean = [], [], []
+        use = int(config.get("aug_pool_views_use") or 0)
+        n_views = min(use, pool.views) if use > 0 else pool.views      # 0 = all (the default, unchanged draws)
         for position in positions:
             rng = np.random.default_rng(np.random.SeedSequence([protocol_seed, aug_epoch, int(position), 5531]))
-            va, vx = rng.choice(pool.views, 2, replace=False) if pool.views > 1 else (0, 0)
+            va, vx = rng.choice(n_views, 2, replace=False) if n_views > 1 else (0, 0)
             views_a.append(int(va)), views_x.append(int(vx))
             clean.append(rng.random() < config.get("aug_clean_prob", 0.2))
         indices = np.asarray(indices, np.int64)

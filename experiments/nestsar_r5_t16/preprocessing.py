@@ -53,6 +53,9 @@ BODY_DCT = int(os.environ.get("NESTSAR_BODY_DCT", "0"))
 DCT_POINTS = 8
 if not 0 <= BODY_DCT < DCT_POINTS:
     raise RuntimeError(f"NESTSAR_BODY_DCT must be in [0, {DCT_POINTS - 1}], got {BODY_DCT}")
+# NESTSAR_IGNORE_DCT=1: read a DCT-width cache/pool but run a NON-DCT variant on its first BASE_FEATURES columns
+# (the DCT block is never touched). Lets a base run reuse a DCT pool; the model is exactly the base one.
+IGNORE_DCT = os.environ.get("NESTSAR_IGNORE_DCT", "0") == "1"
 DCT_CHANNELS = 3 * BODY_DCT                   # per person and joint, ordered (k, axis)
 DCT_FEATURES = PERSONS * JOINTS * DCT_CHANNELS
 FEATURES = BASE_FEATURES + DCT_FEATURES       # 942 when off
