@@ -1,5 +1,48 @@
 # NestSAR-R5-T16 — the R4 architecture audit, fixed
 
+## Review existing weak-class errors before another training run
+
+`eval_heads.py` now checks the checkpoint SHA-256, configuration, ordered sample IDs and labels,
+input-cache signature and file metadata, preprocessing, evaluator source, and backend before reusing
+`val_probs.npz`. Legacy or incompatible prediction files are recomputed; writes are atomic. A prediction
+file cannot bypass a missing checkpoint. The existing three-array `evaluate()` API used by `soup.py`
+is retained. Data-file metadata is a freshness guard, not a full rehash of multi-gigabyte memmaps.
+
+Paste **`kaggle_review_weak_classes.py`** into one Kaggle cell. Attach the saved runs and their original
+hand/body caches. It fetches the isolated review branch and reviews saved **T16** `graph_mr`,
+`graph_mr_pt`, and `graph_mr_dct` checkpoints under `/kaggle/working` and `/kaggle/input`, using a separate
+process and recorded input contract for each run. It never selects a checkpoint by its score.
+Model weights, architecture, training recipe and inference FLOP count are unchanged.
+
+Or run from this checkout:
+
+```bash
+python -m experiments.nestsar_r5_t16.review_weak_classes --discover
+python -m experiments.nestsar_r5_t16.review_weak_classes --run-dir /path/to/RUN --cache /path/to/HAND_CACHE
+```
+
+Each `weak_class_report.json` includes checkpoint/data provenance, score reproduction, current per-class
+recall, confusion directions, and how many main-head errors are correct in M4/hand auxiliary heads.
+Reports and prediction caches are written under `/kaggle/working/NestSAR_WEAK_REVIEW`, including when
+the source checkpoint is a read-only Kaggle input. The matching hand cache is found by the run's recorded
+signature; `--cache` overrides discovery for one run. A missing cache is reported, never rebuilt or guessed.
+
+Interpretation:
+
+- Many errors correct in another existing head show complementary predictions. This does not establish
+  that a practical fusion will recover them; hand fusion and learned gates have already been tried.
+- Errors wrong in every existing head are unresolved by those heads. They do **not** prove that raw
+  skeleton information is missing or that another representation cannot learn it.
+- A score that does not reproduce stops the review after saving its report. Resolve that discrepancy
+  before attributing differences to architecture.
+- These are descriptive held-out diagnostics, not a new untouched test or a training-class selector.
+
+Regression checks:
+
+```bash
+JAX_PLATFORMS=cpu python -m pytest -q experiments/nestsar_r5_t16/tests/test_prediction_cache.py experiments/nestsar_r5_t16/tests/test_weak_class_review.py
+```
+
 R5 keeps NestSAR's identity (recurrent sweeps + nested M4/G4 memory with a
 self-modifying fast memory; no attention, no graph convolution, no TCN) and
 fixes the six problems found when auditing R4-FMSE against its class errors.
