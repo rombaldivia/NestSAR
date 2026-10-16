@@ -256,7 +256,9 @@ class Dataset:
         t0 = time.perf_counter()
         b = {"x": np.zeros((size, r5pp.FRAMES, r5pp.FEATURES), np.float32),
              "y": np.zeros(size, np.int32), "mask": np.zeros(size, np.float32)}
-        b["x"][:len(indices)] = self.canonical(indices)
+        pooled = training and config.get("aug_strength", 0.0) > 0 and bool(config.get("aug_pool"))
+        if not pooled:      # with a pool, x is a pooled view except for the clean rows (filled in _batch_from_pool)
+            b["x"][:len(indices)] = self.canonical(indices)
         b["y"][:len(indices)] = self.labels[indices]
         b["mask"][:len(indices)] = 1
         if training and config.get("kd_weight", 0.0) > 0:
@@ -304,6 +306,11 @@ class Dataset:
             clean.append(rng.random() < config.get("aug_clean_prob", 0.2))
         indices = np.asarray(indices, np.int64)
         views_a, views_x, clean = np.asarray(views_a), np.asarray(views_x), np.asarray(clean)
+        # Read the canonical tokens only for the rows that keep them: the other rows are overwritten by a
+        # pooled view, so reading them only fills the page cache (it thrashed once the pool outgrew RAM).
+        rows = np.flatnonzero(clean)
+        if len(rows):
+            b["x"][rows] = self.canonical(indices[rows])
         for v in np.unique(np.concatenate([views_a, views_x[~clean]])):
             rows = np.flatnonzero(views_a == v)
             if len(rows):
