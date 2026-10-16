@@ -36,6 +36,8 @@ import numpy as np
 from flax import linen as nn
 
 from experiments.nestsar_r5_t16.preprocessing import (
+    BASE_FEATURES,
+    DCT_CHANNELS,
     FEATURES,
     FRAMES,
     HAND_CHANNELS,
@@ -679,6 +681,9 @@ class NestSARR5T16(nn.Module):
     part_temporal: bool = False
     part_temporal_dim: int = 24
     part_temporal_hidden: int = 16
+    # Body DCT block (NESTSAR_BODY_DCT=K preprocessing): within-segment trajectory coefficients per joint, added
+    # to the joint embedding through a zero-initialised projection (at init the model equals the base model).
+    body_dct: bool = False
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = False) -> Mapping[str, jnp.ndarray]:
@@ -689,7 +694,9 @@ class NestSARR5T16(nn.Module):
         b = x.shape[0]
         dtype = x.dtype
         tok = x[..., :R4_FEATURES].reshape(b, FRAMES, PERSONS, JOINTS, TOKEN_CHANNELS)
-        hands = x[..., R4_FEATURES:].reshape(b, FRAMES, SUB, PERSONS, HAND_CHANNELS)
+        hands = x[..., R4_FEATURES:BASE_FEATURES].reshape(b, FRAMES, SUB, PERSONS, HAND_CHANNELS)
+        if self.body_dct != (DCT_CHANNELS > 0):
+            raise ValueError(f"body_dct={self.body_dct} needs NESTSAR_BODY_DCT {'> 0' if self.body_dct else '= 0'}")
 
         # ---- validity (a root-centred P1 root can be exactly zero) ----
         joint_valid = jnp.any(jnp.abs(tok) > 1e-8, axis=-1)                 # [B,T,P,V]
@@ -721,6 +728,10 @@ class NestSARR5T16(nn.Module):
         ], axis=-1)
         joint_embed = self.param("joint_embed", nn.initializers.normal(0.02), (JOINTS, self.spatial_dim))
         person_embed = self.param("person_embed", nn.initializers.normal(0.02), (PERSONS, self.spatial_dim))
+        if self.body_dct:
+            dct = x[..., BASE_FEATURES:].reshape(b, FRAMES, PERSONS, JOINTS, DCT_CHANNELS)
+            e = e + nn.Dense(self.spatial_dim, use_bias=False, kernel_init=nn.initializers.zeros,
+                             name="embed_dct")(dct)
         e = nn.gelu(e + joint_embed + person_embed[:, None, :]) * jv
 
         # ---- (bi)directional sweep over the joints of each person and segment ----
@@ -845,8 +856,9 @@ class NestSARR5T16(nn.Module):
         m4_mean = level_means[0]
         frame_recon = None
         if self.masked_recon:
-            recon_w = self.param("recon_w", nn.initializers.lecun_normal(), (self.model_dim, FEATURES))
-            recon_b = self.param("recon_b", nn.initializers.zeros, (FEATURES,))
+            # Rebuilds the base 942 tokens only (the body DCT block, when present, is not a recon target).
+            recon_w = self.param("recon_w", nn.initializers.lecun_normal(), (self.model_dim, BASE_FEATURES))
+            recon_b = self.param("recon_b", nn.initializers.zeros, (BASE_FEATURES,))
             if training:
                 frame_recon = m4 @ recon_w + recon_b                                   # [B,T,F]
         desc = nn.Dense(self.model_dim, name="descriptor")(jnp.concatenate(level_means, -1))

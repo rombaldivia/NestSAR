@@ -29,6 +29,8 @@ nails, OK vs victory sign).
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from experiments.nestsar_sm_all_t16 import preprocessing_corrected as pp
@@ -40,8 +42,21 @@ HAND_FRAMES = FRAMES * SUB                    # 64
 HAND_SIDES = ((6, 7, 21, 22), (10, 11, 23, 24))   # (wrist, hand, tip, thumb), left then right
 HAND_CHANNELS = 24                            # per person per sub-segment
 HAND_FEATURES = SUB * PERSONS * HAND_CHANNELS  # 192 per segment
-FEATURES = R4_FEATURES + HAND_FEATURES        # 942
-VERSION = f"r5-hand4x-v2+{pp.VERSION}"
+BASE_FEATURES = R4_FEATURES + HAND_FEATURES   # 942
+
+# Optional body DCT block (NESTSAR_BODY_DCT=K, default 0 = off and every cache/feature bit-identical).
+# Per segment, person, joint and axis: the root-relative trajectory is resampled to DCT_POINTS points and
+# the orthonormal DCT-II coefficients k = 1..K are kept (k = 0 is the mean, already given by the pose).
+# They describe how the joint moves INSIDE the segment (trend, curvature, oscillation), which the R4
+# summary (net, two half displacements, path) only keeps coarsely.
+BODY_DCT = int(os.environ.get("NESTSAR_BODY_DCT", "0"))
+DCT_POINTS = 8
+if not 0 <= BODY_DCT < DCT_POINTS:
+    raise RuntimeError(f"NESTSAR_BODY_DCT must be in [0, {DCT_POINTS - 1}], got {BODY_DCT}")
+DCT_CHANNELS = 3 * BODY_DCT                   # per person and joint, ordered (k, axis)
+DCT_FEATURES = PERSONS * JOINTS * DCT_CHANNELS
+FEATURES = BASE_FEATURES + DCT_FEATURES       # 942 when off
+VERSION = f"r5-hand4x-v2+{pp.VERSION}" + (f"+bodydct{BODY_DCT}x{DCT_POINTS}-v1" if BODY_DCT else "")
 
 if FRAMES not in (16, 24, 32) or (PERSONS, JOINTS, TOKEN_CHANNELS) != (2, 25, 15):
     raise RuntimeError("R5 expects the R4 T16|24|32/M2/V25/C15 token contract")
@@ -167,6 +182,52 @@ def hand_tokens(x, valid, starts, ends, scale):
     right = [means[..., 3, :], means[..., 4, :], means[..., 5, :], steps[..., 1, :]]
     out = np.concatenate(left + right, axis=-1) / scale              # [F, S, P, 24]
     return out.astype(np.float32).reshape(FRAMES, HAND_FEATURES)
+
+
+def dct_matrix(n=DCT_POINTS):
+    """Orthonormal DCT-II, rows = frequencies: C @ C.T = I."""
+    k = np.arange(n)[:, None]
+    i = np.arange(n)[None, :]
+    c = np.cos(np.pi * (i + 0.5) * k / n) * np.sqrt(2.0 / n)
+    c[0] /= np.sqrt(2.0)
+    return c
+
+
+_DCT = dct_matrix()
+
+
+def body_dct_tokens(local, valid, starts, ends, scale, k=BODY_DCT):
+    """Body DCT block [FRAMES, PERSONS * JOINTS * 3k] (see the BODY_DCT comment).
+
+    Invalid frames of a joint take the nearest earlier valid value (later one at the clip start), a joint
+    never valid in a segment gets zeros, and segments of one frame (clips shorter than FRAMES) are constant,
+    so all their k >= 1 coefficients are zero.
+    """
+    out = np.zeros((FRAMES, PERSONS, JOINTS, k, 3), np.float32)
+    total = len(local)
+    if k == 0 or total == 0:
+        return out.reshape(FRAMES, -1)
+    t = np.arange(total)[:, None, None]
+    fwd = np.maximum.accumulate(np.where(valid, t, -1), axis=0)
+    bwd = np.minimum.accumulate(np.where(valid, t, total)[::-1], axis=0)[::-1]
+    src = np.where(fwd >= 0, fwd, np.minimum(bwd, total - 1))                      # [T, P, V]
+    filled = np.take_along_axis(local, src[..., None], axis=0)                      # [T, P, V, 3]
+
+    starts = np.asarray(starts, np.int64)
+    ends = np.asarray(ends, np.int64)
+    length = np.maximum(ends - starts, 1)
+    pos = starts[:, None] + (length - 1)[:, None] * np.linspace(0.0, 1.0, DCT_POINTS)[None, :]   # [F, N]
+    lo = np.floor(pos).astype(np.int64)
+    hi = np.minimum(lo + 1, np.maximum(ends - 1, starts)[:, None])
+    w = (pos - lo)[..., None, None, None]
+    lo, hi = np.clip(lo, 0, total - 1), np.clip(hi, 0, total - 1)
+    traj = filled[lo] * (1.0 - w) + filled[hi] * w                                  # [F, N, P, V, 3]
+    coef = np.einsum("kn,fnpvc->fpvkc", _DCT[1:k + 1], traj.astype(np.float64))     # [F, P, V, k, 3]
+
+    seen = np.concatenate([np.zeros((1,) + valid.shape[1:], np.int64), np.cumsum(valid, axis=0)])
+    any_valid = (seen[np.minimum(ends, total)] - seen[np.clip(starts, 0, total)]) > 0  # [F, P, V]
+    out[:] = np.where(any_valid[..., None, None], coef / scale, 0)
+    return out.reshape(FRAMES, -1)
 
 
 BODY_ALIGNS = ("none", "yaw")
@@ -298,7 +359,9 @@ def features(x, valid=None, rng=None, shift=0, hand_filter="none", body_align="n
     starts, ends = pp.segment_bounds(total, rng=rng, shift=shift)
     body = r4_tokens(x, local, valid, scale, starts, ends)
     hands = hand_tokens(denoise_hand_joints(x, valid, hand_filter), valid, starts, ends, scale)
-    return np.concatenate([body, hands], axis=-1)
+    if not BODY_DCT:
+        return np.concatenate([body, hands], axis=-1)
+    return np.concatenate([body, hands, body_dct_tokens(local, valid, starts, ends, scale)], axis=-1)
 
 
 def augmented_features(x, seed, epoch, sample_index, rotation_degrees=8.0, shift=1, hand_filter="none",
@@ -425,5 +488,5 @@ def split(tokens):
     tokens = np.asarray(tokens)
     lead = tokens.shape[:-2]
     body = tokens[..., :R4_FEATURES].reshape(*lead, FRAMES, PERSONS, JOINTS, TOKEN_CHANNELS)
-    hands = tokens[..., R4_FEATURES:].reshape(*lead, FRAMES, SUB, PERSONS, HAND_CHANNELS)
+    hands = tokens[..., R4_FEATURES:BASE_FEATURES].reshape(*lead, FRAMES, SUB, PERSONS, HAND_CHANNELS)
     return body, hands

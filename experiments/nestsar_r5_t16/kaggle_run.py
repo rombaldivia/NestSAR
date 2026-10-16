@@ -191,7 +191,9 @@ def default_hand_cache_name(r4_cache, hand_filter="none", body_align="none"):
     import hashlib
     manifest = json.loads((Path(r4_cache) / "manifest.json").read_text())
     key = json.dumps({"signature": manifest["signature"], "files": manifest["files"]}, sort_keys=True)
-    suffix = ("" if hand_filter == "none" else f"_{hand_filter}") + ("" if body_align == "none" else f"_{body_align}")
+    from experiments.nestsar_r5_t16 import preprocessing as pp
+    suffix = ("" if hand_filter == "none" else f"_{hand_filter}") + ("" if body_align == "none" else f"_{body_align}") \
+        + ("" if not pp.BODY_DCT else f"_dct{pp.BODY_DCT}")
     return f"{DEFAULT_HAND_CACHE}_{hashlib.sha256(key.encode()).hexdigest()[:8]}{suffix}"
 
 
@@ -217,7 +219,7 @@ def check_disk_for_cache(hand_cache, body_align, working, r4_cache=None):
             n = int(json.loads((Path(r4_cache) / "manifest.json").read_text())["samples"])
         except (OSError, KeyError, ValueError):
             pass
-    width = pp.FEATURES if body_align != "none" else pp.HAND_FEATURES
+    width = pp.FEATURES if body_align != "none" else pp.FEATURES - pp.R4_FEATURES
     need = n * pp.FRAMES * width * 4 / 2 ** 30 + 0.5
     Path(hand_cache).parent.mkdir(parents=True, exist_ok=True)
     free = shutil.disk_usage(Path(hand_cache).parent).free / 2 ** 30

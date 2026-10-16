@@ -61,6 +61,8 @@ EXPECTED_PARAMS = {
     "graph_mr": 1_300_768,
     "graph_mr_no_fast": 1_289_848,
     "graph_mr_pt": 1_308_256,
+    # graph_mr + zero-init body DCT projection: + 3K x 48 (K = NESTSAR_BODY_DCT), added in expected_params.
+    "graph_mr_dct": 1_300_768,
 }
 # Strict MFLOPs per clip (jaxpr dot MACs x 2, scan bodies x length, batch 1).
 STRICT_MFLOPS = {
@@ -96,6 +98,9 @@ def expected_params(variant):
     from .config import VARIANTS
     v = VARIANTS[variant]
     extra = (FRAMES - 16) * 176 if v.get("temporal") == "hope" and v.get("level_mixer") == "conv" else 0
+    if v.get("body_dct"):
+        from .preprocessing import DCT_CHANNELS
+        extra += DCT_CHANNELS * 48
     return EXPECTED_PARAMS[variant] + extra
 
 
@@ -103,7 +108,8 @@ _FLOPS_CACHE = {}
 
 
 def strict_mflops(variant):
-    if FRAMES == 16:
+    from .config import VARIANTS
+    if FRAMES == 16 and not VARIANTS[variant].get("body_dct"):
         return STRICT_MFLOPS[variant]
     if variant not in _FLOPS_CACHE:
         from .audit_flops import audit
@@ -196,8 +202,9 @@ def make_loss(model, config):
         else:
             kd = jnp.zeros_like(main)
         if use_mr:   # relative MSE on the masked segments only (scale-free across clips)
-            err = jnp.mean((aug["frame_recon"] - xa) ** 2, axis=-1)                 # [B,T]
-            power = jnp.mean(xa ** 2, axis=-1)
+            target = xa[..., :aug["frame_recon"].shape[-1]]    # base 942 tokens (body DCT block not rebuilt)
+            err = jnp.mean((aug["frame_recon"] - target) ** 2, axis=-1)             # [B,T]
+            power = jnp.mean(target ** 2, axis=-1)
             loss = loss + config["recon_weight"] * (jnp.sum(err * seg_mask, 1)
                                                     / (jnp.sum(power * seg_mask, 1) + 1e-3))
         hit = lambda logits: (logits.argmax(-1) == y).astype(jnp.float32)

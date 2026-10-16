@@ -42,14 +42,14 @@ def test_skeleton_constants_match_r4():
     m5.part_matrix(m5.TEN_PARTS)
 
 
-@pytest.mark.parametrize("variant", sorted(VARIANTS))
+@pytest.mark.parametrize("variant", sorted(v for v in VARIANTS if not VARIANTS[v].get("body_dct")))
 def test_parameter_counts_are_recorded(variant):
     _, params = build(variant)
     n = sum(int(np.prod(a.shape)) for a in jax.tree_util.tree_leaves(params))
     assert n == EXPECTED_PARAMS[variant]
 
 
-@pytest.mark.parametrize("variant", sorted(VARIANTS))
+@pytest.mark.parametrize("variant", sorted(v for v in VARIANTS if not VARIANTS[v].get("body_dct")))
 def test_forward_and_gradients_finite_with_zero_padding(variant):
     model, params = build(variant)
     x = real_batch(5)

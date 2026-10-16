@@ -124,7 +124,7 @@ def test_reference_discovery(tmp_path):
 def test_config_validation():
     c = validate_config({})
     assert c["variant"] == "full" and c["epochs"] == 60 and c["micro_batch"] * c["accumulation_steps"] == 256
-    for v in VARIANTS:
+    for v in [v for v in VARIANTS if not VARIANTS[v].get("body_dct")]:   # body_dct needs NESTSAR_BODY_DCT
         kw = model_kwargs(validate_config({"variant": v}))
         assert kw["model_dim"] == 176
     with pytest.raises(ValueError):

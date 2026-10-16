@@ -109,7 +109,7 @@ def build(base_dir, cache_dir, status=None, check_body=True, hand_filter="none",
     signature = _signature(base, hand_filter, body_align)
     aligned = body_align != "none"
     out_file = FULL_FILE if aligned else HAND_FILE
-    width = r5pp.FEATURES if aligned else r5pp.HAND_FEATURES
+    width = r5pp.FEATURES if aligned else r5pp.FEATURES - r5pp.R4_FEATURES   # hands (+ body DCT)
     n = int(base.meta["samples"])
     done = _existing(cache_dir, signature, base_dir)
     if done is not None:
@@ -200,7 +200,7 @@ class Dataset:
         self.base_dir = locate_base(meta, [base] if base else [])
         self.base = r4_data.Dataset(self.base_dir)
         self.hand = np.load(path, mmap_mode="r")
-        width = r5pp.FEATURES if self.body_align != "none" else r5pp.HAND_FEATURES
+        width = r5pp.FEATURES if self.body_align != "none" else r5pp.FEATURES - r5pp.R4_FEATURES
         if self.hand.shape != (meta["samples"], r5pp.FRAMES, width):
             raise ValueError(f"Unexpected hand cache shape {self.hand.shape}")
         if len(self.base.labels) != meta["samples"]:

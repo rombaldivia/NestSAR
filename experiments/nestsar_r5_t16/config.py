@@ -65,6 +65,8 @@ VARIANTS["graph_mr"] = {"spatial_mixer": "graph", "masked_recon": True}
 VARIANTS["graph_mr_no_fast"] = {"spatial_mixer": "graph", "masked_recon": True, "fast_mode": "off"}
 # graph_mr + part-temporal route (each of the 14 parts keeps its own 16-segment trajectory before pooling).
 VARIANTS["graph_mr_pt"] = {"spatial_mixer": "graph", "masked_recon": True, "part_temporal": True}
+# graph_mr + body DCT block (within-segment trajectory coefficients); needs NESTSAR_BODY_DCT=K > 0.
+VARIANTS["graph_mr_dct"] = {"spatial_mixer": "graph", "masked_recon": True, "body_dct": True}
 
 # Outer CMS: parameter tier of each temporal level = its in-clip period (optimizer steps per update).
 # Inside a level, a CMS-chain MLP named mlp_p<f> uses its own period f instead.
@@ -101,6 +103,10 @@ def validate_config(config):
 
     if c["variant"] not in VARIANTS:
         raise ValueError(f"variant must be one of {sorted(VARIANTS)}")
+    from .preprocessing import BODY_DCT
+    if bool(VARIANTS[c["variant"]].get("body_dct")) != (BODY_DCT > 0):
+        raise ValueError(f"variant {c['variant']} with NESTSAR_BODY_DCT={BODY_DCT}: body_dct variants need "
+                         "NESTSAR_BODY_DCT=K>0 and every other variant needs it unset (0)")
     for k, v in MODEL_DEFAULTS.items():
         if c[k] != v:
             raise ValueError(f"Keep {k}={v}: parameter/FLOP audits are recorded for the default sizes")
