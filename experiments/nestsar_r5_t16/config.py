@@ -67,6 +67,8 @@ VARIANTS["graph_mr_no_fast"] = {"spatial_mixer": "graph", "masked_recon": True, 
 VARIANTS["graph_mr_pt"] = {"spatial_mixer": "graph", "masked_recon": True, "part_temporal": True}
 # graph_mr + body DCT block (within-segment trajectory coefficients); needs NESTSAR_BODY_DCT=K > 0.
 VARIANTS["graph_mr_dct"] = {"spatial_mixer": "graph", "masked_recon": True, "body_dct": True}
+# graph_mr + FR-Head (CVPR 2023): training-only multi-level contrastive feature refinement (fr_head.py).
+VARIANTS["graph_mr_fr"] = {"spatial_mixer": "graph", "masked_recon": True, "fr_head": True}
 
 # Outer CMS: parameter tier of each temporal level = its in-clip period (optimizer steps per update).
 # Inside a level, a CMS-chain MLP named mlp_p<f> uses its own period f instead.
@@ -88,6 +90,10 @@ DEFAULTS.update(recon_weight=0.5, recon_mask_ratio=0.3)
 # Logit distillation from a precomputed teacher cache (npz with ids/logits/labels, aligned by sample ID).
 # Training-only: the student graph and its FLOPs are unchanged. kd_weight 0 = off.
 DEFAULTS.update(kd_teacher="", kd_weight=0.0, kd_temperature=1.0)
+# FR-Head (only used by variants with fr_head): official defaults --w-cl-loss 0.1,
+# --w-multi-cl-loss 0.1 0.2 0.5 1 (low, mid, high, fin), alpha = tau = 0.125, memory momentum 0.9.
+DEFAULTS.update(fr_weight=0.1, fr_level_weights=(0.1, 0.2, 0.5, 1.0), fr_alpha=0.125, fr_temperature=0.125,
+                fr_momentum=0.9)
 
 
 def validate_config(config):
@@ -156,6 +162,15 @@ def validate_config(config):
         raise ValueError("kd_temperature must be in (0, 20]")
     if c["kd_weight"] > 0 and not c["kd_teacher"]:
         raise ValueError("kd_weight > 0 needs kd_teacher (path to the teacher logits npz)")
+    c["fr_level_weights"] = tuple(float(w) for w in c["fr_level_weights"])
+    if len(c["fr_level_weights"]) != 4 or min(c["fr_level_weights"]) < 0:
+        raise ValueError("fr_level_weights must be 4 nonnegative weights (low, mid, high, fin)")
+    if not 0 <= c["fr_weight"] <= 10:
+        raise ValueError("fr_weight must be in [0, 10]")
+    if not (0 < c["fr_alpha"] <= 1 and 0 < c["fr_temperature"] <= 1 and 0 <= c["fr_momentum"] < 1):
+        raise ValueError("fr_alpha and fr_temperature must be in (0, 1], fr_momentum in [0, 1)")
+    if VARIANTS[c["variant"]].get("fr_head") and c["fr_weight"] > 0 and c["mix_prob"] > 0:
+        raise ValueError("FR-Head with mix_prob > 0 is not supported (its TP/FN/FP masks need one label per clip)")
     if c["kd_weight"] > 0 and c["mix_prob"] > 0:
         raise ValueError("kd with mix_prob > 0 is not supported (teacher targets are per clip, not per mix)")
     return c

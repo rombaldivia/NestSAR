@@ -29,6 +29,7 @@ from experiments.nestsar_sm_all_t16.streaming import worker as r4_worker
 from experiments.nestsar_sm_all_t16.streaming.io_utils import Reporter, atomic_bytes, atomic_json, read_json
 
 from . import MODEL_IDENTITY as BASE_IDENTITY, MODEL_NAME, VERSION
+from . import fr_head
 from .mixing import mix_batch
 from .config import OUTER_CMS_PERIODS, model_kwargs, validate_config
 from .data import Dataset
@@ -63,6 +64,8 @@ EXPECTED_PARAMS = {
     "graph_mr_pt": 1_308_256,
     # graph_mr + zero-init body DCT projection: + 3K x 48 (K = NESTSAR_BODY_DCT), added in expected_params.
     "graph_mr_dct": 1_300_768,
+    # graph_mr + 313,882 training-only FR-Head projections (absent from the inference graph).
+    "graph_mr_fr": 1_614_650,
 }
 # Strict MFLOPs per clip (jaxpr dot MACs x 2, scan bodies x length, batch 1).
 STRICT_MFLOPS = {
@@ -89,6 +92,7 @@ STRICT_MFLOPS = {
     "graph_mr": 40.882816,
     "graph_mr_no_fast": 40.587136,
     "graph_mr_pt": 47.075968,
+    "graph_mr_fr": 40.882816,
 }
 # The tables above are for the T16 contract. Other segment counts (NESTSAR_FRAMES=24/32) keep every parameter
 # count except the conv-mixer time embedding, and their strict FLOPs are measured with the same counter.
@@ -129,7 +133,7 @@ R4_WEAK_CLASS_RECALL = {
 
 TRAIN_METRICS = ("loss", "main", "aux", "kl", "acc", "aug_acc", "agreement", "eta", "alpha",
                  "g4_eta", "g4_alpha", "fast_scale_m4", "fast_scale_g4", "pair_scale",
-                 "aux_m4_acc", "aux_hand_acc", "kd")
+                 "aux_m4_acc", "aux_hand_acc", "kd", "fr")
 EVAL_COLUMNS = ("val_loss", "val_acc", "val_top5", "eta", "alpha", "aux_m4_acc", "aux_hand_acc", "count")
 
 
@@ -141,7 +145,7 @@ def implementation_identity(variant):
     """
     root = Path(__file__).resolve().parent
     digest = hashlib.sha256()
-    for name in ("model.py", "preprocessing.py", "config.py"):
+    for name in ("model.py", "preprocessing.py", "config.py", "fr_head.py"):
         digest.update(name.encode() + b"\0" + (root / name).read_bytes() + b"\0")
     return dict(BASE_IDENTITY, version=VERSION, variant=variant, source_sha256=digest.hexdigest())
 
@@ -152,6 +156,7 @@ def make_model(config):
 
 class State(train_state.TrainState):
     ema_params: object
+    fr_banks: object = None      # FR-Head class memories (training-only, saved in last.msgpack, never in inference)
 
 
 def ce(logits, labels, smoothing, labels2=None, lam=None):
@@ -164,12 +169,18 @@ def ce(logits, labels, smoothing, labels2=None, lam=None):
     return -jnp.sum(target * jax.nn.log_softmax(logits), axis=-1)
 
 
+def uses_fr(model, config):
+    return bool(getattr(model, "fr_head", False)) and config.get("fr_weight", 0.0) > 0
+
+
 def make_loss(model, config):
     """Per-sample training metrics [B, len(TRAIN_METRICS)] (column 0 = loss) for one micro-batch."""
     use_mr = bool(getattr(model, "masked_recon", False)) and config["recon_weight"] > 0
     use_kd = config.get("kd_weight", 0.0) > 0
+    use_fr = uses_fr(model, config)
 
-    def per_sample(params, key, batch):
+    def per_sample(params, key, batch, banks=None):
+        """Metrics [B, M]; with FR-Head also the updated class memories: (metrics, banks)."""
         k1, k2 = jax.random.split(key)          # unchanged key chain for every non-MR variant
         if use_mr:
             k2, k3 = jax.random.split(k2)
@@ -207,6 +218,17 @@ def make_loss(model, config):
             power = jnp.mean(target ** 2, axis=-1)
             loss = loss + config["recon_weight"] * (jnp.sum(err * seg_mask, 1)
                                                     / (jnp.sum(power * seg_mask, 1) + 1e-3))
+        new_banks = banks
+        if use_fr:   # FR-Head on both views; the class memories advance once, from the canonical view
+            fr_args = (config["fr_level_weights"], config["fr_alpha"], config["fr_temperature"],
+                       config["fr_momentum"])
+            mask = batch["mask"]
+            fr_x, new_banks = fr_head.fr_loss(out["fr_feats"], y, out["logits"], mask, banks, *fr_args)
+            fr_a, _ = fr_head.fr_loss(aug["fr_feats"], y, aug["logits"], mask, banks, *fr_args)
+            fr = (fr_x + fr_a) / 2
+            loss = loss + config["fr_weight"] * fr
+        else:
+            fr = jnp.zeros_like(main)
         hit = lambda logits: (logits.argmax(-1) == y).astype(jnp.float32)
         sl = out["stream_logits"]
         hand_acc = hit(sl[:, 1]) if sl.shape[1] > 1 else jnp.zeros_like(main)
@@ -214,9 +236,9 @@ def make_loss(model, config):
             loss, main, aux, kl, hit(out["logits"]), hit(aug["logits"]),
             (out["logits"].argmax(-1) == aug["logits"].argmax(-1)).astype(jnp.float32),
             out["sm_eta_mean"], out["sm_alpha_mean"], out["g4_eta_mean"], out["g4_alpha_mean"],
-            out["fast_scale_m4"], out["fast_scale_g4"], out["pair_scale"], hit(sl[:, 0]), hand_acc, kd,
+            out["fast_scale_m4"], out["fast_scale_g4"], out["pair_scale"], hit(sl[:, 0]), hand_acc, kd, fr,
         ], axis=-1)
-        return metrics
+        return (metrics, new_banks) if use_fr else metrics
 
     return per_sample
 
@@ -225,6 +247,7 @@ def build_steps(model, config):
     n_metrics = len(TRAIN_METRICS)
 
     per_sample = make_loss(model, config)
+    use_fr = uses_fr(model, config)
 
     @jax.jit
     def train_step(state, key, batch):
@@ -243,20 +266,26 @@ def build_steps(model, config):
         zero = jax.tree.map(jnp.zeros_like, state.params)
 
         def accumulate(carry, inputs):
-            gradient_sum, metric_sum = carry
+            gradient_sum, metric_sum, banks = carry
             micro, drop = inputs
 
             def loss_fn(params):
-                totals = jnp.sum(per_sample(params, drop, micro) * micro["mask"][:, None], axis=0)
-                return totals[0] / denom, totals
+                if use_fr:   # the class memories advance micro-batch by micro-batch, as in the original
+                    rows, new_banks = per_sample(params, drop, micro, banks)
+                else:
+                    rows, new_banks = per_sample(params, drop, micro), banks
+                totals = jnp.sum(rows * micro["mask"][:, None], axis=0)
+                return totals[0] / denom, (totals, new_banks)
 
-            (_, totals), gradients = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
-            return (jax.tree.map(lambda a, b: a + b, gradient_sum, gradients), metric_sum + totals), None
+            (_, (totals, banks)), gradients = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+            return (jax.tree.map(lambda a, b: a + b, gradient_sum, gradients), metric_sum + totals, banks), None
 
-        (grads, metrics), _ = jax.lax.scan(
-            accumulate, (zero, jnp.zeros(n_metrics, jnp.float32)), (micros, drop_keys))
+        (grads, metrics, banks), _ = jax.lax.scan(
+            accumulate, (zero, jnp.zeros(n_metrics, jnp.float32), state.fr_banks), (micros, drop_keys))
         norm = optax.global_norm(grads)
         state = state.apply_gradients(grads=grads)
+        if use_fr:
+            state = state.replace(fr_banks=banks)
         ema = jax.tree.map(lambda e, p: config["ema_decay"] * e + (1 - config["ema_decay"]) * p,
                            state.ema_params, state.params)
         state = state.replace(ema_params=ema)
@@ -362,7 +391,10 @@ def create_state(config, steps_per_epoch):
     expected = expected_params(config["variant"])
     if count != expected:
         raise RuntimeError(f"Model parameter mismatch for {config['variant']}: {count} != {expected}")
-    state = State.create(apply_fn=model.apply, params=params, tx=optimizer, ema_params=params)
+    banks = None
+    if uses_fr(model, config):   # torch.randn(h, K) per branch; fixed key so a resumed run restores the same tree
+        banks = fr_head.init_banks(jax.random.PRNGKey(config["seed"] + 7919), model.fr_hidden, NUM_CLASSES)
+    state = State.create(apply_fn=model.apply, params=params, tx=optimizer, ema_params=params, fr_banks=banks)
     return model, state, key, schedule, int(math.ceil(warm / steps_per_epoch))
 
 

@@ -685,6 +685,11 @@ class NestSARR5T16(nn.Module):
     # Body DCT block (NESTSAR_BODY_DCT=K preprocessing): within-segment trajectory coefficients per joint, added
     # to the joint embedding through a zero-initialised projection (at init the model equals the base model).
     body_dct: bool = False
+    # FR-Head (CVPR 2023), training-only: squeeze + cl_fc projections of four stages (low: joint features after
+    # the spatial mixer, spatial and temporal branch; mid: frame features; high: m4 states; fin: descriptor).
+    # Parameters always exist; the projections run only when training=True (inference graph unchanged).
+    fr_head: bool = False
+    fr_hidden: int = 256
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = False) -> Mapping[str, jnp.ndarray]:
@@ -870,6 +875,9 @@ class NestSARR5T16(nn.Module):
 
         ones = jnp.ones((b,), dtype)
         extra = {} if frame_recon is None else {"frame_recon": frame_recon}
+        if self.fr_head:
+            extra.update(FRProjections(self.spatial_dim, self.model_dim, self.fr_hidden, name="fr_head")(
+                s, jv, f, m4, desc, training))
         return {**extra,
             "logits": logits,
             "main_logits": logits,
@@ -885,3 +893,41 @@ class NestSARR5T16(nn.Module):
             "pair_rate": jnp.mean(pair, axis=1),
             "hand_valid_rate": hand_valid_rate,
         }
+
+
+
+class FRProjections(nn.Module):
+    """FR-Head refined features (ST_RenovateNet squeeze + RenovateNet cl_fc), one [B, hidden] per branch.
+    Parameters are created at init as well (explicit params), but only computed when training."""
+    spatial_dim: int
+    model_dim: int
+    hidden: int = 256
+
+    @nn.compact
+    def __call__(self, s, jv, f, m4, desc, training):
+        h = self.hidden
+        b = s.shape[0]
+
+        def linear(name, d_in, d_out):
+            w = self.param(f"{name}_w", nn.initializers.lecun_normal(), (d_in, d_out))
+            bias = self.param(f"{name}_b", nn.initializers.zeros, (d_out,))
+            return lambda z: z @ w + bias
+
+        sq_j, sq_t = h // JOINTS, h // FRAMES
+        layers = {
+            "low_s": (linear("fr_low_s_sq", self.spatial_dim, sq_j), linear("fr_low_s_fc", sq_j * JOINTS, h)),
+            "low_t": (linear("fr_low_t_sq", self.spatial_dim, sq_t), linear("fr_low_t_fc", sq_t * FRAMES, h)),
+            "mid_t": (linear("fr_mid_t_sq", self.model_dim, sq_t), linear("fr_mid_t_fc", sq_t * FRAMES, h)),
+            "high_t": (linear("fr_high_t_sq", self.model_dim, sq_t), linear("fr_high_t_fc", sq_t * FRAMES, h)),
+        }
+        fin = linear("fr_fin_fc", self.model_dim, h)
+        if not training:
+            return {}
+        # Mean over persons (and time / joints), counting valid joints only (the original averages persons).
+        w_sum = lambda axes: jnp.maximum(jnp.sum(jv, axis=axes), 1.0)
+        spatial = jnp.sum(s * jv, axis=(1, 2)) / w_sum((1, 2))                 # [B,V,Ds]
+        temporal = jnp.sum(s * jv, axis=(2, 3)) / w_sum((2, 3))                # [B,T,Ds]
+        inputs = {"low_s": spatial, "low_t": temporal, "mid_t": f, "high_t": m4}
+        feats = {name: fc(nn.relu(sq(inputs[name])).reshape(b, -1)) for name, (sq, fc) in layers.items()}
+        feats["fin"] = fin(desc)
+        return {"fr_feats": feats}
