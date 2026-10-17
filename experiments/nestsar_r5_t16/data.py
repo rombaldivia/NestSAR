@@ -281,14 +281,16 @@ class Dataset:
                     b["xa"][j] = r5pp.strong_augmented_features(
                         sample, protocol_seed, aug_epoch, int(position), strength, stream=1,
                         shift=config["jitter_shift"], hand_filter=self.hand_filter, body_align=self.body_align,
-                        view_degrees=config.get("aug_view_degrees", 15.0))
+                        view_degrees=config.get("aug_view_degrees", 15.0),
+                        random_frame=config.get("aug_random_frame", False))
                     keep_clean = np.random.default_rng(np.random.SeedSequence(
                         [protocol_seed, aug_epoch, int(position), 4177])).random() < config.get("aug_clean_prob", 0.2)
                     if not keep_clean:
                         b["x"][j] = r5pp.strong_augmented_features(
                             sample, protocol_seed, aug_epoch, int(position), strength, stream=0,
                             shift=config["jitter_shift"], hand_filter=self.hand_filter, body_align=self.body_align,
-                        view_degrees=config.get("aug_view_degrees", 15.0))
+                        view_degrees=config.get("aug_view_degrees", 15.0),
+                        random_frame=config.get("aug_random_frame", False))
                 else:
                     b["xa"][j] = r5pp.augmented_features(
                         sample, protocol_seed, aug_epoch, int(position),

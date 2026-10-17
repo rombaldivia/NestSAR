@@ -83,7 +83,7 @@ DEFAULTS.update(variant="full", early_stop_guard_epoch=14)
 # Strong training-only augmentation (preprocessing.strong_augmented_features). 0 = the R4 recipe
 # (yaw +-8 deg and +-1 frame boundary jitter on one augmented view).
 DEFAULTS.update(aug_strength=0.0, aug_clean_prob=0.2, prefetch_workers=1, hand_filter="none", aug_view_degrees=15.0, body_align="none", mix_prob=0.0, aug_pool="",
-                aug_pool_views_use=0)   # 0 = draw from every pooled view; K>0 = only the first K (view-count ablation)
+                aug_pool_views_use=0, aug_random_frame=False)   # 0 = draw from every pooled view; K>0 = only the first K (view-count ablation)
 # HOPE optimizer side: "auto" = on for hope* variants, off otherwise (R5 keeps its exact optimizer).
 DEFAULTS.update(outer_cms="auto", dmgd="auto", dmgd_momentum=0.90, dmgd_memory_lr=0.01, dmgd_mix=0.10,
                 dmgd_cap=2.0)
@@ -141,6 +141,10 @@ def validate_config(config):
     if not isinstance(c["aug_pool_views_use"], int) or isinstance(c["aug_pool_views_use"], bool) \
             or c["aug_pool_views_use"] < 0:
         raise ValueError("aug_pool_views_use must be a nonnegative integer (0 = all pooled views)")
+    if not isinstance(c["aug_random_frame"], bool):
+        raise ValueError("aug_random_frame must be true or false")
+    if c["aug_random_frame"] and (not c["aug_strength"] > 0 or c["aug_pool"]):
+        raise ValueError("aug_random_frame needs live strong augmentation (aug_strength > 0, no aug_pool)")
     if c["prefetch_workers"] not in (1, 2, 3, 4):
         raise ValueError("prefetch_workers must be 1..4")
     hope = c["variant"].startswith("hope")

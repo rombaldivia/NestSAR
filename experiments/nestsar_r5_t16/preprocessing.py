@@ -65,11 +65,13 @@ if FRAMES not in (16, 24, 32) or (PERSONS, JOINTS, TOKEN_CHANNELS) != (2, 25, 15
     raise RuntimeError("R5 expects the R4 T16|24|32/M2/V25/C15 token contract")
 
 
-def representative_pose(local, valid, starts, ends):
+def representative_pose(local, valid, starts, ends, rng=None):
     """Vectorized ``pp.representative_pose`` (identical choice, tested bit-exact).
 
     Per segment and person: the frame with most valid joints, ties broken by
     distance to the segment centre, then by the earlier frame.
+    With ``rng`` (training only, SGN-style "random frame per segment"): a uniformly random frame among the
+    segment frames with most valid joints, the same draw for both persons.
     """
     starts = np.asarray(starts, np.int64)
     ends = np.asarray(ends, np.int64)
@@ -86,6 +88,8 @@ def representative_pose(local, valid, starts, ends):
     best = seg_counts.max(axis=1)                                               # [F, P]
     center = 0.5 * (starts.astype(np.float64) + (ends - 1).astype(np.float64))
     distance = np.abs(frames.astype(np.float64) - center[:, None])              # [F, W]
+    if rng is not None:
+        distance = rng.random(distance.shape)
     candidate = inside[..., None] & (seg_counts == best[:, None, :])
     score = np.where(candidate, distance[..., None], np.inf)
     chosen = np.take_along_axis(safe, np.argmin(score, axis=1), axis=1)         # [F, P]
@@ -95,10 +99,10 @@ def representative_pose(local, valid, starts, ends):
     return pose
 
 
-def r4_tokens(x, local, valid, scale, starts, ends):
+def r4_tokens(x, local, valid, scale, starts, ends, frame_rng=None):
     """Body of ``preprocessing_corrected.features`` for given segment bounds."""
     total = len(x)
-    pose = representative_pose(local, valid, starts, ends)
+    pose = representative_pose(local, valid, starts, ends, frame_rng)
     d = np.where((valid[1:] & valid[:-1])[..., None], x[1:] - x[:-1], 0)
     prefix = np.concatenate([np.zeros_like(x[:1]), np.cumsum(d, axis=0, dtype=np.float64)])
     path_prefix = np.concatenate([np.zeros_like(x[:1]), np.cumsum(np.abs(d), axis=0, dtype=np.float64)])
@@ -348,7 +352,7 @@ def denoise_hand_joints(x, valid, mode):
     return out
 
 
-def features(x, valid=None, rng=None, shift=0, hand_filter="none", body_align="none"):
+def features(x, valid=None, rng=None, shift=0, hand_filter="none", body_align="none", frame_rng=None):
     """R5 tokens [FRAMES, FEATURES]; the first 750 equal ``pp.features`` exactly."""
     x = np.asarray(x, np.float32)
     if body_align not in BODY_ALIGNS:
@@ -360,7 +364,7 @@ def features(x, valid=None, rng=None, shift=0, hand_filter="none", body_align="n
     if total == 0:
         return np.zeros((FRAMES, FEATURES), np.float32)
     starts, ends = pp.segment_bounds(total, rng=rng, shift=shift)
-    body = r4_tokens(x, local, valid, scale, starts, ends)
+    body = r4_tokens(x, local, valid, scale, starts, ends, frame_rng)
     hands = hand_tokens(denoise_hand_joints(x, valid, hand_filter), valid, starts, ends, scale)
     if not BODY_DCT:
         return np.concatenate([body, hands], axis=-1)
@@ -448,11 +452,13 @@ def _resample_time(x, valid, factor):
 
 
 def strong_augmented_features(x, seed, epoch, sample_index, strength=1.0, stream=0, shift=1, hand_filter="none",
-                              view_degrees=15.0, body_align="none"):
+                              view_degrees=15.0, body_align="none", random_frame=False):
     """R5 tokens of a strongly augmented view of the raw clip ``x`` [T, 2, 25, 3].
 
     Deterministic in (seed, epoch, sample_index, stream), so a resumed run repeats the same views.
     Order: affine -> bone lengths -> joint noise -> speed -> temporal crop -> joint cut-out -> tokens.
+    ``random_frame``: the segment pose is a random frame of the segment (own RNG stream, so every other draw is
+    the same as without it).
     """
     x = np.asarray(x, np.float32)
     valid = pp.raw_valid(x)
@@ -482,8 +488,10 @@ def strong_augmented_features(x, seed, epoch, sample_index, strength=1.0, stream
         x = x.copy()
         x[start:start + span, person, cut] = 0
     valid = pp.raw_valid(x)
+    frame_rng = np.random.default_rng(np.random.SeedSequence([seed, epoch, sample_index, 7919, stream, 313])) \
+        if random_frame else None
     return features(np.where(valid[..., None], x, 0).astype(np.float32), valid, rng=rng, shift=shift,
-                    hand_filter=hand_filter)
+                    hand_filter=hand_filter, frame_rng=frame_rng)
 
 
 def split(tokens):
