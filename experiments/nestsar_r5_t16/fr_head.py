@@ -18,10 +18,15 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-LEVELS = ("low_s", "low_t", "mid_t", "high_t", "fin")
-# FR-Head multi-level weights (low, mid, high, fin). Our low level has both the spatial and the temporal
-# branch (the only stage that still has a joint axis), as the original ST_RenovateNet sums them.
-LEVEL_OF = {"low_s": 0, "low_t": 0, "mid_t": 1, "high_t": 2, "fin": 3}
+LEVELS = ("low_s", "low_t", "mid_t", "high_t", "fin")                       # v1
+LEVELS_V2 = ("low_s", "low_t", "mid_s", "mid_t", "high_f", "high_m", "fin")  # v2: every stage with an axis
+# FR-Head multi-level weights (low, mid, high, fin): the branches of one level are summed, as the original
+# ST_RenovateNet sums its spatial and temporal losses.
+LEVEL_OF = {"low_s": 0, "low_t": 0, "mid_s": 1, "mid_t": 1, "high_t": 2, "high_f": 2, "high_m": 2, "fin": 3}
+
+
+def levels(version):
+    return LEVELS if version == 1 else LEVELS_V2
 
 
 def _unit(a, axis):
@@ -73,15 +78,15 @@ def fr_loss(feats, y, logits, mask, banks, level_weights, alpha, tau, momentum):
     """Sum over the FR branches: sum_l w_level(l) * loss_l. feats/banks: dicts keyed by LEVELS.
 
     Returns (per-sample loss [B], new banks dict)."""
-    total = jnp.zeros(y.shape, feats[LEVELS[0]].dtype)
+    total = jnp.zeros(y.shape, next(iter(feats.values())).dtype)
     new = {}
-    for name in LEVELS:
+    for name in sorted(feats):
         loss, new[name] = renovate(feats[name], y, logits, mask, banks[name], alpha, tau, momentum)
         total = total + level_weights[LEVEL_OF[name]] * loss
     return total, new
 
 
-def init_banks(key, hidden, num_classes):
+def init_banks(key, hidden, num_classes, names=LEVELS):
     """torch.randn(h, K) per branch, as the original."""
-    keys = jax.random.split(key, len(LEVELS))
-    return {name: jax.random.normal(k, (hidden, num_classes), jnp.float32) for name, k in zip(LEVELS, keys)}
+    keys = jax.random.split(key, len(names))
+    return {name: jax.random.normal(k, (hidden, num_classes), jnp.float32) for name, k in zip(names, keys)}

@@ -69,6 +69,9 @@ VARIANTS["graph_mr_pt"] = {"spatial_mixer": "graph", "masked_recon": True, "part
 VARIANTS["graph_mr_dct"] = {"spatial_mixer": "graph", "masked_recon": True, "body_dct": True}
 # graph_mr + FR-Head (CVPR 2023): training-only multi-level contrastive feature refinement (fr_head.py).
 VARIANTS["graph_mr_fr"] = {"spatial_mixer": "graph", "masked_recon": True, "fr_head": True}
+# FR-Head v2: every stage with an axis (joints S+T, parts S+T, frames + m4 T, descriptor) and the original
+# squeeze (projection -> training-mode BatchNorm -> ReLU).
+VARIANTS["graph_mr_fr2"] = {"spatial_mixer": "graph", "masked_recon": True, "fr_head": True, "fr_version": 2}
 
 # Outer CMS: parameter tier of each temporal level = its in-clip period (optimizer steps per update).
 # Inside a level, a CMS-chain MLP named mlp_p<f> uses its own period f instead.

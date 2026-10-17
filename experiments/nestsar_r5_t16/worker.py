@@ -66,6 +66,8 @@ EXPECTED_PARAMS = {
     "graph_mr_dct": 1_300_768,
     # graph_mr + 313,882 training-only FR-Head projections (absent from the inference graph).
     "graph_mr_fr": 1_614_650,
+    # graph_mr + 446,292 training-only FR-Head v2 projections (all stages, BatchNorm squeezes).
+    "graph_mr_fr2": 1_747_060,
 }
 # Strict MFLOPs per clip (jaxpr dot MACs x 2, scan bodies x length, batch 1).
 STRICT_MFLOPS = {
@@ -93,6 +95,7 @@ STRICT_MFLOPS = {
     "graph_mr_no_fast": 40.587136,
     "graph_mr_pt": 47.075968,
     "graph_mr_fr": 40.882816,
+    "graph_mr_fr2": 40.882816,
 }
 # The tables above are for the T16 contract. Other segment counts (NESTSAR_FRAMES=24/32) keep every parameter
 # count except the conv-mixer time embedding, and their strict FLOPs are measured with the same counter.
@@ -184,14 +187,15 @@ def make_loss(model, config):
         k1, k2 = jax.random.split(key)          # unchanged key chain for every non-MR variant
         if use_mr:
             k2, k3 = jax.random.split(k2)
-        out = model.apply({"params": params}, batch["x"], training=True, rngs={"dropout": k1})
+        fr_kw = {"fr_mask": batch["mask"]} if use_fr else {}    # FR-Head v2 BatchNorm skips padding clips
+        out = model.apply({"params": params}, batch["x"], training=True, rngs={"dropout": k1}, **fr_kw)
         xa = batch["xa"]
         if use_mr:   # zero a random subset of the augmented view's segments; rebuild them from context
             seg_mask = jax.random.bernoulli(k3, config["recon_mask_ratio"], xa.shape[:2]).astype(xa.dtype)
             xa_in = xa * (1 - seg_mask)[..., None]
         else:
             xa_in = xa
-        aug = model.apply({"params": params}, xa_in, training=True, rngs={"dropout": k2})
+        aug = model.apply({"params": params}, xa_in, training=True, rngs={"dropout": k2}, **fr_kw)
         y, smooth = batch["y"], config["label_smoothing"]
         y2, lam = batch["y2"], batch["lam"]
         main = (ce(out["logits"], y, smooth, y2, lam) + ce(aug["logits"], y, smooth, y2, lam)) / 2
@@ -393,7 +397,8 @@ def create_state(config, steps_per_epoch):
         raise RuntimeError(f"Model parameter mismatch for {config['variant']}: {count} != {expected}")
     banks = None
     if uses_fr(model, config):   # torch.randn(h, K) per branch; fixed key so a resumed run restores the same tree
-        banks = fr_head.init_banks(jax.random.PRNGKey(config["seed"] + 7919), model.fr_hidden, NUM_CLASSES)
+        banks = fr_head.init_banks(jax.random.PRNGKey(config["seed"] + 7919), model.fr_hidden, NUM_CLASSES,
+                                   fr_head.levels(model.fr_version))
     state = State.create(apply_fn=model.apply, params=params, tx=optimizer, ema_params=params, fr_banks=banks)
     return model, state, key, schedule, int(math.ceil(warm / steps_per_epoch))
 

@@ -690,9 +690,12 @@ class NestSARR5T16(nn.Module):
     # Parameters always exist; the projections run only when training=True (inference graph unchanged).
     fr_head: bool = False
     fr_hidden: int = 256
+    # 1: joints (S+T), frames (T), m4 (T), descriptor. 2 (all stages): joints (S+T), parts (S+T), frames + m4 (T),
+    # descriptor, each squeeze with a training-mode BatchNorm as the original ST_RenovateNet.
+    fr_version: int = 1
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, training: bool = False) -> Mapping[str, jnp.ndarray]:
+    def __call__(self, x: jnp.ndarray, training: bool = False, fr_mask=None) -> Mapping[str, jnp.ndarray]:
         if x.ndim != 3 or x.shape[1] != FRAMES or x.shape[2] != FEATURES:
             raise ValueError(f"Expected [B,{FRAMES},{FEATURES}], got {x.shape}")
         if self.fast_mode not in ("surprise", "capped", "off"):
@@ -772,6 +775,7 @@ class NestSARR5T16(nn.Module):
             seq = Sweep(self.part_temporal_hidden, bidirectional=True, name="pt_sweep")(seq)
             pt = jnp.transpose(seq.reshape(b, PERSONS, n_parts, FRAMES, self.part_temporal_dim), (0, 3, 1, 2, 4)) * pv
             part_feat = part_feat + nn.Dense(self.spatial_dim, kernel_init=nn.initializers.zeros, name="pt_out")(pt) * pv
+        fr_parts = (part_feat, weight)            # FR-Head v2 mid level (training-only; unused otherwise)
         person_in = [part_feat.reshape(b, FRAMES, PERSONS, -1),
                      self_relations(pose, joint_valid)]
 
@@ -875,9 +879,12 @@ class NestSARR5T16(nn.Module):
 
         ones = jnp.ones((b,), dtype)
         extra = {} if frame_recon is None else {"frame_recon": frame_recon}
-        if self.fr_head:
+        if self.fr_head and self.fr_version == 1:
             extra.update(FRProjections(self.spatial_dim, self.model_dim, self.fr_hidden, name="fr_head")(
                 s, jv, f, m4, desc, training))
+        elif self.fr_head:
+            extra.update(FRProjectionsV2(self.spatial_dim, self.model_dim, self.fr_hidden, name="fr_head")(
+                s, jv, fr_parts[0], fr_parts[1], f, m4, desc, fr_mask, training))
         return {**extra,
             "logits": logits,
             "main_logits": logits,
@@ -929,5 +936,65 @@ class FRProjections(nn.Module):
         temporal = jnp.sum(s * jv, axis=(2, 3)) / w_sum((2, 3))                # [B,T,Ds]
         inputs = {"low_s": spatial, "low_t": temporal, "mid_t": f, "high_t": m4}
         feats = {name: fc(nn.relu(sq(inputs[name])).reshape(b, -1)) for name, (sq, fc) in layers.items()}
+        feats["fin"] = fin(desc)
+        return {"fr_feats": feats}
+
+
+class FRProjectionsV2(nn.Module):
+    """FR-Head v2: every stage that keeps an axis gets its branches, and every squeeze is
+    1x1 projection -> BatchNorm -> ReLU as in the original ST_RenovateNet.
+
+      low  : joint features after the spatial mixer  -> spatial (25 joints) + temporal
+      mid  : part features (14 parts per person)     -> spatial (14 parts)  + temporal
+      high : frame features and m4 states            -> temporal + temporal
+      fin  : descriptor                              -> cl_fc only
+
+    The BatchNorm is the training-mode one (batch statistics; FR-Head never runs at inference, so no running
+    averages are needed) and ignores padding clips (fr_mask = 0)."""
+    spatial_dim: int
+    model_dim: int
+    hidden: int = 256
+
+    @nn.compact
+    def __call__(self, s, jv, parts, part_weight, f, m4, desc, fr_mask, training):
+        h = self.hidden
+        b, n_parts = s.shape[0], parts.shape[3]
+
+        def linear(name, d_in, d_out):
+            w = self.param(f"{name}_w", nn.initializers.lecun_normal(), (d_in, d_out))
+            bias = self.param(f"{name}_b", nn.initializers.zeros, (d_out,))
+            return lambda z: z @ w + bias
+
+        def squeeze(name, d_in, d_out):
+            proj = linear(f"{name}_sq", d_in, d_out)
+            gamma = self.param(f"{name}_bn_scale", nn.initializers.ones, (d_out,))
+            beta = self.param(f"{name}_bn_bias", nn.initializers.zeros, (d_out,))
+
+            def apply(z, rows):               # z [B, L, d_in]; rows [B, 1, 1] (1 = real clip)
+                y = proj(z)
+                count = jnp.maximum(jnp.sum(rows) * y.shape[1], 1.0)
+                mean = jnp.sum(y * rows, axis=(0, 1)) / count
+                var = jnp.sum(jnp.square(y - mean) * rows, axis=(0, 1)) / count
+                return nn.relu((y - mean) * jax.lax.rsqrt(var + 1e-5) * gamma + beta)
+            return apply
+
+        sq_j, sq_p, sq_t = h // JOINTS, h // n_parts, h // FRAMES
+        spec = {   # name: (input width, axis length, squeeze width)
+            "low_s": (self.spatial_dim, JOINTS, sq_j), "low_t": (self.spatial_dim, FRAMES, sq_t),
+            "mid_s": (self.spatial_dim, n_parts, sq_p), "mid_t": (self.spatial_dim, FRAMES, sq_t),
+            "high_f": (self.model_dim, FRAMES, sq_t), "high_m": (self.model_dim, FRAMES, sq_t),
+        }
+        layers = {n: (squeeze(f"fr_{n}", d, q), linear(f"fr_{n}_fc", q * length, h))
+                  for n, (d, length, q) in spec.items()}
+        fin = linear("fr_fin_fc", self.model_dim, h)
+        if not training:
+            return {}
+        rows = (jnp.ones((b,), s.dtype) if fr_mask is None else fr_mask.astype(s.dtype))[:, None, None]
+        pw = (part_weight > 0)[..., None].astype(s.dtype)                         # [B,T,P,Q,1]
+        mean = lambda z, w, axes: jnp.sum(z * w, axis=axes) / jnp.maximum(jnp.sum(w, axis=axes), 1.0)
+        inputs = {"low_s": mean(s, jv, (1, 2)), "low_t": mean(s, jv, (2, 3)),        # [B,V,Ds], [B,T,Ds]
+                  "mid_s": mean(parts, pw, (1, 2)), "mid_t": mean(parts, pw, (2, 3)),  # [B,Q,Ds], [B,T,Ds]
+                  "high_f": f, "high_m": m4}
+        feats = {n: fc(sq(inputs[n], rows).reshape(b, -1)) for n, (sq, fc) in layers.items()}
         feats["fin"] = fin(desc)
         return {"fr_feats": feats}

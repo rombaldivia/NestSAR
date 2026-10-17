@@ -1,4 +1,5 @@
-"""FR-Head (graph_mr_fr): training-only, inference unchanged, memories behave as the official RenovateNet."""
+"""FR-Head (graph_mr_fr, graph_mr_fr2): training-only, inference unchanged, memories behave as the official
+RenovateNet, v2 BatchNorm ignores padding clips."""
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -8,6 +9,8 @@ from experiments.nestsar_r5_t16 import fr_head, worker
 from experiments.nestsar_r5_t16 import preprocessing as pp
 from experiments.nestsar_r5_t16.config import model_kwargs, validate_config
 from experiments.nestsar_r5_t16.model import NUM_CLASSES, NestSARR5T16
+
+VARIANTS = {"graph_mr_fr": fr_head.LEVELS, "graph_mr_fr2": fr_head.LEVELS_V2}
 
 
 def _batch(n=4, seed=0):
@@ -19,9 +22,13 @@ def _batch(n=4, seed=0):
     return {"x": jnp.asarray(x), "xa": jnp.asarray(xa), "y": jnp.asarray(y), "mask": jnp.ones(n, jnp.float32)}
 
 
-def test_inference_is_the_base_model():
-    base = NestSARR5T16(**model_kwargs(validate_config({"variant": "graph_mr"})))
-    fr = NestSARR5T16(**model_kwargs(validate_config({"variant": "graph_mr_fr"})))
+def _model(variant):
+    return NestSARR5T16(**model_kwargs(validate_config({"variant": variant})))
+
+
+@pytest.mark.parametrize("variant", sorted(VARIANTS))
+def test_inference_is_the_base_model(variant):
+    base, fr = _model("graph_mr"), _model(variant)
     x = _batch()["x"]
     p_fr = fr.init({"params": jax.random.PRNGKey(0), "dropout": jax.random.PRNGKey(0)}, x, training=False)["params"]
     p_base = {k: v for k, v in p_fr.items() if k != "fr_head"}
@@ -29,11 +36,24 @@ def test_inference_is_the_base_model():
     np.testing.assert_array_equal(out_fr["logits"], out_base["logits"])
     assert "fr_feats" not in out_fr
     assert sum(v.size for v in jax.tree.leaves(p_fr["fr_head"])) == \
-        worker.EXPECTED_PARAMS["graph_mr_fr"] - worker.EXPECTED_PARAMS["graph_mr"]
-    assert worker.STRICT_MFLOPS["graph_mr_fr"] == worker.STRICT_MFLOPS["graph_mr"]
+        worker.EXPECTED_PARAMS[variant] - worker.EXPECTED_PARAMS["graph_mr"]
+    assert worker.STRICT_MFLOPS[variant] == worker.STRICT_MFLOPS["graph_mr"]
     train = fr.apply({"params": p_fr}, x, training=True, rngs={"dropout": jax.random.PRNGKey(1)})
-    assert set(train["fr_feats"]) == set(fr_head.LEVELS)
+    assert set(train["fr_feats"]) == set(VARIANTS[variant])
     assert all(v.shape == (4, 256) and np.isfinite(np.asarray(v)).all() for v in train["fr_feats"].values())
+
+
+def test_v2_batchnorm_ignores_padding_clips():
+    fr = _model("graph_mr_fr2")
+    b = _batch(4)
+    p = fr.init({"params": jax.random.PRNGKey(0), "dropout": jax.random.PRNGKey(0)}, b["x"], training=False)["params"]
+    mask = jnp.asarray([1, 1, 1, 0], jnp.float32)
+    feats = lambda x: fr.apply({"params": p}, x, training=True, fr_mask=mask, rngs={"dropout": jax.random.PRNGKey(2)}
+                               )["fr_feats"]
+    other = b["x"].at[3].set(b["x"][3] * 5 + 1)                     # change only the padding clip
+    a, c = feats(b["x"]), feats(other)
+    for name in fr_head.LEVELS_V2:
+        np.testing.assert_allclose(a[name][:3], c[name][:3], atol=1e-5)
 
 
 def test_memory_moves_only_for_true_positive_classes_and_ignores_padding():
@@ -60,28 +80,24 @@ def test_zero_features_stay_finite():
     assert np.isfinite(np.asarray(loss)).all() and np.isfinite(np.asarray(new)).all()
 
 
-@pytest.fixture(scope="module")
-def tiny():
-    config = validate_config({"variant": "graph_mr_fr", "micro_batch": 2, "accumulation_steps": 2, "epochs": 2})
+@pytest.mark.parametrize("variant", sorted(VARIANTS))
+def test_train_step_updates_the_memories_and_weight_zero_is_the_base_path(variant):
+    config = validate_config({"variant": variant, "micro_batch": 2, "accumulation_steps": 2, "epochs": 2})
     model, state, key, _, _ = worker.create_state(config, 2)
-    return model, state, key, config
-
-
-def test_train_step_updates_the_memories_and_weight_zero_is_the_base_path(tiny):
-    model, state, key, config = tiny
     b = _batch()
     # make two clips true positives of the untrained model, so their classes get a memory update
     pred = model.apply({"params": state.params}, b["x"], training=False)["logits"].argmax(-1)
     b["y"] = b["y"].at[:2].set(pred[:2])
-    assert set(state.fr_banks) == set(fr_head.LEVELS)
+    names = VARIANTS[variant]
+    assert set(state.fr_banks) == set(names)
     new_state, _, metrics = worker.build_steps(model, config)[0](state, key, b)
     m = np.asarray(metrics)
     assert np.isfinite(m).all() and m[worker.TRAIN_METRICS.index("fr")] > 0
-    assert any(float(jnp.abs(new_state.fr_banks[n] - state.fr_banks[n]).max()) > 0 for n in fr_head.LEVELS)
+    assert any(float(jnp.abs(new_state.fr_banks[n] - state.fr_banks[n]).max()) > 0 for n in names)
     off = dict(config, fr_weight=0.0)
     off_state, _, off_metrics = worker.build_steps(model, off)[0](state, key, b)
     assert float(np.asarray(off_metrics)[worker.TRAIN_METRICS.index("fr")]) == 0.0
-    for n in fr_head.LEVELS:
+    for n in names:
         np.testing.assert_array_equal(off_state.fr_banks[n], state.fr_banks[n])
 
 
