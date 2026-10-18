@@ -34,7 +34,9 @@ import sys
 import time
 from pathlib import Path
 
-PROTOCOLS = ("xsub", "xset")
+from experiments.nestsar_sm_all_t16.streaming import dataset_spec as _spec
+
+PROTOCOLS = _spec.PROTOCOLS                 # ("xsub", "xset") on NTU-120, ("xsub", "xview") on NTU-60
 WORKER = "experiments.nestsar_r5_t16.worker"
 LAUNCHER = "experiments.nestsar_r5_t16.launch"
 REF_LABEL = "R4-FMSE"
@@ -78,6 +80,8 @@ def is_reference(d, p):
 
 def find_reference(explicit=None, roots=("/kaggle/working", "/kaggle/input")):
     preferred = meta().PREFERRED_REFERENCE
+    if _spec.DATASET != "ntu120" and not explicit:
+        return None             # the R4 references are NTU-120 runs: never compare or kill an NTU-60 run against them
     if explicit:
         cands = [explicit]
     else:
@@ -185,7 +189,7 @@ def main(argv=None):
     ap.add_argument("--cache", required=True, help="R5 hand-cache directory")
     ap.add_argument("--outdir", default="/kaggle/working/NestSAR_R5_T16_v1")
     ap.add_argument("--variant", default="full")
-    ap.add_argument("--protocols", default="xsub,xset", help="comma list; GPU i runs the i-th protocol")
+    ap.add_argument("--protocols", default=",".join(PROTOCOLS), help="comma list; GPU i runs the i-th protocol")
     ap.add_argument("--gpu-offset", type=int, default=0,
                     help="first GPU index (two one-protocol runs side by side: 0 and 1)")
     ap.add_argument("--micro-batch", type=int, default=64)

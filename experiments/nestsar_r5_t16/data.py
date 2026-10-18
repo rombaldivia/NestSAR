@@ -29,6 +29,7 @@ from experiments.nestsar_sm_all_t16.streaming import data as r4_data
 from experiments.nestsar_sm_all_t16.streaming.io_utils import Reporter, atomic_json
 
 from . import preprocessing as r5pp
+from experiments.nestsar_sm_all_t16.streaming import dataset_spec as spec
 
 CACHE_VERSION = "nestsar-r5-hand-cache-v1"
 HAND_FILE = "hand.npy"
@@ -231,7 +232,7 @@ class Dataset:
             bad = np.flatnonzero(np.asarray(z["labels"][pos], np.int64) != np.asarray(self.labels, np.int64))
             if len(bad):
                 raise ValueError(f"Teacher/cache label mismatch at {len(bad)} samples, e.g. {bad[:5].tolist()}")
-            if logits.shape != (len(ids), 120) or not np.isfinite(logits).all():
+            if logits.shape != (len(ids), spec.NUM_CLASSES) or not np.isfinite(logits).all():
                 raise ValueError(f"Bad teacher logits {logits.shape}")
             self._teachers[path] = logits
         return self._teachers[path]
@@ -262,11 +263,11 @@ class Dataset:
         b["y"][:len(indices)] = self.labels[indices]
         b["mask"][:len(indices)] = 1
         if training and config.get("kd_weight", 0.0) > 0:
-            b["t"] = np.zeros((size, 120), np.float32)
+            b["t"] = np.zeros((size, spec.NUM_CLASSES), np.float32)
             b["t"][:len(indices)] = self.teacher(config["kd_teacher"])[np.asarray(indices, np.int64)]
         if training:
             b["xa"] = np.zeros_like(b["x"])
-            protocol_seed = config["seed"] + (100000 if protocol == "xset" else 0)
+            protocol_seed = spec.protocol_seed(config["seed"], protocol)
             strength = config.get("aug_strength", 0.0)
             aug_epoch = epoch if config["fresh_augmentation"] else 1
             pool = self.pool(config["aug_pool"]) if strength > 0 and config.get("aug_pool") else None

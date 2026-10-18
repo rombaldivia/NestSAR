@@ -18,7 +18,9 @@ import os
 import time
 from pathlib import Path
 
-PROTOCOLS = ("xsub", "xset")
+from experiments.nestsar_sm_all_t16.streaming import dataset_spec as _spec
+
+PROTOCOLS = _spec.PROTOCOLS
 HERE = Path(__file__).resolve().parent
 
 

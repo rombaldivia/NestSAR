@@ -49,7 +49,9 @@ from experiments.nestsar_r5_t16.preprocessing import (
     TOKEN_CHANNELS,
 )
 
-NUM_CLASSES = 120
+from experiments.nestsar_sm_all_t16.streaming import dataset_spec
+
+NUM_CLASSES = dataset_spec.NUM_CLASSES          # 120 (NTU-120, default) or 60 (NESTSAR_DATASET=ntu60)
 
 # NTU-25 skeleton (zero-based). Identical to the R4 constants (checked in tests).
 PARENTS = np.asarray([0, 0, 20, 2, 20, 4, 5, 6, 20, 8, 9, 10, 0,

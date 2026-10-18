@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 from .. import preprocessing_corrected as pp
 from . import VERSION
+from . import dataset_spec as spec
 from .io_utils import Reporter, atomic_json
 
 
@@ -33,7 +34,7 @@ def resolve_splits(annotations, splits):
     by_id = {sid: i for i, sid in enumerate(ids)}
     lower = {str(k).lower(): k for k in splits}
     result = {}
-    for protocol in ("xsub", "xset"):
+    for protocol in spec.PROTOCOLS:
         for part in ("train", "val"):
             aliases = (f"{protocol}_train", f"{protocol}train", f"train_{protocol}") if part == "train" else (
                 f"{protocol}_val", f"{protocol}_test", f"{protocol}val", f"{protocol}test", f"val_{protocol}", f"test_{protocol}")
@@ -95,8 +96,9 @@ def prepare(dataset, cache, status, layout="MTVC"):
             labels[i] = int(_value(annotation, ("label", "action_label", "class", "target")))
             if i % 200 == 0:
                 report(phase="Check raw data", current=i, total=n)
-        if np.any((labels < 0) | (labels >= 120)):
-            raise ValueError("Expected zero-based NTU120 labels 0..119; no automatic label shifting")
+        if np.any((labels < 0) | (labels >= spec.NUM_CLASSES)):
+            raise ValueError(f"Expected zero-based {spec.DATASET} labels 0..{spec.NUM_CLASSES - 1}; "
+                             "no automatic label shifting")
         offsets = np.r_[0, np.cumsum(shape[:, 0] * shape[:, 1])]
         raw_bytes = int(offsets[-1]) * pp.JOINTS * 3 * 4
         canonical_bytes = n * pp.FRAMES * pp.FEATURES * 4
@@ -153,6 +155,7 @@ class Dataset:
         self.offsets = np.load(cache / "offsets.npy", mmap_mode="r")
         self.labels = np.load(cache / "labels.npy", mmap_mode="r")
         self.splits = json.loads((cache / "splits.json").read_text())
+        spec.check_cache(self.labels, self.splits, str(cache))
 
     def sample(self, index):
         total, people = self.shape[index]
@@ -173,7 +176,7 @@ class Dataset:
         b["mask"][:len(indices)] = 1
         if training:
             b["xa"] = np.zeros_like(b["x"])
-            protocol_seed = config["seed"] + (100000 if protocol == "xset" else 0)
+            protocol_seed = spec.protocol_seed(config["seed"], protocol)
             for j, (index, position) in enumerate(zip(indices, positions)):
                 b["xa"][j] = pp.augmented_features(
                     self.sample(index), protocol_seed, epoch if config["fresh_augmentation"] else 1,

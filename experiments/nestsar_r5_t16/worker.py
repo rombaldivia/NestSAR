@@ -34,6 +34,7 @@ from .mixing import mix_batch
 from .config import OUTER_CMS_PERIODS, model_kwargs, validate_config
 from .data import Dataset
 from .model import NUM_CLASSES, NestSARR5T16
+from experiments.nestsar_sm_all_t16.streaming import dataset_spec as spec
 from .preprocessing import FEATURES, FRAMES, VERSION as PREPROCESSING_VERSION
 
 # Exact counts at the default sizes (checked at start-up and in the tests).
@@ -108,7 +109,28 @@ def expected_params(variant):
     if v.get("body_dct"):
         from .preprocessing import DCT_CHANNELS
         extra += DCT_CHANNELS * 48
-    return EXPECTED_PARAMS[variant] + extra
+    return EXPECTED_PARAMS[variant] + extra + class_head_delta(variant)
+
+
+_HEADS = ("classifier", "m4_aux_head", "hand_aux_head")
+_HEAD_DELTA = {}
+
+
+def class_head_delta(variant):
+    """0 on NTU-120. On NTU-60 the three class heads (classifier, m4 / hand auxiliary heads) have 60 outputs, so
+    the count drops by 60 x (fan-in + 1) per head; every other parameter must still match the table exactly."""
+    if NUM_CLASSES == 120:
+        return 0
+    if variant not in _HEAD_DELTA:
+        model = NestSARR5T16(**model_kwargs(validate_config({"variant": variant})))
+        k = jax.random.PRNGKey(0)
+        shapes = jax.eval_shape(lambda: model.init({"params": k, "dropout": k},
+                                                   jnp.zeros((1, FRAMES, FEATURES), jnp.float32), training=False))
+        flat = jax.tree_util.tree_flatten_with_path(shapes["params"])[0]
+        now = sum(int(np.prod(leaf.shape)) for path, leaf in flat
+                  if any(getattr(e, "key", None) in _HEADS for e in path))
+        _HEAD_DELTA[variant] = now - now * 120 // NUM_CLASSES
+    return _HEAD_DELTA[variant]
 
 
 _FLOPS_CACHE = {}
@@ -116,7 +138,7 @@ _FLOPS_CACHE = {}
 
 def strict_mflops(variant):
     from .config import VARIANTS
-    if FRAMES == 16 and not VARIANTS[variant].get("body_dct"):
+    if FRAMES == 16 and NUM_CLASSES == 120 and not VARIANTS[variant].get("body_dct"):
         return STRICT_MFLOPS[variant]
     if variant not in _FLOPS_CACHE:
         from .audit_flops import audit
@@ -150,7 +172,10 @@ def implementation_identity(variant):
     digest = hashlib.sha256()
     for name in ("model.py", "preprocessing.py", "config.py", "fr_head.py"):
         digest.update(name.encode() + b"\0" + (root / name).read_bytes() + b"\0")
-    return dict(BASE_IDENTITY, version=VERSION, variant=variant, source_sha256=digest.hexdigest())
+    identity = dict(BASE_IDENTITY, version=VERSION, variant=variant, source_sha256=digest.hexdigest())
+    if spec.DATASET != "ntu120":          # NTU-120 identities stay as they were
+        identity["dataset"] = spec.DATASET
+    return identity
 
 
 def make_model(config):
@@ -501,8 +526,8 @@ def per_class_report(out, protocol, dataset, val_ids, config, predict_step, repo
 
 def run(config, protocol, cache, outdir, allow_cpu=False, accelerator="gpu"):
     config = validate_config(config)
-    if protocol not in ("xsub", "xset"):
-        raise ValueError("Expected xsub or xset")
+    if protocol not in spec.PROTOCOLS:
+        raise ValueError(f"Expected one of {spec.PROTOCOLS} for {spec.DATASET}")
     out = Path(outdir) / protocol
     out.mkdir(parents=True, exist_ok=True)
     if accelerator == "tpu":
@@ -703,7 +728,7 @@ def run(config, protocol, cache, outdir, allow_cpu=False, accelerator="gpu"):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True)
-    p.add_argument("--protocol", required=True, choices=("xsub", "xset"))
+    p.add_argument("--protocol", required=True, choices=spec.PROTOCOLS)
     p.add_argument("--cache", required=True, help="R5 hand-cache directory")
     p.add_argument("--outdir", required=True)
     p.add_argument("--allow-cpu", action="store_true")

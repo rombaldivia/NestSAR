@@ -157,7 +157,7 @@ def r4_cache_usable(path):
     return r.returncode == 0, last_line(r.stderr)
 
 
-def find_r4_cache(explicit, working, inputs, build_dir=None):
+def find_r4_cache(explicit, working, inputs, build_dir=None, pickle_path=None):
     if explicit:
         ok, why = r4_cache_usable(explicit)
         if not ok:
@@ -170,12 +170,15 @@ def find_r4_cache(explicit, working, inputs, build_dir=None):
         print(f"  R4 cache {'OK' if ok else 'NO'}  {d}" + ("" if ok else f"  ({why})"), flush=True)
         if ok:
             return str(d)
-    pkls = sorted(p for p in glob.glob(str(Path(inputs) / "**" / "*.pkl"), recursive=True)
-                  if "120" in Path(p).name)
+    from experiments.nestsar_sm_all_t16.streaming import dataset_spec as spec
+    tag = "120" if spec.DATASET == "ntu120" else "60"
+    pkls = [str(pickle_path)] if pickle_path else sorted(
+        p for p in glob.glob(str(Path(inputs) / "**" / "*.pkl"), recursive=True)
+        if tag in Path(p).name and (tag == "120" or "120" not in Path(p).name))
     if not pkls:
-        raise SystemExit(f"No R4 cache under {working} or {inputs} and no ntu120*.pkl under {inputs}. "
-                         "Add the NTU120 dataset as a notebook input.")
-    target = Path(build_dir or working) / "NestSAR_canonical_cache"
+        raise SystemExit(f"No R4 cache under {working} or {inputs} and no {spec.DATASET}*.pkl under {inputs}. "
+                         f"Add the {spec.DATASET.upper()} dataset as a notebook input.")
+    target = Path(build_dir or working) / ("NestSAR_canonical_cache" + ("" if tag == "120" else "_NTU60"))
     print(f"No R4 cache found. Building it from {pkls[0]} -> {target} (several minutes)...", flush=True)
     r = cpu_python(R4_CACHE_BUILD, pkls[0], target, capture=False, timeout=6 * 3600)
     if r.returncode != 0:
@@ -349,7 +352,7 @@ def start_or_attach(launch_argv, outdir, follow_log=True):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--variant", default="full")
-    ap.add_argument("--protocols", default="xsub,xset")
+    ap.add_argument("--protocols", default=",".join(launch.PROTOCOLS))
     ap.add_argument("--gpu-offset", type=int, default=0, help="first GPU (run two one-protocol variants side by side)")
     ap.add_argument("--accelerator", default="gpu", choices=["gpu", "tpu"],
                     help="tpu: Kaggle TPU v5e-8, ONE protocol per launch using every chip (batch 256 split)")
@@ -386,6 +389,8 @@ def main(argv=None):
                     help="where to look for a saved pool / hand cache before building (default: --inputs)")
     ap.add_argument("--prepare-only", action="store_true",
                     help="build caches and pool, then stop (pool-builder notebook; Save Version keeps the output)")
+    ap.add_argument("--pickle", default=None,
+                    help="PYSKL *_3danno.pkl to build the R4 cache from when none is found (default: search --inputs)")
     ap.add_argument("--extra-config", default="{}", help='JSON merged into config, e.g. \'{"aug_strength": 1.0, "prefetch_workers": 2}\'')
     a = ap.parse_args(argv)
 
@@ -412,7 +417,7 @@ def main(argv=None):
     print(f"Model OK: {info['params']:,} params, {info['mflops']:.2f} strict MFLOPs per clip "
           f"(R4-FMSE: 1,831,932 params, 60.87 MFLOPs), JAX {info['jax']}", flush=True)
 
-    r4_cache = find_r4_cache(a.r4_cache, a.working, a.inputs, a.r4_build_dir)
+    r4_cache = find_r4_cache(a.r4_cache, a.working, a.inputs, a.r4_build_dir, a.pickle)
     print("R4 CACHE:", r4_cache, flush=True)
     search = a.pool_search if a.pool_search is not None else a.inputs
     name = default_hand_cache_name(r4_cache, a.hand_filter, a.body_align)

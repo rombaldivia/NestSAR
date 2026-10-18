@@ -443,3 +443,17 @@ gets a `-T24` suffix; T16 versions are unchanged, so existing T16 caches stay va
 | `graph2_mr` (+ second temporal BiGRU) | 54.76 | 80.26 | 105.77 |
 
 `graph_mr` at T24 costs the same as R5 `full` at T16 (59.16). CPU smoke at T24 passes end to end.
+
+## NTU-60 (`NESTSAR_DATASET=ntu60`)
+
+Default is NTU-120 (`ntu120`): every constant, cache signature, seed offset and run identity is unchanged.
+With `NESTSAR_DATASET=ntu60` the pipeline reads a PYSKL `ntu60_3danno.pkl` (splits `xsub_*` / `xview_*`, labels 0..59):
+60-way class heads (classifier, m4 and hand auxiliary heads; the parameter check subtracts 60 x (fan-in + 1) per head),
+protocols `xsub` / `xview` (xview reuses the xset augmentation seed offset), strict FLOPs measured, not tabled.
+Safety: a cache whose splits or labels belong to another benchmark is refused at build and at load (so an NTU-120 cache
+found under /tmp or /kaggle/working is never reused), the R4 kill references are NTU-120 runs and are ignored, and the
+run identity records the dataset. Build the R4 cache with `--pickle PATH` (or a `*60*.pkl` under `--inputs`).
+
+    NESTSAR_DATASET=ntu60 NESTSAR_FRAMES=16 python -m experiments.nestsar_r5_t16.kaggle_run \
+        --pickle /kaggle/input/.../ntu60_3danno.pkl --r4-build-dir /tmp --hand-cache /tmp/NestSAR_R5_HAND_CACHE_T16_NTU60 \
+        --protocols xsub,xview --variant graph_mr ...
