@@ -288,6 +288,48 @@ class GraphMix(nn.Module):
         return x
 
 
+class STBlock(nn.Module):
+    """Separable spatio-temporal block at joint level (before the joints are pooled into parts), after
+    CTR-GCN / SkateFormer: every joint mixes with its skeleton neighbours AND with its own neighbouring segments.
+
+      1. graph aggregation per person: normalised skeleton adjacency + learned residual adjacency (zero-init)
+         + a channel-wise, per-clip refinement (CTR-GCN CTRGC: tanh(q_u - k_v) of time-averaged features,
+         `rel_dim` relation channels -> one adjacency per channel, scaled by a zero-init alpha);
+      2. depthwise temporal convolution over the segments (`kernel`, `dilation`), per joint and channel;
+      3. pointwise Dense (zero-init) back into a pre-norm residual.
+
+    The residual projection is zero-initialised, so at init the block is the identity and the model equals the
+    base one. x: [B,T,P,V,C], valid: [B,T,P,V]; missing joints stay zero and never contribute."""
+
+    kernel: int = 5
+    dilation: int = 1
+    rel_dim: int = 8
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, valid: jnp.ndarray) -> jnp.ndarray:
+        b, t, p, v, c = x.shape
+        vf = valid[..., None].astype(x.dtype)
+        h = nn.LayerNorm(name="norm")(x) * vf
+        # 1. graph aggregation (static + learned + per-clip channel-wise refinement)
+        adj = jnp.asarray(SKELETON_ADJ) + self.param("adj", nn.initializers.zeros, SKELETON_ADJ.shape)
+        count = jnp.maximum(jnp.sum(vf, axis=1), 1.0)                                  # [B,P,V,1]
+        q = jnp.sum(nn.Dense(self.rel_dim, name="rel_q")(h) * vf, axis=1) / count     # [B,P,V,r]
+        k = jnp.sum(nn.Dense(self.rel_dim, name="rel_k")(h) * vf, axis=1) / count
+        rel = jnp.tanh(q[:, :, :, None, :] - k[:, :, None, :, :])                     # [B,P,U,V,r]
+        dyn = nn.Dense(c, name="rel_out")(rel)                                         # [B,P,U,V,C]
+        alpha = self.param("alpha", nn.initializers.zeros, ())
+        # one aggregation with the per-channel adjacency (static + learned + alpha * refinement)
+        agg = jnp.einsum("bpuvc,btpvc->btpuc", adj[None, None, :, :, None] + alpha * dyn, h)
+        # 2. depthwise temporal convolution over the segments (zero padding: absent segments are zero)
+        w = self.param("tconv", nn.initializers.normal(1.0 / self.kernel), (self.kernel, c))
+        half, d = self.kernel // 2, self.dilation
+        padded = jnp.pad(agg, ((0, 0), (half * d, half * d), (0, 0), (0, 0), (0, 0)))
+        tc = sum(w[i] * padded[:, i * d:i * d + t] for i in range(self.kernel))
+        # 3. pointwise mixing, zero-init residual
+        y = nn.Dense(c, kernel_init=nn.initializers.zeros, name="out")(nn.gelu(tc))
+        return (x + y) * vf
+
+
 class SkeletonAttention(nn.Module):
     """Single-head attention over the 25 joints with a learned bias per skeleton hop distance
     (Graphormer-style), then a pointwise feed-forward; both residual. Missing joints are never attended."""
@@ -695,6 +737,11 @@ class NestSARR5T16(nn.Module):
     # 1: joints (S+T), frames (T), m4 (T), descriptor. 2 (all stages): joints (S+T), parts (S+T), frames + m4 (T),
     # descriptor, each squeeze with a training-mode BatchNorm as the original ST_RenovateNet.
     fr_version: int = 1
+    # Joint-level spatio-temporal blocks (STBlock) after the spatial mixer, before the parts: 0 = base model.
+    # Block i uses temporal dilation 2**i (kernel st_kernel), so 2 blocks reach +-6 segments.
+    st_blocks: int = 0
+    st_kernel: int = 5
+    st_rel_dim: int = 8
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = False, fr_mask=None) -> Mapping[str, jnp.ndarray]:
@@ -760,6 +807,8 @@ class NestSARR5T16(nn.Module):
             s = mixer(flat, fv).reshape(b, FRAMES, PERSONS, JOINTS, self.spatial_dim) * jv
         else:
             raise ValueError(f"Unknown spatial_mixer {self.spatial_mixer!r}")
+        for i in range(self.st_blocks):
+            s = STBlock(self.st_kernel, 2 ** i, self.st_rel_dim, name=f"st_block_{i}")(s, joint_valid)
 
         # ---- parts: thumb and hand tip are not averaged with the wrist ----
         parts = jnp.asarray(part_matrix(FOURTEEN_PARTS if self.fine_parts else TEN_PARTS))

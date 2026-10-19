@@ -72,6 +72,9 @@ VARIANTS["graph_mr_fr"] = {"spatial_mixer": "graph", "masked_recon": True, "fr_h
 # FR-Head v2: every stage with an axis (joints S+T, parts S+T, frames + m4 T, descriptor) and the original
 # squeeze (projection -> training-mode BatchNorm -> ReLU).
 VARIANTS["graph_mr_fr2"] = {"spatial_mixer": "graph", "masked_recon": True, "fr_head": True, "fr_version": 2}
+# graph_mr + 2 joint-level spatio-temporal blocks (graph aggregation with CTR-GCN refinement + depthwise temporal
+# conv, dilations 1 and 2) between the spatial mixer and the parts. Zero-init residuals: equals graph_mr at init.
+VARIANTS["graph_mr_st2"] = {"spatial_mixer": "graph", "masked_recon": True, "st_blocks": 2}
 
 # Outer CMS: parameter tier of each temporal level = its in-clip period (optimizer steps per update).
 # Inside a level, a CMS-chain MLP named mlp_p<f> uses its own period f instead.
