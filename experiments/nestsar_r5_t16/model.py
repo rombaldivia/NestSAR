@@ -356,15 +356,28 @@ class SkeletonAttention(nn.Module):
 
 
 class NestedMemory(nn.Module):
-    """BiMemory (GRU fwd/bwd) + self-modifying fast memory with a learnable layer scale."""
+    """BiMemory (GRU fwd/bwd) + self-modifying fast memory with a learnable layer scale.
+
+    R9 ablation switches (defaults = R5 bit for bit):
+      base_mode="none"     no GRU at all: the fast memory reads the input sequence directly;
+      bidirectional=False  forward-only GRU (causal level), state width `hidden` (0 = dim).
+    """
 
     dim: int
     rank: int = 8
     fast_mode: str = "surprise"          # "surprise" | "capped" | "off"
+    base_mode: str = "bigru"             # "bigru" | "none"
+    bidirectional: bool = True
+    hidden: int = 0
 
     @nn.compact
     def __call__(self, x: jnp.ndarray):
-        base = Sweep(self.dim, bidirectional=True, name="base")(x)
+        if self.base_mode == "bigru":
+            base = Sweep(self.hidden or self.dim, bidirectional=self.bidirectional, name="base")(x)
+        elif self.base_mode == "none":
+            base = x
+        else:
+            raise ValueError(f"Unknown base_mode {self.base_mode!r}")
         zeros = jnp.zeros(x.shape[:2], x.dtype)
         if self.fast_mode == "off":
             return base, zeros, zeros, jnp.zeros((), x.dtype)
@@ -742,6 +755,18 @@ class NestSARR5T16(nn.Module):
     st_blocks: int = 0
     st_kernel: int = 5
     st_rel_dim: int = 8
+    # R9 ablations of the R5 temporal core (defaults = R5 bit for bit):
+    #   temporal_levels=1  only m4 (no g4 over the 4 chunks: tests the nested second time scale);
+    #   temporal_base="none"  no BiGRU in m4/g4, the fast memory alone models time;
+    #   share_levels       m4 and g4 are ONE NestedMemory (same weights) applied at both scales, plus a learned
+    #                      level embedding on the g4 input (-440,532 params);
+    #   causal_temporal    forward-only GRUs in m4, g4 and the hand branch (state width temporal_hidden, 0 = default),
+    #                      so a segment never sees later segments (streaming / early recognition).
+    temporal_levels: int = 2
+    temporal_base: str = "bigru"
+    share_levels: bool = False
+    causal_temporal: bool = False
+    temporal_hidden: int = 0
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = False, fr_mask=None) -> Mapping[str, jnp.ndarray]:
@@ -840,7 +865,7 @@ class NestSARR5T16(nn.Module):
             z = nn.gelu(nn.Dense(self.hand_dim, name="hand_in")(
                 jnp.concatenate([hands, shape], axis=-1))) * hv_f[..., None]
             z = jnp.transpose(z.reshape(b, FRAMES * SUB, PERSONS, self.hand_dim), (0, 2, 1, 3))
-            z = Sweep(self.hand_hidden, bidirectional=True, name="hand_sweep")(
+            z = Sweep(self.hand_hidden, bidirectional=not self.causal_temporal, name="hand_sweep")(
                 z.reshape(b * PERSONS, FRAMES * SUB, self.hand_dim))
             z = jnp.transpose(z.reshape(b, PERSONS, FRAMES, SUB, self.hand_dim), (0, 2, 3, 1, 4))
             z = z * hv_f[..., None]                                                  # [B,T,S,P,dh]
@@ -881,16 +906,33 @@ class NestSARR5T16(nn.Module):
 
         if self.temporal == "r5":
             # ---- nested temporal memory: M4 over 16 segments, G4 over 4 chunks ----
-            m4, eta, alpha, fast_scale = NestedMemory(self.model_dim, self.fast_rank, self.fast_mode,
-                                                      name="m4")(f)
+            if self.temporal_levels not in (1, 2):
+                raise ValueError("temporal_levels must be 1 or 2")
+            if self.share_levels and self.temporal_levels != 2:
+                raise ValueError("share_levels needs temporal_levels=2")
+            level = lambda name: NestedMemory(self.model_dim, self.fast_rank, self.fast_mode,
+                                              base_mode=self.temporal_base,
+                                              bidirectional=not self.causal_temporal,
+                                              hidden=self.temporal_hidden, name=name)
+            m4_memory = level("m4")
+            m4, eta, alpha, fast_scale = m4_memory(f)
             if self.temporal_stack == 2:      # second residual BiGRU over the 16 segments
-                m4 = Sweep(self.stack_hidden, bidirectional=True, name="m4_stack")(m4)
+                m4 = Sweep(self.stack_hidden, bidirectional=not self.causal_temporal, name="m4_stack")(m4)
             elif self.temporal_stack != 1:
                 raise ValueError("temporal_stack must be 1 or 2")
-            chunks = m4.reshape(b, 4, FRAMES // 4, self.model_dim).mean(axis=2)
-            g4, eta_g, alpha_g, fast_scale_g = NestedMemory(self.model_dim, self.fast_rank, self.fast_mode,
-                                                            name="g4")(chunks)
-            level_means = [m4.mean(axis=1), g4.mean(axis=1)]
+            level_means = [m4.mean(axis=1)]
+            if self.temporal_levels == 2:
+                chunks = m4.reshape(b, 4, FRAMES // 4, self.model_dim).mean(axis=2)
+                if self.share_levels:
+                    # The same memory (weights) at the coarse scale; the embedding tells it which level it is.
+                    chunks = chunks + self.param("g4_level_embed", nn.initializers.zeros, (self.model_dim,))
+                    g4_memory = m4_memory
+                else:
+                    g4_memory = level("g4")
+                g4, eta_g, alpha_g, fast_scale_g = g4_memory(chunks)
+                level_means.append(g4.mean(axis=1))
+            else:
+                eta_g, alpha_g, fast_scale_g = jnp.zeros_like(eta), jnp.zeros_like(alpha), jnp.zeros_like(fast_scale)
         elif self.temporal == "hope":
             # ---- HOPE continuum: nested chain of levels, period 1 -> 2 -> 4 -> 8 (16/8/4/2 steps) ----
             conv = self.level_mixer == "conv"          # a short conv is cheap enough for every level

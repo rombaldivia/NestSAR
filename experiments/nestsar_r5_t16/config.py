@@ -76,6 +76,29 @@ VARIANTS["graph_mr_fr2"] = {"spatial_mixer": "graph", "masked_recon": True, "fr_
 # conv, dilations 1 and 2) between the spatial mixer and the parts. Zero-init residuals: equals graph_mr at init.
 VARIANTS["graph_mr_st2"] = {"spatial_mixer": "graph", "masked_recon": True, "st_blocks": 2}
 
+# R9: leave-one-out ablations of the graph_mr champion (each removes exactly one component; same recipe and
+# seeds as the base, so every run pairs with a base run sample by sample). graph_mr_no_fast is above.
+_GMR = VARIANTS["graph_mr"]
+VARIANTS.update({
+    # training-only masked reconstruction off (inference graph identical to graph_mr)
+    "graph_mr_no_recon": {"spatial_mixer": "graph"},
+    "graph_mr_no_hand": dict(_GMR, hand_branch=False),
+    "graph_mr_coarse": dict(_GMR, fine_parts=False),
+    "graph_mr_no_inter": dict(_GMR, interaction=False),
+    # one time scale: m4 only, no g4 over the 4 chunks
+    "graph_mr_one_level": dict(_GMR, temporal_levels=1),
+    # no BiGRU in m4/g4: the nested fast memory alone models time
+    "graph_mr_mem_only": dict(_GMR, temporal_base="none"),
+    # no temporal model at all (frame features averaged): the floor every temporal component is measured against
+    "graph_mr_no_temporal": dict(_GMR, temporal_base="none", fast_mode="off"),
+    # efficiency: one NestedMemory shared by m4 and g4 (-40% inference parameters)
+    "graph_mr_shared": dict(_GMR, share_levels=True),
+    # causal: forward-only GRUs (state 272 ~ the BiGRU's parameters), hand branch forward-only too
+    "graph_mr_causal": dict(_GMR, causal_temporal=True, temporal_hidden=272),
+    # causal without the fast memory: does the memory matter more when the GRU cannot look ahead?
+    "graph_mr_causal_no_fast": dict(_GMR, causal_temporal=True, temporal_hidden=272, fast_mode="off"),
+})
+
 # Outer CMS: parameter tier of each temporal level = its in-clip period (optimizer steps per update).
 # Inside a level, a CMS-chain MLP named mlp_p<f> uses its own period f instead.
 OUTER_CMS_PERIODS = {"m4": 1, "l2": 2, "g4": 4, "l8": 8}

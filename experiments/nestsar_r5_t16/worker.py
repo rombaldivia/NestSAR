@@ -70,6 +70,17 @@ EXPECTED_PARAMS = {
     "graph_mr_fr": 1_614_650,
     # graph_mr + 446,292 training-only FR-Head v2 projections (all stages, BatchNorm squeezes).
     "graph_mr_fr2": 1_747_060,
+    # R9 leave-one-out ablations of graph_mr (config.py); counts include the training-only heads.
+    "graph_mr_no_recon": 1_134_034,
+    "graph_mr_no_hand": 1_277_464,
+    "graph_mr_coarse": 1_282_336,
+    "graph_mr_no_inter": 1_285_184,
+    "graph_mr_one_level": 829_084,
+    "graph_mr_mem_only": 430_272,
+    "graph_mr_no_temporal": 419_352,
+    "graph_mr_shared": 860_236,
+    "graph_mr_causal": 1_254_968,
+    "graph_mr_causal_no_fast": 1_244_048,
 }
 # Strict MFLOPs per clip (jaxpr dot MACs x 2, scan bodies x length, batch 1).
 STRICT_MFLOPS = {
@@ -99,6 +110,17 @@ STRICT_MFLOPS = {
     "graph_mr_pt": 47.075968,
     "graph_mr_fr": 40.882816,
     "graph_mr_fr2": 40.882816,
+    # R9 ablations (measured with audit_flops, same counter)
+    "graph_mr_no_recon": 40.882816,
+    "graph_mr_no_hand": 37.815936,
+    "graph_mr_coarse": 39.389568,
+    "graph_mr_no_inter": 40.033920,
+    "graph_mr_one_level": 37.292416,
+    "graph_mr_mem_only": 23.536256,
+    "graph_mr_no_temporal": 23.240576,
+    "graph_mr_shared": 40.882816,
+    "graph_mr_causal": 38.845056,
+    "graph_mr_causal_no_fast": 38.549376,
 }
 # The tables above are for the T16 contract. Other segment counts (NESTSAR_FRAMES=24/32) keep every parameter
 # count except the conv-mixer time embedding, and their strict FLOPs are measured with the same counter.

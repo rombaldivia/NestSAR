@@ -75,7 +75,7 @@ def test_forward_and_gradients_finite_with_zero_padding(variant):
     for k, v in out.items():
         assert bool(jnp.isfinite(v).all()), k
     assert out["logits"].shape == (7, 120)
-    s_aux = 1 if variant == "no_hand_branch" else 2
+    s_aux = 2 if VARIANTS[variant].get("hand_branch", True) else 1
     assert out["stream_logits"].shape == (7, s_aux, 120)
     for k in ("sm_eta_mean", "sm_alpha_mean", "fast_scale_m4", "pair_rate", "hand_valid_rate"):
         assert out[k].shape == (7,), k
