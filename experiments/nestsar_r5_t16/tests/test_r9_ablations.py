@@ -80,3 +80,33 @@ def test_forward_and_gradients_finite(variant):
     value, grads = jax.value_and_grad(loss)(variables["params"])
     assert np.isfinite(float(value))
     assert all(bool(jnp.all(jnp.isfinite(g))) for g in jax.tree.leaves(grads))
+
+
+@pytest.mark.parametrize("variant", ("graph_mr_mem_only", "graph_mr_no_temporal", "graph_mr_causal",
+                                     "graph_mr_causal_no_fast"))
+def test_masked_segments_do_not_blow_up_the_backward(variant):
+    """Masked reconstruction zeroes half of the segments. Without a BiGRU (or with a causal one) such a segment
+    reached the memory's chained LayerNorms as an exact zero and the gradients overflowed (1e21 -> inf on
+    Kaggle). The segment-position embedding keeps it off zero."""
+    from experiments.nestsar_r5_t16 import worker
+    from experiments.nestsar_r5_t16.preprocessing import R4_FEATURES, TOKEN_CHANNELS
+    config = validate_config({"variant": variant, "aug_strength": 1.0, "dropout": 0.3, "recon_mask_ratio": 0.5})
+    model = NestSARR5T16(**model_kwargs(config))
+    rng = np.random.default_rng(0)
+    b = 8
+
+    def clip():
+        tok = rng.normal(0, 0.5, (b, FRAMES, 2, 25, TOKEN_CHANNELS)).astype(np.float32)
+        tok[: b // 2, :, 1] = 0
+        x = np.zeros((b, FRAMES, FEATURES), np.float32)
+        x[..., :R4_FEATURES] = tok.reshape(b, FRAMES, -1)
+        x[..., R4_FEATURES:942] = rng.normal(0, 0.3, (b, FRAMES, 942 - R4_FEATURES))
+        return x
+
+    batch = dict(x=clip(), xa=clip(), y=np.arange(b, dtype=np.int32), y2=np.arange(b, dtype=np.int32),
+                 mask=np.ones(b, np.float32), lam=np.ones(b, np.float32))
+    params = model.init(jax.random.PRNGKey(0), jnp.zeros((1, FRAMES, FEATURES)))["params"]
+    per_sample = worker.make_loss(model, config)
+    grads = jax.grad(lambda p: jnp.sum(per_sample(p, jax.random.PRNGKey(1), batch)[:, 0]))(params)
+    worst = max(float(jnp.max(jnp.abs(g))) for g in jax.tree.leaves(grads))
+    assert np.isfinite(worst) and worst < 1e8, worst

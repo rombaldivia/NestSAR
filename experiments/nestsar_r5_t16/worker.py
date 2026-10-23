@@ -76,11 +76,11 @@ EXPECTED_PARAMS = {
     "graph_mr_coarse": 1_282_336,
     "graph_mr_no_inter": 1_285_184,
     "graph_mr_one_level": 829_084,
-    "graph_mr_mem_only": 430_272,
-    "graph_mr_no_temporal": 419_352,
+    "graph_mr_mem_only": 433_088,
+    "graph_mr_no_temporal": 422_168,
     "graph_mr_shared": 860_236,
-    "graph_mr_causal": 1_254_968,
-    "graph_mr_causal_no_fast": 1_244_048,
+    "graph_mr_causal": 1_257_784,
+    "graph_mr_causal_no_fast": 1_246_864,
 }
 # Strict MFLOPs per clip (jaxpr dot MACs x 2, scan bodies x length, batch 1).
 STRICT_MFLOPS = {
@@ -129,7 +129,9 @@ STRICT_MFLOPS = {
 def expected_params(variant):
     from .config import VARIANTS
     v = VARIANTS[variant]
-    extra = (FRAMES - 16) * 176 if v.get("temporal") == "hope" and v.get("level_mixer") == "conv" else 0
+    time_embed = (v.get("temporal") == "hope" and v.get("level_mixer") == "conv") or \
+        v.get("temporal_base") == "none" or v.get("causal_temporal")
+    extra = (FRAMES - 16) * 176 if time_embed else 0
     if v.get("body_dct"):
         from .preprocessing import DCT_CHANNELS
         extra += DCT_CHANNELS * 48

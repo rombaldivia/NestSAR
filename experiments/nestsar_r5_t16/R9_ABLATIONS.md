@@ -3,7 +3,9 @@
 Question: which parts of the champion (`graph_mr`, 77.75 / 78.03 XSub with seeds 7 / 11) actually carry the
 accuracy. Every run uses the champion recipe (38 epochs, batch 64 x 4, aug pool 6 views fp16, dropout 0.3,
 wd 0.05, label smoothing 0.1, recon mask 0.5), XSub only, seeds 7 and 11 so each ablation pairs with a base
-run clip by clip. `graph_mr` and `graph_mr_no_fast` are bit-for-bit unchanged (checked against the previous
+run clip by clip. Variants without a BiGRU (mem_only, no_temporal) or with a causal one add a learned
+segment-position embedding (2,816 params): without it a masked-reconstruction segment reaches the memory's
+LayerNorms as an exact zero and the backward overflows at step 1. `graph_mr` and `graph_mr_no_fast` are bit-for-bit unchanged (checked against the previous
 commit on random inputs).
 
 | Variant | Removes / changes | Params (incl. train-only heads) | Inference params | MFLOPs |
@@ -11,15 +13,15 @@ commit on random inputs).
 | graph_mr | (base) | 1,300,768 | 1,104,994 | 40.88 |
 | graph_mr_no_fast | nested fast memory (m4 and g4) | 1,289,848 | 1,094,074 | 40.59 |
 | graph_mr_one_level | g4 (the 4-chunk time scale) | 829,084 | 633,310 | 37.29 |
-| graph_mr_mem_only | the BiGRUs of m4/g4: the fast memory alone models time | 430,272 | 234,498 | 23.54 |
-| graph_mr_no_temporal | every temporal model (frame features averaged) | 419,352 | 223,578 | 23.24 |
+| graph_mr_mem_only | the BiGRUs of m4/g4: the fast memory alone models time | 433,088 | 237,314 | 23.54 |
+| graph_mr_no_temporal | every temporal model (frame features averaged) | 422,168 | 226,394 | 23.24 |
 | graph_mr_no_hand | 4x-rate hand branch | 1,277,464 | 1,089,490 | 37.82 |
 | graph_mr_coarse | 14 fine parts -> 10 parts | 1,282,336 | 1,086,562 | 39.39 |
 | graph_mr_no_inter | person-person interaction | 1,285,184 | 1,089,410 | 40.03 |
 | graph_mr_no_recon | masked reconstruction (training only) | 1,134,034 | 1,104,994 | 40.88 |
 | graph_mr_shared | m4 and g4 share one NestedMemory (+ level embedding) | 860,236 | 664,462 | 40.88 |
-| graph_mr_causal | forward-only GRUs (state 272), hand branch forward-only | 1,254,968 | 1,059,194 | 38.85 |
-| graph_mr_causal_no_fast | causal and no fast memory | 1,244,048 | 1,048,274 | 38.55 |
+| graph_mr_causal | forward-only GRUs (state 272), hand branch forward-only | 1,257,784 | 1,062,010 | 38.85 |
+| graph_mr_causal_no_fast | causal and no fast memory | 1,246,864 | 1,051,090 | 38.55 |
 
 ## Plan (one run ~ 3.2 h on a T4; two GPUs per session)
 

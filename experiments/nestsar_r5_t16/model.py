@@ -910,6 +910,11 @@ class NestSARR5T16(nn.Module):
                 raise ValueError("temporal_levels must be 1 or 2")
             if self.share_levels and self.temporal_levels != 2:
                 raise ValueError("share_levels needs temporal_levels=2")
+            if self.temporal_base == "none" or self.causal_temporal:
+                # Without a bidirectional GRU, a masked (all-zero) segment stays exactly zero into the memory's
+                # chained LayerNorms and the backward pass overflows (1/sqrt(eps) per LayerNorm), as in the HOPE
+                # conv core. A learned segment-position embedding keeps it off zero; it is causal (position only).
+                f = f + self.param("time_embed", nn.initializers.normal(0.02), (FRAMES, self.model_dim))
             level = lambda name: NestedMemory(self.model_dim, self.fast_rank, self.fast_mode,
                                               base_mode=self.temporal_base,
                                               bidirectional=not self.causal_temporal,
