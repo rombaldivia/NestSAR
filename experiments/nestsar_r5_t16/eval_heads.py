@@ -66,7 +66,8 @@ def acc(y, p):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cache", required=True)
-    ap.add_argument("--protocol", default="xsub", choices=("xsub", "xset"))
+    from experiments.nestsar_sm_all_t16.streaming import dataset_spec
+    ap.add_argument("--protocol", default="xsub", choices=dataset_spec.PROTOCOLS)
     ap.add_argument("runs", nargs="+")
     a = ap.parse_args()
     dataset = Dataset(a.cache)
