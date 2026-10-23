@@ -75,6 +75,17 @@ VARIANTS["graph_mr_fr2"] = {"spatial_mixer": "graph", "masked_recon": True, "fr_
 # graph_mr + 2 joint-level spatio-temporal blocks (graph aggregation with CTR-GCN refinement + depthwise temporal
 # conv, dilations 1 and 2) between the spatial mixer and the parts. Zero-init residuals: equals graph_mr at init.
 VARIANTS["graph_mr_st2"] = {"spatial_mixer": "graph", "masked_recon": True, "st_blocks": 2}
+# Temporal-core ablation of graph_mr (the paper's "is the nesting worth it" table):
+#   flat         = M4 only (no G4 level), BiGRU + fast memory
+#   flat_no_fast = a single plain BiGRU level (no nesting, no fast memory)
+#   tattn        = both levels kept, BiGRU + fast memory replaced by 2 Transformer encoder layers per level
+VARIANTS["graph_mr_flat"] = {"spatial_mixer": "graph", "masked_recon": True, "temporal_levels": 1}
+VARIANTS["graph_mr_flat_no_fast"] = {"spatial_mixer": "graph", "masked_recon": True, "temporal_levels": 1,
+                                     "fast_mode": "off"}
+VARIANTS["graph_mr_tattn"] = {"spatial_mixer": "graph", "masked_recon": True, "temporal_mixer": "attn"}
+#   flat_stack   = size-matched control: M4 + a second residual BiGRU at the SAME 16-segment rate (not nested)
+VARIANTS["graph_mr_flat_stack"] = {"spatial_mixer": "graph", "masked_recon": True, "temporal_levels": 1,
+                                   "temporal_stack": 2}
 
 # Outer CMS: parameter tier of each temporal level = its in-clip period (optimizer steps per update).
 # Inside a level, a CMS-chain MLP named mlp_p<f> uses its own period f instead.

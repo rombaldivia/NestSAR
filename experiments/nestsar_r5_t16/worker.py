@@ -62,6 +62,10 @@ EXPECTED_PARAMS = {
     "attn2_mr": 1_736_437,
     "graph_mr": 1_300_768,
     "graph_mr_st2": 1_309_828,      # + 2 joint-level STBlocks (9,060)
+    "graph_mr_flat": 829_084,           # temporal ablation: M4 only
+    "graph_mr_flat_no_fast": 823_624,   # one plain BiGRU level
+    "graph_mr_flat_stack": 1_264_332,   # size-matched, two BiGRUs at 16 steps (not nested)
+    "graph_mr_tattn": 1_422_552,        # both levels, Transformer layers instead of BiGRU
     "graph_mr_no_fast": 1_289_848,
     "graph_mr_pt": 1_308_256,
     # graph_mr + zero-init body DCT projection: + 3K x 48 (K = NESTSAR_BODY_DCT), added in expected_params.
@@ -95,6 +99,10 @@ STRICT_MFLOPS = {
     "attn2_mr": 55.937664,
     "graph_mr": 40.882816,
     "graph_mr_st2": 56.473216,
+    "graph_mr_flat": 37.292416,
+    "graph_mr_flat_no_fast": 37.055872,
+    "graph_mr_flat_stack": 51.169664,
+    "graph_mr_tattn": 43.448192,
     "graph_mr_no_fast": 40.587136,
     "graph_mr_pt": 47.075968,
     "graph_mr_fr": 40.882816,

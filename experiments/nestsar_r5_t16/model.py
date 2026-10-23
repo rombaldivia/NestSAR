@@ -378,6 +378,27 @@ class NestedMemory(nn.Module):
         return out, eta, alpha, jnp.mean(jnp.abs(scale))
 
 
+class AttnLevel(nn.Module):
+    """Temporal-core ablation: `layers` pre-norm Transformer encoder layers over the segments of one level
+    (learned position embedding, `heads` heads, MLP x2), in place of NestedMemory (BiGRU + fast memory).
+    Same interface as NestedMemory: (states, eta, alpha, fast_scale); the last three are zeros."""
+
+    dim: int
+    layers: int = 2
+    heads: int = 4
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray):
+        h = x + self.param("pos", nn.initializers.normal(0.02), (x.shape[1], self.dim))
+        for i in range(self.layers):
+            a = nn.LayerNorm(name=f"ln_a{i}")(h)
+            h = h + nn.MultiHeadDotProductAttention(self.heads, qkv_features=self.dim, name=f"attn{i}")(a, a)
+            m = nn.LayerNorm(name=f"ln_m{i}")(h)
+            h = h + nn.Dense(self.dim, name=f"mlp_out{i}")(nn.gelu(nn.Dense(2 * self.dim, name=f"mlp_in{i}")(m)))
+        zeros = jnp.zeros(x.shape[:2], x.dtype)
+        return nn.LayerNorm(name="norm")(h), zeros, zeros, jnp.zeros((), x.dtype)
+
+
 # --------------------------------------------------------------------------- R6-HOPE temporal core
 # HOPE (Nested Learning, Behrouz et al., NeurIPS 2025) = self-modifying Titans + a continuum memory
 # system (CMS). Here: four levels with in-clip periods 1/2/4/8 (16, 8, 4, 2 steps); every level is a
@@ -742,6 +763,11 @@ class NestSARR5T16(nn.Module):
     st_blocks: int = 0
     st_kernel: int = 5
     st_rel_dim: int = 8
+    # Temporal-core ablations (r5 core only). temporal_levels: 2 = M4 over the 16 segments + G4 over 4 chunks
+    # (the nested core), 1 = M4 only. temporal_mixer: "nested" = BiGRU + fast memory (NestedMemory),
+    # "attn" = 2 Transformer encoder layers per level (AttnLevel). Defaults = the base model.
+    temporal_levels: int = 2
+    temporal_mixer: str = "nested"
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = False, fr_mask=None) -> Mapping[str, jnp.ndarray]:
@@ -881,16 +907,22 @@ class NestSARR5T16(nn.Module):
 
         if self.temporal == "r5":
             # ---- nested temporal memory: M4 over 16 segments, G4 over 4 chunks ----
-            m4, eta, alpha, fast_scale = NestedMemory(self.model_dim, self.fast_rank, self.fast_mode,
-                                                      name="m4")(f)
+            if self.temporal_mixer not in ("nested", "attn") or self.temporal_levels not in (1, 2):
+                raise ValueError(f"temporal_mixer={self.temporal_mixer!r}, temporal_levels={self.temporal_levels}")
+            level = (lambda name: AttnLevel(self.model_dim, name=name)) if self.temporal_mixer == "attn" else \
+                (lambda name: NestedMemory(self.model_dim, self.fast_rank, self.fast_mode, name=name))
+            m4, eta, alpha, fast_scale = level("m4")(f)
             if self.temporal_stack == 2:      # second residual BiGRU over the 16 segments
                 m4 = Sweep(self.stack_hidden, bidirectional=True, name="m4_stack")(m4)
             elif self.temporal_stack != 1:
                 raise ValueError("temporal_stack must be 1 or 2")
-            chunks = m4.reshape(b, 4, FRAMES // 4, self.model_dim).mean(axis=2)
-            g4, eta_g, alpha_g, fast_scale_g = NestedMemory(self.model_dim, self.fast_rank, self.fast_mode,
-                                                            name="g4")(chunks)
-            level_means = [m4.mean(axis=1), g4.mean(axis=1)]
+            if self.temporal_levels == 2:
+                chunks = m4.reshape(b, 4, FRAMES // 4, self.model_dim).mean(axis=2)
+                g4, eta_g, alpha_g, fast_scale_g = level("g4")(chunks)
+                level_means = [m4.mean(axis=1), g4.mean(axis=1)]
+            else:                               # single level: no G4 nesting
+                eta_g, alpha_g, fast_scale_g = eta, alpha, fast_scale
+                level_means = [m4.mean(axis=1)]
         elif self.temporal == "hope":
             # ---- HOPE continuum: nested chain of levels, period 1 -> 2 -> 4 -> 8 (16/8/4/2 steps) ----
             conv = self.level_mixer == "conv"          # a short conv is cheap enough for every level
