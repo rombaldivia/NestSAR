@@ -96,7 +96,9 @@ VARIANTS.update({
     # causal: forward-only GRUs (state 272 ~ the BiGRU's parameters), hand branch forward-only too
     "graph_mr_causal": dict(_GMR, causal_temporal=True, temporal_hidden=272),
     # causal without the fast memory: does the memory matter more when the GRU cannot look ahead?
-    "graph_mr_causal_no_fast": dict(_GMR, causal_temporal=True, temporal_hidden=272, fast_mode="off"),
+    "graph_mr_causal_no_fast": dict(_GMR, causal_temporal=True, temporal_hidden=272, fast_mode="off"),    # capacity probe: temporal width 176 -> 256 (person / spatial sizes unchanged). If it clearly beats graph_mr,
+    # compute/capacity limits the model; if not, the limit is generalization (regularization, augmentation).
+    "graph_mr_wide": dict(_GMR, model_dim=256),
 })
 
 # Outer CMS: parameter tier of each temporal level = its in-clip period (optimizer steps per update).

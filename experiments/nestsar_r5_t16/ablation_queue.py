@@ -32,6 +32,7 @@ TIERS = {
         ("graph_mr_no_inter", 11), ("graph_mr_coarse", 11), ("graph_mr_no_recon", 11)],
     3: [("graph_mr_causal", 7), ("graph_mr_causal_no_fast", 7), ("graph_mr_causal", 11),
         ("graph_mr_causal_no_fast", 11)],
+    4: [("graph_mr_wide", 7), ("graph_mr_wide", 11)],
 }
 
 

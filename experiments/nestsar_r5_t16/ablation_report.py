@@ -41,6 +41,7 @@ COMPARISONS = [
     ("m4/g4 con pesos compartidos (-40% params)", "graph_mr_shared", "graph_mr", "efficiency"),
     ("costo de ser causal", "graph_mr_causal", "graph_mr", "efficiency"),
     ("memoria rápida en el modelo causal", "graph_mr_causal_no_fast", "graph_mr_causal", "remove"),
+    ("más capacidad (model_dim 256, 61 MFLOPs)", "graph_mr_wide", "graph_mr", "efficiency"),
 ]
 
 
@@ -66,7 +67,16 @@ def load(d: Path):
         acc = 100 * float(correct.mean())
     cfg_file = d / "run_config.json"
     cfg = json.loads(cfg_file.read_text()).get("config", {}) if cfg_file.exists() else {}
-    return dict(acc=acc, correct=correct, y=y, pred=pred, params=res.get("params"),
+    # Last-epoch EMA accuracy: no max over epochs taken on the test split (unbiased, unlike best-epoch).
+    last = None
+    hist = d / "history.json"
+    if hist.exists():
+        h = json.loads(hist.read_text())
+        h = h if isinstance(h, list) else h.get("epochs", [])
+        if h:
+            v = h[-1]["val_acc"]
+            last = 100 * v if v <= 1 else v
+    return dict(acc=acc, last=last, correct=correct, y=y, pred=pred, params=res.get("params"),
                 mflops=res.get("strict_mflops"), cfg=cfg, dir=str(d.parent.name))
 
 
@@ -123,10 +133,12 @@ def main(argv=None):
         if not pairs:
             print(f"-- {label}: falta correr ({v} vs {r})")
             continue
-        deltas, tests, warn = [], [], []
+        deltas, last_deltas, tests, warn = [], [], [], []
         for s in pairs:
             A, B = runs[(r, s)], runs[(v, s)]
             deltas.append(B["acc"] - A["acc"])
+            if A["last"] is not None and B["last"] is not None:
+                last_deltas.append(B["last"] - A["last"])
             warn += recipe_mismatch(A, B)
             if A["correct"] is not None and B["correct"] is not None:
                 if len(A["correct"]) != len(B["correct"]) or not np.array_equal(A["y"], B["y"]):
@@ -147,12 +159,16 @@ def main(argv=None):
             verdict = "efecto pequeño, dudoso"
         v_run = runs[(v, pairs[0])]
         rows.append(dict(label=label, variant=v, reference=r, seeds=pairs, deltas=deltas, mean_delta=md,
+                         last_epoch_deltas=last_deltas,
                          mcnemar=[dict(only_ref=t[0], only_abl=t[1], p=t[2]) for t in tests], verdict=verdict,
                          params=v_run["params"], mflops=v_run["mflops"], recipe_mismatch=sorted(set(warn)),
                          worst_classes=class_shift(runs[(r, pairs[0])], v_run)))
         p_txt = "  ".join(f"s{s}: p={t[2]:.1e} ({t[0]} vs {t[1]})" for s, t in zip(pairs, tests)) or "sin val_probs"
         print(f"-- {label}  [{v} vs {r}]")
         print(f"   delta por semilla: {', '.join(f'{d:+.2f}' for d in deltas)}  media {md:+.2f} pp   -> {verdict}")
+        if len(last_deltas) == len(pairs):
+            print(f"   última época (sin elegir el máximo): {', '.join(f'{d:+.2f}' for d in last_deltas)}  "
+                  f"media {np.mean(last_deltas):+.2f} pp")
         print(f"   McNemar: {p_txt}")
         if v_run["params"] is not None:
             print(f"   {v}: {v_run['params']:,} params (incl. cabezas de entrenamiento), {v_run['mflops']:.2f} MFLOPs")

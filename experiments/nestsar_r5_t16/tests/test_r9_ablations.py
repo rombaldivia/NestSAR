@@ -10,7 +10,8 @@ from experiments.nestsar_r5_t16.preprocessing import FEATURES, FRAMES
 from experiments.nestsar_r5_t16.worker import EXPECTED_PARAMS
 
 R9 = ("graph_mr_no_recon", "graph_mr_no_hand", "graph_mr_coarse", "graph_mr_no_inter", "graph_mr_one_level",
-      "graph_mr_mem_only", "graph_mr_no_temporal", "graph_mr_shared", "graph_mr_causal", "graph_mr_causal_no_fast")
+      "graph_mr_mem_only", "graph_mr_no_temporal", "graph_mr_shared", "graph_mr_causal", "graph_mr_causal_no_fast",
+      "graph_mr_wide")
 
 
 def params_of(variant):

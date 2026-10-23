@@ -22,12 +22,14 @@ commit on random inputs).
 | graph_mr_shared | m4 and g4 share one NestedMemory (+ level embedding) | 860,236 | 664,462 | 40.88 |
 | graph_mr_causal | forward-only GRUs (state 272), hand branch forward-only | 1,257,784 | 1,062,010 | 38.85 |
 | graph_mr_causal_no_fast | causal and no fast memory | 1,246,864 | 1,051,090 | 38.55 |
+| graph_mr_wide | capacity probe: temporal width 176 -> 256 | 2,456,368 | 2,175,634 | 61.10 |
 
 ## Plan (one run ~ 3.2 h on a T4; two GPUs per session)
 
 - Tier 1 (7 runs, decides what the paper can claim): no_fast s11, mem_only s7/s11, shared s7/s11, one_level s7/s11.
 - Tier 2 (10 runs, component table): no_temporal, no_hand, no_inter, coarse, no_recon at s7/s11.
 - Tier 3 (4 runs, streaming story): causal and causal_no_fast at s7/s11.
+- Tier 4 (2 runs, capacity vs generalization): wide at s7/s11.
 
 ## Kaggle cells
 
@@ -71,3 +73,14 @@ models of the same seed on the same 50,919 clips (sample noise only). The base's
 seed noise. "APORTA" needs the same sign on every seed, McNemar p < 0.01 on each, and a mean drop at least
 as large as max(0.3 pp, seed range). With two seeds this is a coarse screen: anything near the threshold needs
 a third seed (13) for the base and that ablation.
+
+The report also prints the deltas at the last epoch (no max over epochs taken on the test split).
+
+## Where does it fail? (no training)
+
+```python
+!cd /tmp/NestSAR_code_r9c && PYTHONPATH=. python -m experiments.nestsar_r5_t16.generalization_report --cache /tmp/NestSAR_R5_HAND_CACHE_T16 /kaggle/working/NestSAR_T16_GRAPH_MR_REGNOMIX_SEED7 /kaggle/working/NestSAR_T16_GRAPH_MR_REGNOMIX_SEED11
+```
+
+Accuracy by camera, one person vs interaction, subject (observed spread vs pure sampling noise), setup, the
+weakest classes and the most confused pairs, per run and for their ensemble.
