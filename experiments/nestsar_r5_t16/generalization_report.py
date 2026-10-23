@@ -41,6 +41,50 @@ def subject_spread(keys, correct):
     return float(vals.std()), expected, acc
 
 
+def adjusted_spread(group, other, correct):
+    """Spread of `group` accuracies after removing the effect of `other` (e.g. subjects within their setups).
+
+    Each clip's correctness is compared with the accuracy of its `other` cell; the group effect is the mean
+    of those residuals. Returns (raw spread, adjusted spread, sampling-noise spread), all in pp.
+    """
+    p = float(correct.mean())
+    other_acc = {k: correct[other == k].mean() for k in np.unique(other)}
+    resid = correct - np.array([other_acc[k] for k in other])
+    raw, adj, noise = [], [], []
+    for g in np.unique(group):
+        m = group == g
+        raw.append(correct[m].mean())
+        adj.append(resid[m].mean())
+        noise.append(p * (1 - p) / m.sum())
+    return 100 * float(np.std(raw)), 100 * float(np.std(adj)), 100 * float(np.sqrt(np.mean(noise)))
+
+
+def crossed_report(subject, setup, correct, name):
+    print(f"\nSUJETO x SETUP ({name})")
+    print("  ¿la diferencia entre sujetos es del sujeto o de dónde lo grabaron?")
+    print(f"  {'':10s}{'cruda':>9s}{'ajustada':>10s}{'azar':>8s}")
+    raw, adj, noise = adjusted_spread(subject, setup, correct)
+    print(f"  {'sujetos':10s}{raw:9.2f}{adj:10.2f}{noise:8.2f}   (ajustada = descontando el setup)")
+    raw2, adj2, noise2 = adjusted_spread(setup, subject, correct)
+    print(f"  {'setups':10s}{raw2:9.2f}{adj2:10.2f}{noise2:8.2f}   (ajustada = descontando el sujeto)")
+    excess_raw, excess_adj = raw ** 2 - noise ** 2, max(adj ** 2 - noise ** 2, 0.0)   # variances beyond chance
+    share = 0.0 if excess_raw <= 0 else min(1.0, max(0.0, 1 - excess_adj / excess_raw))
+    print(f"  -> el setup explica ~{100 * share:.0f}% de la variación entre sujetos que excede el azar")
+    per_subject = [len(np.unique(setup[subject == k])) for k in np.unique(subject)]
+    print(f"  (cada sujeto aparece en {np.mean(per_subject):.1f} setups en promedio; si es ~1, sujeto y setup"
+          " no se pueden separar)")
+    sacc = {k: 100 * correct[setup == k].mean() for k in np.unique(setup)}
+    pacc = {k: 100 * correct[subject == k].mean() for k in np.unique(subject)}
+    print("\n  peores sujetos, por setup en que aparecen (acc del sujeto / acc de todo el setup, n):")
+    for p_ in sorted(pacc, key=pacc.get)[:6]:
+        cells = []
+        for s_ in np.unique(setup[subject == p_]):
+            m = (subject == p_) & (setup == s_)
+            if m.sum() >= 30:
+                cells.append(f"S{s_:03d} {100 * correct[m].mean():.0f}/{sacc[s_]:.0f} ({m.sum()})")
+        print(f"  P{p_:03d} {pacc[p_]:5.1f}%: " + ", ".join(cells))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--cache", required=True)
@@ -101,6 +145,8 @@ def main(argv=None):
     for k in sorted(sacc, key=lambda k: sacc[k][0])[:6]:
         m = setup == k
         row(f"S{k:03d} n={m.sum()}", [100 * x[m].mean() for x in corrects])
+
+    crossed_report(subject, setup, corrects[0], names[0])
 
     print(f"\nCLASES MAS DEBILES ({names[0]})")
     cacc = group_acc(action, corrects[0])
