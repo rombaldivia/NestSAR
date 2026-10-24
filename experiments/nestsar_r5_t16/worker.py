@@ -519,7 +519,8 @@ def per_class_report(out, protocol, dataset, val_ids, config, predict_step, repo
     flat = np.argsort(off, axis=None)[::-1][:20]
     pairs = [{"true": names[i // NUM_CLASSES], "pred": names[i % NUM_CLASSES],
               "count": int(off.flat[i])} for i in flat if off.flat[i] > 0]
-    reference = R4_WEAK_CLASS_RECALL.get(protocol, {})
+    # The R4 weak-class references are NTU-120 recalls; NTU-60 has no A061+ classes (and other splits).
+    reference = R4_WEAK_CLASS_RECALL.get(protocol, {}) if spec.DATASET == "ntu120" else {}
     atomic_json(target, {
         "protocol": protocol,
         "epoch": int(payload.get("epoch", 0)),
