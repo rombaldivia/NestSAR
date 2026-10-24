@@ -574,7 +574,8 @@ def run(config, protocol, cache, outdir, allow_cpu=False, accelerator="gpu"):
                  "model_identity": identity}
     digest = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
     previous = read_json(out / "run_config.json")
-    if previous is not None and previous != signature:
+    # Compare in JSON form: the stored file turns tuples (e.g. fr_level_weights) into lists.
+    if previous is not None and previous != json.loads(json.dumps(signature)):
         raise ValueError("OUT_DIR contains another model, implementation, or config/data. Choose a new OUT_DIR.")
     atomic_json(out / "run_config.json", signature)
 
