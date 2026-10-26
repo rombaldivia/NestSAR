@@ -66,6 +66,8 @@ EXPECTED_PARAMS = {
     "graph_mr_flat_no_fast": 823_624,   # one plain BiGRU level
     "graph_mr_flat_stack": 1_264_332,   # size-matched, two BiGRUs at 16 steps (not nested)
     "graph_mr_tattn": 1_422_552,        # both levels, Transformer layers instead of BiGRU
+    "graph_mr_notemp": 513_512,         # no temporal memory: per-segment MLP, order-free mean
+    "graph_mr_tconv": 643_928,          # one level of 2 x (depthwise temporal conv k5 + MLP)
     "graph_mr_no_fast": 1_289_848,
     "graph_mr_pt": 1_308_256,
     # graph_mr + zero-init body DCT projection: + 3K x 48 (K = NESTSAR_BODY_DCT), added in expected_params.
@@ -103,6 +105,8 @@ STRICT_MFLOPS = {
     "graph_mr_flat_no_fast": 37.055872,
     "graph_mr_flat_stack": 51.169664,
     "graph_mr_tattn": 43.448192,
+    "graph_mr_notemp": 27.143552,
+    "graph_mr_tconv": 31.1648,
     "graph_mr_no_fast": 40.587136,
     "graph_mr_pt": 47.075968,
     "graph_mr_fr": 40.882816,

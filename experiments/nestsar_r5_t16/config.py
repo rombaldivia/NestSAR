@@ -86,6 +86,12 @@ VARIANTS["graph_mr_tattn"] = {"spatial_mixer": "graph", "masked_recon": True, "t
 #   flat_stack   = size-matched control: M4 + a second residual BiGRU at the SAME 16-segment rate (not nested)
 VARIANTS["graph_mr_flat_stack"] = {"spatial_mixer": "graph", "masked_recon": True, "temporal_levels": 1,
                                    "temporal_stack": 2}
+#   notemp       = NO temporal memory: one per-segment MLP, order-free mean over segments (is memory needed?)
+#   tconv        = cheap local temporal mixing: 2 x (depthwise conv k5 + MLP) over the 16 segments, one level
+VARIANTS["graph_mr_notemp"] = {"spatial_mixer": "graph", "masked_recon": True, "temporal_levels": 1,
+                               "temporal_mixer": "none"}
+VARIANTS["graph_mr_tconv"] = {"spatial_mixer": "graph", "masked_recon": True, "temporal_levels": 1,
+                              "temporal_mixer": "conv"}
 
 # Outer CMS: parameter tier of each temporal level = its in-clip period (optimizer steps per update).
 # Inside a level, a CMS-chain MLP named mlp_p<f> uses its own period f instead.

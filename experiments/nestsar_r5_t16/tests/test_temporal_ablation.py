@@ -10,7 +10,8 @@ from experiments.nestsar_r5_t16 import worker
 from experiments.nestsar_r5_t16.config import model_kwargs, validate_config
 from experiments.nestsar_r5_t16.model import NestSARR5T16
 
-ABLATION = ("graph_mr_flat", "graph_mr_flat_no_fast", "graph_mr_flat_stack", "graph_mr_tattn")
+ABLATION = ("graph_mr_flat", "graph_mr_flat_no_fast", "graph_mr_flat_stack", "graph_mr_tattn",
+            "graph_mr_notemp", "graph_mr_tconv")
 
 
 def test_base_is_untouched():
@@ -36,3 +37,17 @@ def test_variant_trains_finitely(variant):
     assert np.isfinite(np.asarray(metrics)).all()
     out = model.apply({"params": state.params}, batch["x"][:3], training=False)
     assert out["logits"].shape == (3, 120) and bool(jnp.all(jnp.isfinite(out["logits"])))
+
+
+def test_notemp_is_order_free_and_tconv_is_not():
+    """notemp must ignore segment order in the main path (no temporal core); tconv must see it.
+    The hand branch keeps its own small BiGRU over the 64 hand sub-steps, so hands are zeroed here."""
+    k = jax.random.PRNGKey(0)
+    x = (jax.random.normal(k, (2, pp.FRAMES, pp.FEATURES)) * 0.3).at[..., pp.R4_FEATURES:].set(0.0)
+    perm = jnp.asarray(np.random.default_rng(0).permutation(pp.FRAMES))
+    for variant, order_free in (("graph_mr_notemp", True), ("graph_mr_tconv", False)):
+        m = NestSARR5T16(**model_kwargs(validate_config({"variant": variant})))
+        p = m.init({"params": k, "dropout": k}, x, training=False)["params"]
+        a = m.apply({"params": p}, x)["logits"]
+        b = m.apply({"params": p}, x[:, perm])["logits"]
+        assert bool(jnp.allclose(a, b, atol=1e-4)) == order_free, variant

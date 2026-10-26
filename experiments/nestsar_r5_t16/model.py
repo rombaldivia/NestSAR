@@ -399,6 +399,46 @@ class AttnLevel(nn.Module):
         return nn.LayerNorm(name="norm")(h), zeros, zeros, jnp.zeros((), x.dtype)
 
 
+class PointLevel(nn.Module):
+    """Temporal-core ablation "no temporal memory": a per-segment residual MLP (D -> 2D -> D) with NO mixing
+    across segments and no position embedding, so the clip descriptor is an order-free bag of segments.
+    Same interface as NestedMemory: (states, eta, alpha, fast_scale)."""
+
+    dim: int
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray):
+        h = x + nn.Dense(self.dim, name="mlp_out")(nn.gelu(nn.Dense(2 * self.dim, name="mlp_in")(
+            nn.LayerNorm(name="ln")(x))))
+        zeros = jnp.zeros(x.shape[:2], x.dtype)
+        return nn.LayerNorm(name="norm")(h), zeros, zeros, jnp.zeros((), x.dtype)
+
+
+class ConvLevel(nn.Module):
+    """Temporal-core ablation "cheap local mixing": `layers` pre-norm blocks of depthwise temporal conv
+    (kernel 5, zero padding) + pointwise MLP (D -> 2D -> D), with a learned position embedding.
+    Receptive field +-2 segments per block, no recurrence and no fast memory."""
+
+    dim: int
+    layers: int = 2
+    kernel: int = 5
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray):
+        h = x + self.param("pos", nn.initializers.normal(0.02), (x.shape[1], self.dim))
+        for i in range(self.layers):
+            a = nn.LayerNorm(name=f"ln_c{i}")(h)
+            h = h + nn.Conv(self.dim, (self.kernel,), padding="SAME", feature_group_count=self.dim,
+                            name=f"dwconv{i}")(a)
+            m = nn.LayerNorm(name=f"ln_m{i}")(h)
+            h = h + nn.Dense(self.dim, name=f"mlp_out{i}")(nn.gelu(nn.Dense(2 * self.dim, name=f"mlp_in{i}")(m)))
+        zeros = jnp.zeros(x.shape[:2], x.dtype)
+        return nn.LayerNorm(name="norm")(h), zeros, zeros, jnp.zeros((), x.dtype)
+
+
+TEMPORAL_MIXERS = ("nested", "attn", "conv", "none")
+
+
 # --------------------------------------------------------------------------- R6-HOPE temporal core
 # HOPE (Nested Learning, Behrouz et al., NeurIPS 2025) = self-modifying Titans + a continuum memory
 # system (CMS). Here: four levels with in-clip periods 1/2/4/8 (16, 8, 4, 2 steps); every level is a
@@ -907,10 +947,12 @@ class NestSARR5T16(nn.Module):
 
         if self.temporal == "r5":
             # ---- nested temporal memory: M4 over 16 segments, G4 over 4 chunks ----
-            if self.temporal_mixer not in ("nested", "attn") or self.temporal_levels not in (1, 2):
+            if self.temporal_mixer not in TEMPORAL_MIXERS or self.temporal_levels not in (1, 2):
                 raise ValueError(f"temporal_mixer={self.temporal_mixer!r}, temporal_levels={self.temporal_levels}")
-            level = (lambda name: AttnLevel(self.model_dim, name=name)) if self.temporal_mixer == "attn" else \
-                (lambda name: NestedMemory(self.model_dim, self.fast_rank, self.fast_mode, name=name))
+            level = {"attn": lambda name: AttnLevel(self.model_dim, name=name),
+                     "conv": lambda name: ConvLevel(self.model_dim, name=name),
+                     "none": lambda name: PointLevel(self.model_dim, name=name)}.get(
+                self.temporal_mixer, lambda name: NestedMemory(self.model_dim, self.fast_rank, self.fast_mode, name=name))
             m4, eta, alpha, fast_scale = level("m4")(f)
             if self.temporal_stack == 2:      # second residual BiGRU over the 16 segments
                 m4 = Sweep(self.stack_hidden, bidirectional=True, name="m4_stack")(m4)
