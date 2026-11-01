@@ -33,6 +33,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", default="edge_models")
     ap.add_argument("--only", nargs="*", default=None)
+    ap.add_argument("--skip", nargs="*", default=[])
+    ap.add_argument("--tag", default="")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--warmup", type=int, default=50)
     ap.add_argument("--runs", type=int, default=1000)
@@ -47,7 +49,7 @@ def main():
     host = socket.gethostname()
     res = {"host": host, "machine": platform.machine(), "processor": platform.processor(), "python": platform.python_version(),
            "onnxruntime": ort.__version__, "threads": a.threads, "models": {}}
-    for name in names:
+    for name in [n for n in names if n not in a.skip]:
         s = session(root / f"{name}.onnx", a.threads)
         inp = s.get_inputs()[0]
         x = np.random.default_rng(0).normal(0, 0.3, manifest[name]["input_shape"]).astype(np.float32)
@@ -72,7 +74,7 @@ def main():
         print(f"{name:16s} median {r['median_ms']:8.2f} ms  p90 {r['p90_ms']:8.2f}  {r['clips_per_s']:8.1f} clips/s  "
               f"{r['strict_mflops']:7.1f} MFLOPs", flush=True)
     if res["models"]:
-        out = Path(f"bench_{host}_t{a.threads}.json"); out.write_text(json.dumps(res, indent=1)); print("saved", out)
+        out = Path(f"bench_onnx_{host}_t{a.threads}{a.tag and '_' + a.tag}.json"); out.write_text(json.dumps(res, indent=1)); print("saved", out)
 
 
 if __name__ == "__main__":

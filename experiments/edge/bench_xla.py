@@ -24,6 +24,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", default="edge_xla")
     ap.add_argument("--only", nargs="*", default=None)
+    ap.add_argument("--skip", nargs="*", default=[])
+    ap.add_argument("--tag", default="")
     ap.add_argument("--warmup", type=int, default=50)
     ap.add_argument("--runs", type=int, default=500)
     ap.add_argument("--power-window", type=float, default=0)
@@ -32,7 +34,7 @@ def main():
     manifest = json.loads((root / "manifest.json").read_text())
     tag = "t1" if "intra_op_parallelism_threads=1" in os.environ.get("XLA_FLAGS", "") else "tall"
     res = {"host": socket.gethostname(), "machine": platform.machine(), "jax": jax.__version__, "threads": tag, "models": {}}
-    for name in a.only or list(manifest):
+    for name in [n for n in (a.only or list(manifest)) if n not in a.skip]:
         f = jax.jit(export.deserialize((root / f"{name}.jaxexport").read_bytes()).call)
         x = np.random.default_rng(0).normal(0, 0.3, manifest[name]["input_shape"]).astype(np.float32)
         t0 = time.perf_counter(); f(x).block_until_ready(); compile_s = time.perf_counter() - t0
@@ -55,7 +57,7 @@ def main():
         print(f"{name:16s} median {r['median_ms']:8.2f} ms  p90 {r['p90_ms']:8.2f}  {r['clips_per_s']:8.1f} clips/s  "
               f"{r['strict_mflops']:7.1f} MFLOPs", flush=True)
     if res["models"]:
-        out = Path(f"bench_xla_{res['host']}_{tag}.json"); out.write_text(json.dumps(res, indent=1)); print("saved", out)
+        out = Path(f"bench_xla_{res['host']}_{tag}{a.tag and '_' + a.tag}.json"); out.write_text(json.dumps(res, indent=1)); print("saved", out)
 
 
 if __name__ == "__main__":
