@@ -6,6 +6,7 @@ through an exact JAX port (sgn_jax.py, verified against PyTorch), so every model
   python -m experiments.edge.export_xla --out edge_xla            # random-init weights (latency is weight-independent)
 """
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -20,6 +21,11 @@ sys.path.insert(0, str(REPO))
 NESTSAR = {"nestsar": "graph_mr", "nestsar_tattn": "graph_mr_tattn", "nestsar_tconv": "graph_mr_tconv",
            "nestsar_notemp": "graph_mr_notemp"}
 SGN = {"sgn40": 0.3125, "sgn_full": 1.0}
+# Deployment schedules of the full model (same weights, same arithmetic; see edge_schedules.py):
+#   unroll = jax.lax.scan unroll factor (64 >= longest scan = fully unrolled); split = fwd/bwd GRU scans run one after
+#   the other so each step reads one direction's recurrent weights (cache-resident on a 512 KB L2).
+SCHEDULES = {"nestsar_u4": dict(unroll=4), "nestsar_unrolled": dict(unroll=64),
+             "nestsar_split": dict(split=True), "nestsar_split_u4": dict(split=True, unroll=4)}
 
 
 def main(argv=None):
@@ -27,19 +33,44 @@ def main(argv=None):
     import jax.numpy as jnp
     from jax import export
     ap = argparse.ArgumentParser(); ap.add_argument("--out", default="edge_xla")
+    ap.add_argument("--schedules-only", action="store_true",
+                    help="only add the deployment-schedule NestSAR programs (SCHEDULES) to an existing folder")
     a = ap.parse_args(argv)
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
-    manifest = {}
-    for name, variant in NESTSAR.items():
-        from experiments.nestsar_r5_t16 import preprocessing as pp, worker
-        from experiments.nestsar_r5_t16.config import model_kwargs, validate_config
-        from experiments.nestsar_r5_t16.model import NestSARR5T16
+    mpath = out / "manifest.json"
+    manifest = json.loads(mpath.read_text()) if a.schedules_only and mpath.exists() else {}
+    from experiments.edge.edge_schedules import split_bigru
+    from experiments.nestsar_r5_t16 import preprocessing as pp, worker
+    from experiments.nestsar_r5_t16.config import model_kwargs, validate_config
+    from experiments.nestsar_r5_t16.model import NestSARR5T16
+    jobs = [] if a.schedules_only else [(n, v, {}) for n, v in NESTSAR.items()]
+    jobs += [(n, "graph_mr", opt) for n, opt in SCHEDULES.items()]
+    orig_scan = jax.lax.scan
+    for name, variant, opt in jobs:
         m = NestSARR5T16(**model_kwargs(validate_config({"variant": variant})))
         shape = (1, pp.FRAMES, pp.FEATURES); k = jax.random.PRNGKey(0)
         p = m.init({"params": k, "dropout": k}, jnp.zeros(shape), training=False)["params"]
-        f = jax.jit(lambda x, p=p, m=m: m.apply({"params": p}, x, training=False)["logits"])
+        # a fresh Python function per jit, so JAX's trace cache cannot hand back the other schedule's program
+        apply = lambda: (lambda x, p=p, m=m: m.apply({"params": p}, x, training=False)["logits"])
         info = {"strict_mflops": worker.strict_mflops(variant), "params": int(sum(v.size for v in jax.tree.leaves(p)))}
-        _save(export, f, shape, out, name, info, manifest)
+        if not opt:
+            _save(export, jax.jit(apply()), shape, out, name, info, manifest); continue
+        xr = np.random.default_rng(2).normal(0, .3, shape).astype(np.float32)
+        ref_y = np.asarray(jax.jit(apply())(xr))                              # training schedule, same weights
+        u = opt.get("unroll", 1)
+        ctx = split_bigru() if opt.get("split") else contextlib.nullcontext()
+        with ctx:
+            if u != 1:
+                jax.lax.scan = lambda *args, u_=u, **kw: orig_scan(*args, **dict(kw, unroll=u_))
+            try:
+                f = jax.jit(apply())
+                d = float(np.abs(np.asarray(f(xr)) - ref_y).max()); assert d < 1e-4, (name, d)
+                info.update(schedule=opt, max_abs_diff_vs_training_schedule=d)
+                _save(export, f, shape, out, name, info, manifest)
+            finally:
+                jax.lax.scan = orig_scan
+    if a.schedules_only:
+        mpath.write_text(json.dumps(manifest, indent=1)); return
     import torch
     from experiments.sgn_baseline.sgn import SGN as TorchSGN, strict_mflops
     from experiments.sgn_baseline.sgn_jax import from_torch, sgn_apply
