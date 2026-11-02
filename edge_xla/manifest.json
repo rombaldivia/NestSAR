@@ -122,5 +122,66 @@
   "max_abs_diff_vs_onnxruntime": 7.450580596923828e-09,
   "jax_version": "0.8.1",
   "source": "official PyTorch code -> ONNX -> onnx_jax"
+ },
+ "nestsar_u4": {
+  "strict_mflops": 40.882816,
+  "params": 1300768,
+  "schedule": {
+   "unroll": 4
+  },
+  "max_abs_diff_vs_training_schedule": 4.76837158203125e-07,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1"
+ },
+ "nestsar_unrolled": {
+  "strict_mflops": 40.882816,
+  "params": 1300768,
+  "schedule": {
+   "unroll": 64
+  },
+  "max_abs_diff_vs_training_schedule": 4.76837158203125e-07,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1"
+ },
+ "nestsar_split": {
+  "strict_mflops": 40.882816,
+  "params": 1300768,
+  "schedule": {
+   "split": true
+  },
+  "max_abs_diff_vs_training_schedule": 7.152557373046875e-07,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1"
+ },
+ "nestsar_split_u4": {
+  "strict_mflops": 40.882816,
+  "params": 1300768,
+  "schedule": {
+   "split": true,
+   "unroll": 4
+  },
+  "max_abs_diff_vs_training_schedule": 7.152557373046875e-07,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1"
  }
 }

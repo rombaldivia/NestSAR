@@ -10,10 +10,13 @@ import sys
 from pathlib import Path
 
 ACC = {"nestsar": "85.55", "sgn40": "83.22", "sgn_full": "87.43", "tacnn": "88.53", "hcnb": "87.67", "tscnn": "83.89",
-       "nestsar_tattn": "84.30*", "nestsar_tconv": "83.39*", "nestsar_notemp": "81.87*", "ctrgcn": "-"}
+       "nestsar_tattn": "84.30*", "nestsar_tconv": "83.39*", "nestsar_notemp": "81.87*", "ctrgcn": "-",
+       "nestsar_u4": "85.55", "nestsar_unrolled": "85.55", "nestsar_split": "85.55", "nestsar_split_u4": "85.55"}
 NAMES = {"nestsar": "NestSAR", "sgn40": "SGN-40 (mismo costo)", "sgn_full": "SGN completo", "tacnn": "Ta-CNN",
          "hcnb": "HCN-Baseline", "tscnn": "Two-Stream CNN", "nestsar_tattn": "NestSAR-TATTN",
-         "nestsar_tconv": "NestSAR-TCONV", "nestsar_notemp": "NestSAR-NOTEMP", "ctrgcn": "CTR-GCN"}
+         "nestsar_tconv": "NestSAR-TCONV", "nestsar_notemp": "NestSAR-NOTEMP", "ctrgcn": "CTR-GCN",
+         "nestsar_u4": "NestSAR [unroll 4]", "nestsar_unrolled": "NestSAR [unroll todo]",
+         "nestsar_split": "NestSAR [GRU separada]", "nestsar_split_u4": "NestSAR [separada+u4]"}
 
 
 def main(folder):
@@ -34,7 +37,8 @@ def main(folder):
         b = best(d)
         lines.append(f"{NAMES.get(n, n):24s} {d['mflops']:8.1f} {fmt(d['ORT'])} {fmt(d['XLA'])} {b:9.2f} {1e3 / b:8.1f} {ACC.get(n, '-'):>12s}")
     lines += ["", "* variantes de la ablación (38 épocas), no el modelo final.",
-              "MEJOR = el runtime más rápido para cada modelo (mínimo entre ONNX Runtime y XLA, 1 hilo o todos)."]
+              "MEJOR = el runtime más rápido para cada modelo (mínimo entre ONNX Runtime y XLA, 1 hilo o todos).",
+              "NestSAR [..] = el mismo modelo y los mismos pesos con otro orden de ejecución (salida idéntica)."]
     txt = "\n".join(lines); print("\n" + txt)
     (Path(folder) / "resumen.md").write_text("```\n" + txt + "\n```\n")
 
