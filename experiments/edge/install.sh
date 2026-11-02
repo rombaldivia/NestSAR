@@ -2,6 +2,12 @@
 # Installs the benchmark environment in ./venv (Raspberry Pi OS 64-bit, Ubuntu, Jetson). Run once.
 set -e
 cd "$(dirname "$0")"
+ARCH=$(uname -m)
+if [ "$ARCH" != "aarch64" ] && [ "$ARCH" != "x86_64" ]; then
+  echo "!! Este sistema es de 32 bits ($ARCH). ONNX Runtime y JAX necesitan un sistema de 64 bits."
+  echo "!! Reinstala con Raspberry Pi Imager: 'Raspberry Pi OS Lite (64-bit)', y vuelve a correr ./install.sh"
+  exit 1
+fi
 command -v python3 >/dev/null || { echo "Falta python3"; exit 1; }
 if ! python3 -m venv --help >/dev/null 2>&1 || ! python3 -c "import ensurepip" 2>/dev/null; then
   echo "== instalando python3-venv"; sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv
