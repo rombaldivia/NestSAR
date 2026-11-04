@@ -38,18 +38,24 @@ def load_clip(path):
     return x
 
 
-def to_ntu25(x20):
+def to_ntu25(x20, fill_hands=False):
     t = x20.shape[0]
     out = np.zeros((1, t, 25, 3), np.float32)          # [M=1, T, V=25, C=3]
     out[0, :, :20] = x20
     out[0, :, 20] = x20[:, 2]                          # spine shoulder <- shoulder centre
-    return out                                          # joints 21-24 (hand tips / thumbs) stay exactly 0 = missing
+    if fill_hands:                                      # for baselines without a missing-joint mask (SGN):
+        out[0, :, 21] = out[0, :, 22] = x20[:, 7]       # left tip / thumb <- left hand
+        out[0, :, 23] = out[0, :, 24] = x20[:, 11]      # right tip / thumb <- right hand
+    return out                                          # else joints 21-24 stay exactly 0 = missing (NestSAR masks them)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True, help="folder with the all_sqe/*.json clips (searched recursively)")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--fill-hands", action="store_true",
+                    help="copy the hand joint into the missing tip/thumb joints (for SGN, which centres every joint "
+                         "and would otherwise see the zero joints as a fixed fake point); NestSAR uses the default")
     a = ap.parse_args()
     files = sorted(p for p in Path(a.src).rglob("*.json") if NAME.search(p.stem))
     if not files:
@@ -61,7 +67,7 @@ def main():
     label_of = {act: i for i, act in enumerate(actions)}
     annotations, split = [], {"xview_train": [], "xview_val": []}
     for p, act, sub, rep, view in meta:
-        x = to_ntu25(load_clip(p))
+        x = to_ntu25(load_clip(p), a.fill_hands)
         name = p.stem
         annotations.append({"frame_dir": name, "label": label_of[act], "keypoint": x, "total_frames": x.shape[1]})
         if view in (1, 2):
