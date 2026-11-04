@@ -171,14 +171,16 @@ def find_r4_cache(explicit, working, inputs, build_dir=None, pickle_path=None):
         if ok:
             return str(d)
     from experiments.nestsar_sm_all_t16.streaming import dataset_spec as spec
-    tag = "120" if spec.DATASET == "ntu120" else "60"
+    tag = {"ntu120": "120", "ntu60": "60"}.get(spec.DATASET, spec.DATASET)
     pkls = [str(pickle_path)] if pickle_path else sorted(
         p for p in glob.glob(str(Path(inputs) / "**" / "*.pkl"), recursive=True)
         if tag in Path(p).name and (tag == "120" or "120" not in Path(p).name))
     if not pkls:
         raise SystemExit(f"No R4 cache under {working} or {inputs} and no {spec.DATASET}*.pkl under {inputs}. "
                          f"Add the {spec.DATASET.upper()} dataset as a notebook input.")
-    target = Path(build_dir or working) / ("NestSAR_canonical_cache" + ("" if tag == "120" else "_NTU60"))
+    # one build directory per benchmark, so an NW-UCLA build never overwrites an NTU cache in the same session
+    suffix = {"ntu120": "", "ntu60": "_NTU60"}.get(spec.DATASET, "_" + spec.DATASET.upper())
+    target = Path(build_dir or working) / ("NestSAR_canonical_cache" + suffix)
     print(f"No R4 cache found. Building it from {pkls[0]} -> {target} (several minutes)...", flush=True)
     r = cpu_python(R4_CACHE_BUILD, pkls[0], target, capture=False, timeout=6 * 3600)
     if r.returncode != 0:

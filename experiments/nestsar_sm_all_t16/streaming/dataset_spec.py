@@ -2,6 +2,8 @@
 
     ntu120: 120 classes, protocols xsub / xset   (default; every cache, signature and number unchanged)
     ntu60:  60 classes,  protocols xsub / xview  (PYSKL ``ntu60_3danno.pkl``: splits xsub_*/xview_*, labels 0..59)
+    nwucla: 10 classes,  protocol  xview         (Northwestern-UCLA, standard cross-view split: train views 1+2,
+            test view 3; built by experiments/nestsar_r5_t16/prepare_nwucla.py into the same PYSKL format)
 
 The second protocol keeps the augmentation seed offset of xset, so seeds mean the same thing on both datasets.
 """
@@ -10,7 +12,7 @@ from __future__ import annotations
 import os
 
 DATASET = os.environ.get("NESTSAR_DATASET", "ntu120").lower()
-_SPECS = {"ntu120": (120, ("xsub", "xset")), "ntu60": (60, ("xsub", "xview"))}
+_SPECS = {"ntu120": (120, ("xsub", "xset")), "ntu60": (60, ("xsub", "xview")), "nwucla": (10, ("xview",))}
 if DATASET not in _SPECS:
     raise RuntimeError(f"NESTSAR_DATASET must be one of {sorted(_SPECS)}, got {DATASET!r}")
 NUM_CLASSES, PROTOCOLS = _SPECS[DATASET]

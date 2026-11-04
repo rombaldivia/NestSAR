@@ -3,8 +3,9 @@
     nohup python -m experiments.nestsar_r5_t16.kaggle_queue --jobs /kaggle/working/QUEUE_jobs.json \
         > /kaggle/working/QUEUE.log 2>&1 &
 
-jobs.json = [{"name": ..., "dataset": "ntu120"|"ntu60", "protocol": "xsub"|"xset"|"xview", "variant": ...,
-              "epochs": 38, "extra": {...config...}, "pool": "/tmp/...", "view_degrees": 15}, ...]
+jobs.json = [{"name": ..., "dataset": "ntu120"|"ntu60"|"nwucla", "protocol": "xsub"|"xset"|"xview", "variant": ...,
+              "epochs": 38, "extra": {...config...}, "pool": "/tmp/...", "view_degrees": 15,
+              "pickle": optional path (default: the dataset's *.pkl under /kaggle/input)}, ...]
 
 * Caches and augmentation pools are prepared first, serially (kaggle_run --prepare-only), so two jobs never
   build the same cache at once.
@@ -26,11 +27,12 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 WORKING = Path("/kaggle/working")
-HAND = {"ntu120": "/tmp/NestSAR_R5_HAND_CACHE_T16", "ntu60": "/tmp/NestSAR_R5_HAND_CACHE_T16_NTU60"}
+HAND = {"ntu120": "/tmp/NestSAR_R5_HAND_CACHE_T16", "ntu60": "/tmp/NestSAR_R5_HAND_CACHE_T16_NTU60",
+        "nwucla": "/tmp/NestSAR_R5_HAND_CACHE_T16_NWUCLA"}
 
 
 def find_pickle(dataset):
-    tag = "120" if dataset == "ntu120" else "60"
+    tag = {"ntu120": "120", "ntu60": "60"}.get(dataset, dataset)
     found = [p for p in glob.glob("/kaggle/input/**/*.pkl", recursive=True)
              if tag in Path(p).name and (tag == "120" or "120" not in Path(p).name)]
     if not found:
@@ -44,7 +46,7 @@ def base_cmd(job):
     view = float(job.get("view_degrees", extra.get("aug_view_degrees", 15.0)))
     if view != 15.0:
         extra["aug_view_degrees"] = view
-    args = (f"--pickle {find_pickle(job['dataset'])} --r4-build-dir /tmp --hand-cache {HAND[job['dataset']]} "
+    args = (f"--pickle {job.get('pickle') or find_pickle(job['dataset'])} --r4-build-dir /tmp --hand-cache {HAND[job['dataset']]} "
             f"--aug-pool {job['pool']} --pool-views 6 --pool-dtype float16 --variant {job['variant']}")
     return env, args, extra
 
