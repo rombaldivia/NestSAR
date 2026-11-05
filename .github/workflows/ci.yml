@@ -23,7 +23,7 @@ jobs:
         run: python -m compileall -q nestsar.py experiments
 
       - name: Install CPU JAX stack
-        run: pip install "jax[cpu]==0.8.1" "flax==0.12.12" optax numpy pytest
+        run: pip install "jax[cpu]" flax optax numpy pytest
 
       - name: Model builds with the expected cost
         run: |
