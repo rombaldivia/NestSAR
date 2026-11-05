@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  readable-single-file:
+  nestsar:
     runs-on: ubuntu-latest
 
     steps:
@@ -19,21 +19,26 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Compile complete trainer
-        run: python -m py_compile nestsar.py
+      - name: Compile all code
+        run: python -m compileall -q nestsar.py experiments
 
-      - name: Verify complete implementation is visible
-        run: |
-          test ! -d .source
-          grep -q "class HOPEModel" nestsar.py
-          grep -q "class NestSARH3Model" nestsar.py
-          grep -q "class NestSAR4LModel" nestsar.py
-          grep -q "def run_experiment" nestsar.py
-          grep -q "def save_full_checkpoint" nestsar.py
-          grep -q "def restore_full_checkpoint" nestsar.py
-          grep -q "def launch_protocols" nestsar.py
-          grep -q "def parse_args" nestsar.py
+      - name: Install CPU JAX stack
+        run: pip install "jax[cpu]==0.8.1" "flax==0.12.12" optax numpy pytest
 
-      - name: Verify readable source checksum
+      - name: Model builds with the expected cost
         run: |
-          echo "8aa931b9423bbe4aaba2258563021797f738619ae6fd5f9a227ca9239dfb49d4  nestsar.py" | sha256sum --check --strict
+          python - <<'EOF'
+          import jax, jax.numpy as jnp
+          from experiments.nestsar_r5_t16 import preprocessing as pp, worker
+          from experiments.nestsar_r5_t16.config import model_kwargs, validate_config
+          from experiments.nestsar_r5_t16.model import NestSARR5T16
+          m = NestSARR5T16(**model_kwargs(validate_config({"variant": "graph_mr"})))
+          k = jax.random.PRNGKey(0)
+          p = m.init({"params": k, "dropout": k}, jnp.zeros((1, pp.FRAMES, pp.FEATURES)), training=False)["params"]
+          n = sum(x.size for x in jax.tree.leaves(p))
+          print("params", n, "strict MFLOPs", worker.strict_mflops("graph_mr"))
+          assert abs(worker.strict_mflops("graph_mr") - 40.882816) < 1e-6
+          EOF
+
+      - name: Unit tests (resume signature, temporal ablation)
+        run: python -m pytest -q experiments/nestsar_r5_t16/tests/test_resume_signature.py experiments/nestsar_r5_t16/tests/test_temporal_ablation.py

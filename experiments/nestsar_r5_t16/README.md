@@ -1,0 +1,459 @@
+# NestSAR-R5-T16 — the R4 architecture audit, fixed
+
+R5 keeps NestSAR's identity (recurrent sweeps + nested M4/G4 memory with a
+self-modifying fast memory; no attention, no graph convolution, no TCN) and
+fixes the six problems found when auditing R4-FMSE against its class errors.
+
+## What changed and why
+
+| # | R4 finding | R5 fix | Ablation variant |
+|---|---|---|---|
+| 1 | Thumb and hand tip were averaged with wrist + hand into one 24-D part, then a 480→112 bottleneck. The worst classes are exactly the ones that differ by thumb/tip (A071 OK sign ↔ A072 victory sign, A073, A074, A084…). | 14 parts: thumb and hand tip are their own parts. A hand branch reads hand-relative vectors (tip−hand, thumb−hand, hand−wrist), and the model adds scale-free hand-shape scalars (distances, angles). | `coarse_parts` |
+| 2 | 16 segment tokens keep only net displacement and path length, so the rhythm of small repeated motions (counting money, writing, cutting nails) is erased. | 4×-rate hand block (64 sub-segments, built from every raw frame) processed by a bidirectional GRU before pooling to 16; per-axis reversal amount (path − \|net\|) for every joint. | `no_hand_branch` |
+| 3 | The adaptive mechanisms were capped so hard they could barely act: fusion logits ±0.15 (every weight stays in [0.198, 0.311]), FiLM ±10 %, stream gates ±10 %, η ≤ 0.2, α ∈ [0.9, 0.999], fast residual ×0.08, rank-2 head ×0.15. "Learned fusion ≈ average" was a consequence of the cap. | The capped controller, capped fusion and adaptive head are removed. The fast memory stays (it is the HOPE/Titans-inspired part), with η ∈ (0,1) and α ∈ (0.5,1) driven by its own prediction error ("surprise") and a learnable layer scale instead of 0.08. With unit-norm keys the update is non-expansive, so no cap is needed for stability. | `capped_fast_memory`, `no_fast_memory` |
+| 4 | The joint sweep was a one-way chain: the left arm never saw the right arm. | Bidirectional joint sweep (both directions advanced in one scan). | `unidirectional_sweep` (one direction, wider state, similar compute) |
+| 5 | Four per-view models (J, B, JM, BM) at 62–68 % each, logits averaged. | One early-fused trunk: all four views embedded together per joint. | (R4 itself is the reference) |
+| 6 | The two actors met only in one linear layer after pooling. | Explicit person–person geometry (hand→head/torso/hand distances, relative position and velocity, facing, closing speed) and a layer-scaled cross-person message; all zero when the pair is absent. | `no_interaction` |
+
+The training recipe is the R4 one (60 epochs, batch 256, AdamW + warmup-cosine,
+EMA 0.995, label smoothing, canonical/augmented consistency, yaw ±8° and ±1
+frame boundary jitter, patience 5). The training-only LocalGeometry loss is not
+used: it measured +0.005 pp. Auxiliary heads (weight 0.15): the M4 temporal mean
+and the hand branch.
+
+## Cost (measured, batch 1, T = 16)
+
+Strict counter: MACs of every dot in the inference jaxpr, scan bodies × length,
+1 MAC = 2 FLOPs (the same counter as the SA audit).
+
+| Model | Params | Strict MFLOPs | Recurrent scans | Sequential steps |
+|---|---:|---:|---:|---:|
+| R4-FMSE (reference) | 1,831,932 | 60.87 | 28 | 340 |
+| **R5 (full)** | **1,146,656** | **59.16** | **6** | **129** |
+
+R5 has fewer FLOPs and 37 % fewer parameters than R4. Its sequential chain is
+2.6× shorter, which matters on a GPU or a Jetson, where these small recurrent
+matmuls are latency-bound. Every variant:
+
+| Variant | Params | Strict MFLOPs |
+|---|---:|---:|
+| full | 1,146,656 | 59.16 |
+| no_hand_branch | 1,123,352 | 56.09 |
+| coarse_parts | 1,128,224 | 57.67 |
+| unidirectional_sweep | 1,144,304 | 55.47 |
+| no_interaction | 1,131,072 | 58.31 |
+| capped_fast_memory | 1,146,296 | 59.16 |
+| no_fast_memory | 1,135,736 | 58.87 |
+
+Reproduce: `python -m experiments.nestsar_r5_t16.audit_flops --with-r4 --variants`
+
+## Run on Kaggle — one cell (GPU T4 ×2, internet on)
+
+```python
+import importlib.util, os, subprocess, sys
+from pathlib import Path
+REPO, BRANCH = "/kaggle/working/NestSAR_R5_branch", "experiment/nestsar-r5-t16"
+OUT = "/kaggle/working/NestSAR_R5_T16_v1"
+if not Path(REPO, ".git").exists():
+    subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", BRANCH,
+                    "https://github.com/rombaldivia/NestSAR.git", REPO], check=True)
+else:
+    subprocess.run(["git", "-C", REPO, "fetch", "-q", "--depth", "1", "origin", BRANCH], check=True)
+    subprocess.run(["git", "-C", REPO, "reset", "-q", "--hard", "FETCH_HEAD"], check=True)
+p = subprocess.Popen([sys.executable, "-u", "-m", "experiments.nestsar_r5_t16.kaggle_run",
+                      "--outdir", OUT, "--no-follow"],
+                     cwd=REPO, env=dict(os.environ, PYTHONPATH=REPO),
+                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+for line in p.stdout:
+    print(line, end="")
+if p.wait() != 0:
+    raise RuntimeError("Setup failed - see the messages above.")
+spec = importlib.util.spec_from_file_location("nestsar_r5_monitor", f"{REPO}/experiments/nestsar_r5_t16/monitor.py")
+mon = importlib.util.module_from_spec(spec); spec.loader.exec_module(mon)
+mon.monitor(OUT)
+```
+
+What it does:
+
+1. Checks the two GPUs, and that JAX can use each one.
+2. Builds the model on CPU: exact parameter count, finite forward pass, finite
+   gradients on a zero-padded batch.
+3. Reuses the R4 canonical cache already in `/kaggle/working` (or
+   `/kaggle/input`), or builds one from `ntu120*.pkl`.
+4. Builds the R5 hand cache next to it (`NestSAR_R5_HAND_CACHE_v1_<hash>`,
+   about 1.4 GiB, a few minutes). Every sample's R4 tokens are recomputed and
+   must match the cache exactly.
+5. Starts the dual-GPU launcher detached (XSUB → GPU0, XSET → GPU1). The
+   monitor shows two bars and, per epoch, val / top-5 / hand-branch accuracy /
+   fast-memory η and the delta against R4 at the same epoch.
+
+Stopping the cell never stops training; running it again re-attaches.
+Interrupted runs resume from `last.msgpack`. A worker that dies for a
+non-deterministic reason is restarted up to twice. NaN, OOM and config
+mismatches are reported instead of retried. Only one launcher can manage an
+output folder. If a worker runs out of GPU memory, add `"--micro-batch", "32"`
+(accumulation 8, the effective batch stays 256) and use a new `OUT`.
+
+Expected time: about the same per epoch as R4 (both are limited by the
+augmented-view preparation, about 3 ms per sample on one CPU thread).
+
+## Early kill rule
+
+At epoch 10 the launcher compares EMA validation accuracy with the R4-FMSE +
+LocalGeometry run found in `/kaggle/working` or `/kaggle/input` (prefers
+`NestSAR_R4_FMSE_LOCAL_GEOMETRY_T16_v1`; its `run_config.json` must say model
+`NestSAR-R4-FMSE-T16-v1` with 1,831,932 parameters). R5 is a new architecture,
+so its early curve predicts less than a one-block change does:
+
+- **KILL** only if every protocol is more than 1.0 pp behind (`--kill-margin-pp`).
+- **CONTINUE** otherwise.
+
+A killed run is never restarted by re-running the cell (`--ignore-kill`
+overrides). Without a reference run the rule is off and training runs to the end.
+
+## Optional: does R4 use its fast memory? (inference-only, a few minutes on one GPU)
+
+Run it before starting R5 or after it finishes (not while both GPUs train):
+
+```python
+import os, subprocess, sys
+REPO = "/kaggle/working/NestSAR_R5_branch"
+subprocess.run([sys.executable, "-u", "-m", "experiments.nestsar_r5_t16.ablate_r4_fastweights"],
+               cwd=REPO, env=dict(os.environ, PYTHONPATH=REPO, CUDA_VISIBLE_DEVICES="0"), check=True)
+```
+
+The script loads the R4-FMSE + LocalGeometry best checkpoints and evaluates
+the full validation split as trained and with:
+
+- η = 0 and α = 1 (memory frozen at its learned initial state, for both levels
+  or for M4 or G4 alone);
+- the fast residual removed;
+- uniform fusion;
+- no adaptive head;
+- every capped controller knob neutral.
+
+It first checks that the trained accuracy reproduces exactly, then saves
+`r4_fastweight_ablation.json`. These are counterfactuals on trained weights.
+Training-time evidence comes from the R5 variants.
+
+## Audit of trained checkpoints (also works on a stopped run)
+
+Needs only `<run>/<protocol>/best.msgpack` (and `history.json`). Inference only; run it on one
+GPU when no training is using it.
+
+```python
+import os, subprocess, sys
+REPO = "/kaggle/working/NestSAR_R5_branch"
+subprocess.run([sys.executable, "-u", "-m", "experiments.nestsar_r5_t16.audit_r5_checkpoint",
+                "--run-dir", "/kaggle/working/NestSAR_R5_T16_v1",
+                "--r4-checkpoint-root", "/kaggle/working/NestSAR_R4_FMSE_LOCAL_GEOMETRY_T16_v1"],
+               cwd=REPO, env=dict(os.environ, PYTHONPATH=REPO, CUDA_VISIBLE_DEVICES="0"), check=True)
+```
+
+`--r4-checkpoint-root` is optional (adds the R4-vs-R5 comparison). Output: `<run>/r5_audit.json`.
+
+- **reproduction**: the best EMA checkpoint must give back its recorded accuracy.
+- **clean train accuracy**: eval mode, no augmentation, on a train subset (the training log
+  accuracy uses augmentation and dropout, so it overstates the gap).
+- **per class**: recall, macro recall, weakest classes, top confusions, the finger classes and the
+  R4 weak classes (A071-A075, A084, ...), R4 vs R5.
+- **subsets**: one actor vs two actors.
+- **calibration**: confidence of right and wrong predictions.
+- **counterfactuals** on the trained weights: `hand_zeroed`, `fast_scale_zero`, `fast_frozen`
+  (eta = 0, alpha = 1), `pair_message_off`. A drop is not the gain of the component in a model
+  trained without it; that comes from the ablation variants.
+- **R4 comparison**: who is right when, oracle union, softmax-average ensemble.
+- **history**: gap, gain per epoch, learned fast/pair scales, eta/alpha, timing.
+
+## Ablations
+
+```python
+# same cell, other variant and a new output folder, e.g.
+[..., "--variant", "no_hand_branch", "--outdir", "/kaggle/working/NestSAR_R5_T16_no_hand_branch"]
+# one protocol only (runs on GPU0):  "--protocols", "xsub"
+```
+
+## Outputs (`OUT/<protocol>/`)
+
+- `history.json`: per-epoch training and validation metrics, η/α, fast-memory
+  and interaction scales, auxiliary accuracies, timing and memory.
+- `best.msgpack` / `best.json`: EMA weights of the best epoch.
+- `last.msgpack`: resume state.
+- `result.json`: also written to `OUT/result_<protocol>.json`.
+- `per_class.json`: per-class recall of the best checkpoint, the top confusions,
+  and R4 vs R5 recall on the classes R4 got most wrong.
+
+Also in `OUT`: `kill_decision.json`, `reference.json`, `launcher.log`,
+`<protocol>.log`.
+
+## Local verification
+
+```bash
+JAX_PLATFORMS=cpu python -m pytest -q experiments/nestsar_r5_t16/tests
+JAX_PLATFORMS=cpu python -m experiments.nestsar_r5_t16.smoke_cpu --root /tmp/r5_smoke
+```
+
+The tests cover:
+
+- R4 tokens bit-exact against `preprocessing_corrected`, for canonical and
+  augmented views.
+- The hand block against an independent loop implementation, with every
+  transition counted once.
+- Parameter counts of every variant.
+- Finite forward passes and gradients with zero-padded rows.
+- That an absent person's hand data is ignored.
+- The fast memory against a loop reference.
+- The single-scan BiGRU against two separate GRUs.
+- Cache build, validation, refusal and relocation.
+- The kill rule and reference discovery.
+- Worker restart vs no-retry, the launcher lock and zombie-safe liveness.
+- The R4 counterfactual script.
+
+The smoke test runs the exact Kaggle path on a synthetic pickle: caches,
+detached launcher, two concurrent workers, kill decision, results, re-run,
+resume, and refusal of a variant change.
+
+## Strong augmentation, hand filter and TTA (post-audit)
+
+The audit showed 99.7–99.9 % clean-train accuracy against 76–77 % validation, so the next lever is
+regularisation, not more capacity.
+
+**Strong augmentation** (`aug_strength` 0 = old behaviour, 0–2): random affine (yaw ±15°, pitch/roll ±5°,
+shear, per-axis scale), per-bone length perturbation along the kinematic tree, joint noise, speed
+resampling (±25 %), temporal crop, joint cut-out. Deterministic per (seed, epoch, sample, stream).
+`aug_clean_prob` (0.2) keeps the canonical view for that share of samples; `prefetch_workers` (1–4)
+feeds the GPU. Resuming an older run needs the commit it was started with (the config is hashed).
+
+    --extra-config '{"aug_strength": 1.0, "prefetch_workers": 2}' --ignore-kill
+
+**Hand filter** (`--hand-filter none|hampel|smooth|sun|sun_smooth`): only wrist/hand/tip/thumb joints, only inside the
+hand tokens (the 750 R4 features stay bit-identical). `hampel` = Hampel identifier (window 5, 3 MAD,
+0.002 m floor); `smooth` = Hampel + zero-phase Savitzky–Golay (window 7, order 2). `sun` is frame-level, adapted from Sun et al. (2105.11312: detect a noisy frame, replace it by the previous one): a hand side is noisy when a hand bone length leaves max(4 MAD, 25 %) of its clip median or the wrist jumps > 6 robust sigmas in one step; its four joints are then held from the last clean frame. Only the idea is from the paper (I could not read their criterion); the detector is mine. `sun_smooth` = `sun` + `smooth`. Gaps are never filled
+and runs shorter than the window are left alone. A filtered run needs its own hand cache (the name gets a
+`_<filter>` suffix, the signature records it) and `worker.py` refuses a config/cache mismatch.
+Motivation: BHaRNet reports hand keypoints are noisier than body keypoints.
+Not validated on real NTU yet: compare `none` vs `smooth` with the same augmentation before trusting it.
+
+**TTA** in the audit: `--tta N` adds N mildly augmented views (same hand filter as the cache) and reports
+mean-logit / mean-softmax accuracy against the canonical view.
+
+**Multi-view augmentation** (`aug_view_degrees`, default 15 = previous behaviour, max 90): the yaw range of
+the random viewpoint change in the strong augmentation (NTU records each action from three cameras).
+e.g. `{"aug_strength": 1.0, "aug_view_degrees": 45}`. It conflicts with body-frame alignment: with
+alignment, use a small value.
+
+## Body alignment and temporal CutMix (branch `experiment/nestsar-r5-align-mix`)
+
+**Body alignment** (`--body-align yaw`, config `body_align`): one rotation per clip about the vertical axis so
+the first actor's shoulder+hip line faces +x (taken from up to the first 8 frames where those four joints exist).
+Only the viewpoint is removed: motion, speed, gravity direction and the relative geometry of both actors are kept
+(the literature warns that per-frame alignment loses trajectory and speed; this is per clip). Missing joints stay
+zero; clips without a usable torso are left alone. The R4 tokens change, so the cache is a separate, larger
+`full.npy` ([N,16,942], ~6.8 GB for NTU120; name suffix `_yaw`) and the worker refuses a config/cache mismatch.
+With alignment the yaw augmentation is a small jitter around the aligned pose: use e.g.
+`{"rotation_degrees": 5}` (mild augmentation) or `{"aug_strength": 1.0, "aug_view_degrees": 5}` (strong).
+
+**Temporal CutMix** (`mix_prob`, default 0 = off): inside the jitted train step, with probability `mix_prob` a
+contiguous span (20–70 %) of the 16 segment tokens of a clip is replaced by the same span of another clip of the
+batch (same partner and span in both views); the label is mixed in proportion (soft target, label smoothing kept).
+Runs on the accelerator, so epoch time does not change. With `mix_prob=0` the loss and the key chain are the same as
+before. Hand/spatial mixing is not implemented.
+
+Short test (about 10 epochs, XSUB only), compare with R4 at E10 (73.61 % XSUB):
+
+    --epochs 38 --protocols xsub --ignore-kill --body-align yaw --extra-config '{"rotation_degrees": 5}'
+    --epochs 38 --protocols xsub --ignore-kill --extra-config '{"mix_prob": 0.5}'
+
+Note: every change to preprocessing.py/config.py/model.py changes the run identity, so a run started with another
+commit cannot be resumed with this branch.
+
+## Augmentation pool (CPU bottleneck)
+
+Profiling (2 cores, synthetic clips of 40-130 frames): clean features 1.0-1.25 ms, strong augmentation ~2.2 ms per
+view, and a step needs two views per clip. The cost is thousands of tiny numpy calls, not one hot spot
+(vectorising the bone loop gained nothing). Threads make it *slower* (GIL: 2 threads 0.69x, 4 threads 0.56x);
+processes scale 1.8x on 2 cores, but a dual-protocol Kaggle run already uses both physical cores, so
+multiprocessing inside each protocol cannot help.
+
+`--aug-pool DIR --pool-views K` pays the cost once: K strong views per clip are written to DIR (6.9 GiB each,
+use `/tmp` on Kaggle) with every core, and training draws two *different* pooled views per clip and epoch
+(clean canonical view with `aug_clean_prob`). The pool is validated against the cache signature and
+preprocessing version, is resumable (a view is renamed into place only when complete) and is reused by every
+run that shares cache, strength, seed and view range. Trade-off: K finite views instead of fresh ones each epoch.
+
+    python -m experiments.nestsar_r5_t16.kaggle_run --aug-pool /tmp/NestSAR_AUGPOOL --pool-views 8 --epochs 38 \
+        --extra-config '{"aug_strength": 1.0}'
+
+## R6-HOPE: a HOPE temporal core on the R5 front end (branch `experiment/nestsar-r6-hope`)
+
+The R5 front end (early-fused joints, bidirectional joint sweep, 14 parts, 4x-rate hand branch,
+person-person interaction) is unchanged; the temporal core becomes HOPE-style (Nested Learning,
+self-modifying Titans + continuum memory system). `--variant full` is bit-for-bit R5 (tested).
+
+| HOPE element | R5 | R6-HOPE |
+|---|---|---|
+| Titans memory written in-clip, surprise-gated | yes | yes |
+| Self-referential memory: K, V, Q, eta, alpha and the main memory all self-modify | no | **yes** (`SelfRefMemory`) |
+| CMS levels by frequency, in the clip | 2 levels (1, 4) | **4 levels, periods 1/2/4/8** (16/8/4/2 steps, nested chain) |
+| HOPE block = memory + CMS MLP | no | **yes** (`HopeLevel` = BiGRU local mixer -> memory -> MLP) |
+| CMS in training: level with period p updated every p optimizer steps | no | **yes** (`outer_cms`, mean gradient of the window) |
+| Optimizer as associative memory (DMGD, diagonal L2) | no | **yes** (`dmgd`, training-only) |
+| Own L2 objective per memory (delta rule in-clip) | main only | **every component** |
+
+Update rules (per token t, `SelfRefMemory`, inner width d = 32):
+
+    k = unit(M_k(u)),  v = M_v(u),  q = unit(M_q(u)),  M_c(u) = u + 0.1 tanh(A_c u)
+    eta = sigmoid(a_eta.u + w s + b),  alpha = 0.5 + 0.5 sigmoid(a_alpha.u + w' s + b'),  s = rms(v - M k)
+    main:        M   <- M (alpha I - eta k k^T) + eta v k^T          read y = M q
+    components:  A_c <- A_c (alpha I - eta_c k k^T) + eta_c (A_c v) k^T,   eta_c = 0.1 eta   (same for a_eta, a_alpha)
+    outer CMS:   theta_level(p) <- AdamW step on mean grad of the last p steps, every p steps
+    DMGD-L2:     pred = tanh(P) g,  P <- clip(P - lr_m (pred - m) g / (g^2 + eps)),  g' = g + 0.1 pred
+
+Not HOPE, added for stability: bounded residual reads, unit keys/queries, Frobenius caps
+(4 / 1 / 8), component rate 0.1 x eta; tier-wise gradient clipping when `outer_cms` is on.
+
+Cost (strict counter, batch 1):
+
+| Variant | Params | Strict MFLOPs |
+|---|---:|---:|
+| full (R5) | 1,146,656 | 59.16 |
+| **hope** | **1,389,992** | **62.46** |
+| hope_no_selfref (R5 fast memory in every level) | 1,346,600 | 61.29 |
+| hope_no_levels (only periods 1 and 4) | 1,231,888 | 61.18 |
+| hope_no_mlp | 1,262,920 | 60.60 |
+
+`outer_cms` and `dmgd` are optimizer keys (`"auto"` = on for `hope*`); ablate them with
+`--extra-config '{"outer_cms": false}'` / `'{"dmgd": false}'`. Same data, pool and launcher as R5:
+
+```python
+# in the AUGPOOL launch cell: BRANCH = "experiment/nestsar-r6-hope", new OUT, and add
+"--variant", "hope",
+```
+
+### hope_core: the full HOPE backbone (`--variant hope_core`)
+
+NestSAR = skeleton tokenizer (the R5 front end) + HOPE backbone. `hope_core` removes the R5 BiGRUs from
+the temporal levels (they held 63% of the parameters) and keeps only HOPE / Titans pieces there:
+
+- Titans short conv (depthwise, kernel 3) as the local mixer of every level, plus a learned segment-position
+  embedding (the BiGRU carried order implicitly).
+- Self-referential memory, inner width 64, with a **Titans deep memory** M(k) = W2 tanh(W1 k) written by its
+  own gradient with momentum: S <- beta S - eta grad, W <- alpha W + S (beta is a self-modifying gate too).
+- **HOPE CMS chain** in every level: MLP_p1 -> MLP_p2 -> MLP_p4 -> MLP_p8, each updated every 1/2/4/8
+  optimizer steps (`mlp_p<f>` sets the tier); other level weights use the level period.
+- Outer CMS + DMGD-L2 as in `hope`.
+
+| Variant | Params | Strict MFLOPs | HOPE backbone share |
+|---|---:|---:|---:|
+| full (R5) | 1,146,656 | 59.16 | - |
+| hope | 1,389,992 | 62.46 | 14% of params |
+| **hope_core** | **771,056** | **51.45** | **57.6% of params** |
+
+Run two one-protocol variants side by side with `--protocols xsub --gpu-offset 0|1`.
+
+### Keep the augmentation pool between Kaggle sessions (no rebuild)
+
+`/tmp` is wiped with the session, and an 8-view float32 pool (~55 GiB) does not fit a 20 GB notebook
+output. Store it as **float16** (3.4 GiB per view) **split over two outputs** of builder notebooks
+(CPU accelerator is enough), each with `--prepare-only`:
+
+    part A: --pool-views 8 --pool-dtype float16 --pool-only-views 0-3 --aug-pool /kaggle/working/NestSAR_AUGPOOL_F16_A --r4-build-dir /tmp
+    part B: --pool-views 8 --pool-dtype float16 --pool-only-views 4-7 --aug-pool /kaggle/working/NestSAR_AUGPOOL_F16_B --r4-build-dir /tmp
+
+Save Version (Save & Run All) both, add both outputs as inputs of the training notebook, and launch with
+`--pool-dtype float16 --aug-pool /tmp/NestSAR_AUGPOOL_F16` (fallback path). The launcher finds the saved hand
+cache and every pool part under `/kaggle/input` by signature and joins them (`'dirA:dirB'`); nothing is rebuilt.
+
+## Weak-class fine-tuning without freezing (HOPE continual-learning test)
+
+`finetune.py` starts from a run's best EMA weights and trains a few epochs with every weight trainable, a
+low LR and batches where 40% of the clips come from the 20 weakest classes. The weak classes are chosen on
+**training** clips (pooled strong views), never on the validation split. Each epoch reports top-1, weak-class
+recall, the recall of all other classes and their loss ("forgetting"). `--outer-cms on|off` is the HOPE test:
+does updating the slow levels every 4 / 8 steps reduce forgetting? Report the fixed last epoch.
+
+    python -m experiments.nestsar_r5_t16.finetune --run-dir OUT --protocol xsub --cache HAND_CACHE --outer-cms on
+
+### v2 options (branch `experiment/nestsar-r6-hope-v2`): bidirectional HOPE memory and spatial part attention
+
+- `memory_bidir`: the same self-referential memory (shared weights, fresh state) also reads the clip from the
+  last segment to the first; reads are aligned back to forward time and added with their own layer scale.
+  It restores the future context the R5 BiGRU had, without leaving HOPE.
+- `part_attention`: one SGN / CD-Former-style spatial attention over the 28 part tokens of a frame (14 parts x
+  2 persons, learned part and person embeddings, absent parts masked), single head, q/k width 16, values =
+  the tokens themselves. In Nested Learning terms: an associative memory over space; time stays HOPE.
+
+| Variant | Params | Strict MFLOPs |
+|---|---:|---:|
+| full (R5) | 1,146,656 | 59.16 |
+| hope_core | 771,056 | 51.45 |
+| hope_core_bi | 771,760 | 57.50 |
+| hope_core_attn | 773,504 | 54.43 |
+| **hope_core_bi_attn** | **774,208** | **60.48** |
+| hope_core_wide (bi + attn + 2x CMS chain) | 1,022,720 | 64.20 |
+
+## R7: masked reconstruction (`full_mr`, `hope_mr`)
+
+Training-only auxiliary task on top of R5 / HOPE. In every training step 30% of the 16 segments of the
+augmented view are zeroed at the input (`recon_mask_ratio`), and a linear head on the per-segment
+states (`m4`, `[B,16,176]`) rebuilds their full 942-dim tokens. Loss: relative MSE on the masked
+segments only, weight `recon_weight` = 0.5. The head (`recon_w`, `recon_b`, 166,734 params) is
+created at init but applied only when `training=True`, so the inference graph, logits and strict
+FLOPs are exactly the base model's (`full_mr` 59.161216 MFLOPs = `full`). Non-MR variants keep the
+same dropout key chain and loss (the per-sample loss now lives in `worker.make_loss`).
+
+    python -m experiments.nestsar_r5_t16.kaggle_run --variant full_mr --protocols xsub ...
+
+Tests: `tests/test_masked_recon.py` (unchanged inference logits, no recon output at eval, recon loss
+adds and trains only the head, finite gradients on empty clips, base loss independent of recon keys).
+
+## R8: parallel spatial mixers + second temporal BiGRU (`graph2_mr`, `attn2_mr`)
+
+Strict FLOP breakdown of R5 `full` (59.16 MFLOPs): `joint_sweep` 29.49 (50%), `m4` 14.11 (24%),
+`person_proj` 4.45, `g4` 3.53, `hand_sweep` 2.46, rest 5.1. The joint sweep is a BiGRU along a fixed chain
+of the 25 joints (sequential, with false neighbours at limb boundaries). R8 replaces it with a parallel mixer
+and spends the saving on a second residual BiGRU over the 16 segments after `m4` (hidden 176):
+
+| variant | spatial mixer | MFLOPs | params (incl. 166,734 training-only recon head) |
+|---|---|---|---|
+| `graph2_mr` | `GraphMix`: 2 blocks of (normalised skeleton adjacency + learned zero-init residual adjacency) then Dense, residual + LN | 54.76 | 1,736,016 |
+| `attn2_mr` | `SkeletonAttention`: 1 head (qk 16) with a learned bias per skeleton hop distance (0..6), residual FFN | 55.94 | 1,736,437 |
+
+Both keep masked reconstruction. Missing joints are never mixed or attended (tested: garbage on missing joints
+does not change valid outputs). Tests: `tests/test_spatial_mixers.py`.
+
+## Kaggle TPU v5e-8 (`--accelerator tpu`)
+
+One process owns every TPU chip (Kaggle does not allow one process per chip), so a TPU launch runs ONE
+protocol and its worker is data parallel: state replicated, the 256 batch split across the chips
+(`--micro-batch` defaults to 256, no accumulation). Verified on 8 simulated devices: the sharded train step
+matches the single-device step (params identical, metrics within 3e-5).
+
+    python -m experiments.nestsar_r5_t16.kaggle_run --accelerator tpu --protocols xsub --variant graph2_mr ...
+
+## Segment count: T16 / T24 / T32 (`NESTSAR_FRAMES`)
+
+Set `NESTSAR_FRAMES=24` (or 32) in the environment BEFORE launching: every segment still summarises all its raw
+frames, segments are just finer. Caches, pools and runs are separated automatically (the preprocessing version
+gets a `-T24` suffix; T16 versions are unchanged, so existing T16 caches stay valid). Use new cache/pool paths.
+
+| variant | T16 | T24 | T32 (strict MFLOPs) |
+|---|---|---|---|
+| `graph_mr` (graph mixer + MR, one temporal BiGRU) | 40.88 | **59.45** | 78.01 |
+| `graph2_mr` (+ second temporal BiGRU) | 54.76 | 80.26 | 105.77 |
+
+`graph_mr` at T24 costs the same as R5 `full` at T16 (59.16). CPU smoke at T24 passes end to end.
+
+## NTU-60 (`NESTSAR_DATASET=ntu60`)
+
+Default is NTU-120 (`ntu120`): every constant, cache signature, seed offset and run identity is unchanged.
+With `NESTSAR_DATASET=ntu60` the pipeline reads a PYSKL `ntu60_3danno.pkl` (splits `xsub_*` / `xview_*`, labels 0..59):
+60-way class heads (classifier, m4 and hand auxiliary heads; the parameter check subtracts 60 x (fan-in + 1) per head),
+protocols `xsub` / `xview` (xview reuses the xset augmentation seed offset), strict FLOPs measured, not tabled.
+Safety: a cache whose splits or labels belong to another benchmark is refused at build and at load (so an NTU-120 cache
+found under /tmp or /kaggle/working is never reused), the R4 kill references are NTU-120 runs and are ignored, and the
+run identity records the dataset. Build the R4 cache with `--pickle PATH` (or a `*60*.pkl` under `--inputs`).
+
+    NESTSAR_DATASET=ntu60 NESTSAR_FRAMES=16 python -m experiments.nestsar_r5_t16.kaggle_run \
+        --pickle /kaggle/input/.../ntu60_3danno.pkl --r4-build-dir /tmp --hand-cache /tmp/NestSAR_R5_HAND_CACHE_T16_NTU60 \
+        --protocols xsub,xview --variant graph_mr ...

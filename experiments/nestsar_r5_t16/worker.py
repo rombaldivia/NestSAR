@@ -1,0 +1,758 @@
+"""Train NestSAR-R5 on one protocol and one isolated GPU.
+
+Same loop, losses, optimizer, EMA, checkpoint format, resume and early stopping
+as the R4-FMSE + LocalGeometry worker, minus the geometry loss (+0.005 pp,
+archived as a negative result). Auxiliary heads: the M4 temporal mean and the
+hand branch. Adds the fast-memory / interaction diagnostics to the history and,
+at the end, a per-class report of the best EMA checkpoint next to the R4 recalls
+of the classes R4 got most wrong.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import time
+from contextlib import closing
+from pathlib import Path
+from typing import NamedTuple
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+from flax import serialization, traverse_util
+from flax.training import train_state
+
+from experiments.nestsar_sm_all_t16.streaming import worker as r4_worker
+from experiments.nestsar_sm_all_t16.streaming.io_utils import Reporter, atomic_bytes, atomic_json, read_json
+
+from . import MODEL_IDENTITY as BASE_IDENTITY, MODEL_NAME, VERSION
+from . import fr_head
+from .mixing import mix_batch
+from .config import OUTER_CMS_PERIODS, model_kwargs, validate_config
+from .data import Dataset
+from .model import NUM_CLASSES, NestSARR5T16
+from experiments.nestsar_sm_all_t16.streaming import dataset_spec as spec
+from .preprocessing import FEATURES, FRAMES, VERSION as PREPROCESSING_VERSION
+
+# Exact counts at the default sizes (checked at start-up and in the tests).
+EXPECTED_PARAMS = {
+    "full": 1_146_656,
+    "no_hand_branch": 1_123_352,
+    "coarse_parts": 1_128_224,
+    "unidirectional_sweep": 1_144_304,
+    "no_interaction": 1_131_072,
+    "capped_fast_memory": 1_146_296,
+    "no_fast_memory": 1_135_736,
+    "hope": 1_389_992,
+    "hope_no_selfref": 1_346_600,
+    "hope_no_levels": 1_231_888,
+    "hope_no_mlp": 1_262_920,
+    "hope_core": 771_056,
+    "hope_core_bi": 771_760,
+    "hope_core_attn": 773_504,
+    "hope_core_bi_attn": 774_208,
+    "hope_core_wide": 1_022_720,
+    # +166,734 training-only reconstruction head (absent from the inference graph).
+    "full_mr": 1_313_390,
+    "hope_mr": 1_556_726,
+    "graph2_mr": 1_736_016,
+    "attn2_mr": 1_736_437,
+    "graph_mr": 1_300_768,
+    "graph_mr_st2": 1_309_828,      # + 2 joint-level STBlocks (9,060)
+    "graph_mr_flat": 829_084,           # temporal ablation: M4 only
+    "graph_mr_flat_no_fast": 823_624,   # one plain BiGRU level
+    "graph_mr_flat_stack": 1_264_332,   # size-matched, two BiGRUs at 16 steps (not nested)
+    "graph_mr_tattn": 1_422_552,        # both levels, Transformer layers instead of BiGRU
+    "graph_mr_notemp": 513_512,         # no temporal memory: per-segment MLP, order-free mean
+    "graph_mr_tconv": 643_928,          # one level of 2 x (depthwise temporal conv k5 + MLP)
+    "graph_mr_no_fast": 1_289_848,
+    "graph_mr_pt": 1_308_256,
+    # graph_mr + zero-init body DCT projection: + 3K x 48 (K = NESTSAR_BODY_DCT), added in expected_params.
+    "graph_mr_dct": 1_300_768,
+    # graph_mr + 313,882 training-only FR-Head projections (absent from the inference graph).
+    "graph_mr_fr": 1_614_650,
+    # graph_mr + 446,292 training-only FR-Head v2 projections (all stages, BatchNorm squeezes).
+    "graph_mr_fr2": 1_747_060,
+}
+# Strict MFLOPs per clip (jaxpr dot MACs x 2, scan bodies x length, batch 1).
+STRICT_MFLOPS = {
+    "full": 59.161216,
+    "no_hand_branch": 56.094336,
+    "coarse_parts": 57.667968,
+    "unidirectional_sweep": 55.474816,
+    "no_interaction": 58.31232,
+    "capped_fast_memory": 59.161216,
+    "no_fast_memory": 58.865536,
+    "hope": 62.45696,
+    "hope_no_selfref": 61.29152,
+    "hope_no_levels": 61.177216,
+    "hope_no_mlp": 60.5984,
+    "hope_core": 51.44736,
+    "hope_core_bi": 57.50304,
+    "hope_core_attn": 54.429248,
+    "hope_core_bi_attn": 60.484928,
+    "hope_core_wide": 64.202048,
+    "full_mr": 59.161216,
+    "hope_mr": 62.45696,
+    "graph2_mr": 54.760064,
+    "attn2_mr": 55.937664,
+    "graph_mr": 40.882816,
+    "graph_mr_st2": 56.473216,
+    "graph_mr_flat": 37.292416,
+    "graph_mr_flat_no_fast": 37.055872,
+    "graph_mr_flat_stack": 51.169664,
+    "graph_mr_tattn": 43.448192,
+    "graph_mr_notemp": 27.143552,
+    "graph_mr_tconv": 31.1648,
+    "graph_mr_no_fast": 40.587136,
+    "graph_mr_pt": 47.075968,
+    "graph_mr_fr": 40.882816,
+    "graph_mr_fr2": 40.882816,
+}
+# The tables above are for the T16 contract. Other segment counts (NESTSAR_FRAMES=24/32) keep every parameter
+# count except the conv-mixer time embedding, and their strict FLOPs are measured with the same counter.
+
+
+def expected_params(variant):
+    from .config import VARIANTS
+    v = VARIANTS[variant]
+    extra = (FRAMES - 16) * 176 if v.get("temporal") == "hope" and v.get("level_mixer") == "conv" else 0
+    if v.get("body_dct"):
+        from .preprocessing import DCT_CHANNELS
+        extra += DCT_CHANNELS * 48
+    return EXPECTED_PARAMS[variant] + extra + class_head_delta(variant)
+
+
+_HEADS = ("classifier", "m4_aux_head", "hand_aux_head")
+_HEAD_DELTA = {}
+
+
+def class_head_delta(variant):
+    """0 on NTU-120. On NTU-60 the three class heads (classifier, m4 / hand auxiliary heads) have 60 outputs, so
+    the count drops by 60 x (fan-in + 1) per head; every other parameter must still match the table exactly."""
+    if NUM_CLASSES == 120:
+        return 0
+    if variant not in _HEAD_DELTA:
+        model = NestSARR5T16(**model_kwargs(validate_config({"variant": variant})))
+        k = jax.random.PRNGKey(0)
+        shapes = jax.eval_shape(lambda: model.init({"params": k, "dropout": k},
+                                                   jnp.zeros((1, FRAMES, FEATURES), jnp.float32), training=False))
+        flat = jax.tree_util.tree_flatten_with_path(shapes["params"])[0]
+        now = sum(int(np.prod(leaf.shape)) for path, leaf in flat
+                  if any(getattr(e, "key", None) in _HEADS for e in path))
+        _HEAD_DELTA[variant] = now - now * 120 // NUM_CLASSES
+    return _HEAD_DELTA[variant]
+
+
+_FLOPS_CACHE = {}
+
+
+def strict_mflops(variant):
+    from .config import VARIANTS
+    if FRAMES == 16 and NUM_CLASSES == 120 and not VARIANTS[variant].get("body_dct"):
+        return STRICT_MFLOPS[variant]
+    if variant not in _FLOPS_CACHE:
+        from .audit_flops import audit
+        from .config import model_kwargs, validate_config
+        from .model import NestSARR5T16
+        _FLOPS_CACHE[variant] = audit(NestSARR5T16(**model_kwargs(validate_config({"variant": variant}))),
+                                      variant, FEATURES, frames=FRAMES)["strict_mflops"]
+    return _FLOPS_CACHE[variant]
+
+# R4-FMSE+Geometry per-class recall of its weakest classes (EXPERIMENT_REPORT, best checkpoints).
+R4_WEAK_CLASS_RECALL = {
+    "xsub": {"A073": 0.2785, "A072": 0.3635, "A074": 0.3965, "A071": 0.4330, "A084": 0.4703,
+             "A091": 0.4791, "A105": 0.4922, "A082": 0.5096, "A075": 0.5114, "A012": 0.5331},
+    "xset": {"A072": 0.3980, "A012": 0.4076, "A073": 0.4078, "A074": 0.4362, "A084": 0.4928,
+             "A071": 0.5041, "A011": 0.5220, "A107": 0.5264, "A076": 0.5266, "A075": 0.5343},
+}
+
+TRAIN_METRICS = ("loss", "main", "aux", "kl", "acc", "aug_acc", "agreement", "eta", "alpha",
+                 "g4_eta", "g4_alpha", "fast_scale_m4", "fast_scale_g4", "pair_scale",
+                 "aux_m4_acc", "aux_hand_acc", "kd", "fr")
+EVAL_COLUMNS = ("val_loss", "val_acc", "val_top5", "eta", "alpha", "aux_m4_acc", "aux_hand_acc", "count")
+
+
+def implementation_identity(variant):
+    """Hash of the files that define the model function and its inputs.
+
+    A fix to the loop/launcher/data plumbing keeps a run resumable; any change to
+    the model, preprocessing or configuration starts a new identity (new OUT_DIR).
+    """
+    root = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for name in ("model.py", "preprocessing.py", "config.py", "fr_head.py"):
+        digest.update(name.encode() + b"\0" + (root / name).read_bytes() + b"\0")
+    identity = dict(BASE_IDENTITY, version=VERSION, variant=variant, source_sha256=digest.hexdigest())
+    if spec.DATASET != "ntu120":          # NTU-120 identities stay as they were
+        identity["dataset"] = spec.DATASET
+    return identity
+
+
+def make_model(config):
+    return NestSARR5T16(**model_kwargs(config))
+
+
+class State(train_state.TrainState):
+    ema_params: object
+    fr_banks: object = None      # FR-Head class memories (training-only, saved in last.msgpack, never in inference)
+
+
+def ce(logits, labels, smoothing, labels2=None, lam=None):
+    """Cross-entropy with label smoothing; ``lam``/``labels2`` give the CutMix soft target (lam = 1: plain)."""
+    target = jax.nn.one_hot(labels, NUM_CLASSES)
+    if labels2 is not None:
+        lam = lam.reshape(lam.shape + (1,) * (target.ndim - lam.ndim))
+        target = lam * target + (1 - lam) * jax.nn.one_hot(labels2, NUM_CLASSES)
+    target = target * (1 - smoothing) + smoothing / NUM_CLASSES
+    return -jnp.sum(target * jax.nn.log_softmax(logits), axis=-1)
+
+
+def uses_fr(model, config):
+    return bool(getattr(model, "fr_head", False)) and config.get("fr_weight", 0.0) > 0
+
+
+def make_loss(model, config):
+    """Per-sample training metrics [B, len(TRAIN_METRICS)] (column 0 = loss) for one micro-batch."""
+    use_mr = bool(getattr(model, "masked_recon", False)) and config["recon_weight"] > 0
+    use_kd = config.get("kd_weight", 0.0) > 0
+    use_fr = uses_fr(model, config)
+
+    def per_sample(params, key, batch, banks=None):
+        """Metrics [B, M]; with FR-Head also the updated class memories: (metrics, banks)."""
+        k1, k2 = jax.random.split(key)          # unchanged key chain for every non-MR variant
+        if use_mr:
+            k2, k3 = jax.random.split(k2)
+        fr_kw = {"fr_mask": batch["mask"]} if use_fr else {}    # FR-Head v2 BatchNorm skips padding clips
+        out = model.apply({"params": params}, batch["x"], training=True, rngs={"dropout": k1}, **fr_kw)
+        xa = batch["xa"]
+        if use_mr:   # zero a random subset of the augmented view's segments; rebuild them from context
+            seg_mask = jax.random.bernoulli(k3, config["recon_mask_ratio"], xa.shape[:2]).astype(xa.dtype)
+            xa_in = xa * (1 - seg_mask)[..., None]
+        else:
+            xa_in = xa
+        aug = model.apply({"params": params}, xa_in, training=True, rngs={"dropout": k2}, **fr_kw)
+        y, smooth = batch["y"], config["label_smoothing"]
+        y2, lam = batch["y2"], batch["lam"]
+        main = (ce(out["logits"], y, smooth, y2, lam) + ce(aug["logits"], y, smooth, y2, lam)) / 2
+        aux = (ce(out["stream_logits"], y[:, None], smooth, y2[:, None], lam[:, None]).mean(1)
+               + ce(aug["stream_logits"], y[:, None], smooth, y2[:, None], lam[:, None]).mean(1)) / 2
+        temperature = config["consistency_temperature"]
+        logp = jax.nn.log_softmax(out["logits"] / temperature)
+        logq = jax.nn.log_softmax(aug["logits"] / temperature)
+        kl = 0.5 * temperature ** 2 * jnp.sum((jnp.exp(logp) - jnp.exp(logq)) * (logp - logq), -1)
+        loss = main + config["stream_aux_weight"] * aux + config["consistency_weight"] * kl
+        if use_kd:   # KL(teacher || student) at temperature T on both views, x T^2 (Hinton et al.)
+            tkd = config["kd_temperature"]
+            t_logp = jax.nn.log_softmax(batch["t"] / tkd)
+            kd = 0.0
+            for logits in (out["logits"], aug["logits"]):
+                kd = kd + jnp.sum(jnp.exp(t_logp) * (t_logp - jax.nn.log_softmax(logits / tkd)), -1)
+            kd = 0.5 * tkd ** 2 * kd
+            loss = loss + config["kd_weight"] * kd
+        else:
+            kd = jnp.zeros_like(main)
+        if use_mr:   # relative MSE on the masked segments only (scale-free across clips)
+            target = xa[..., :aug["frame_recon"].shape[-1]]    # base 942 tokens (body DCT block not rebuilt)
+            err = jnp.mean((aug["frame_recon"] - target) ** 2, axis=-1)             # [B,T]
+            power = jnp.mean(target ** 2, axis=-1)
+            loss = loss + config["recon_weight"] * (jnp.sum(err * seg_mask, 1)
+                                                    / (jnp.sum(power * seg_mask, 1) + 1e-3))
+        new_banks = banks
+        if use_fr:   # FR-Head on both views; the class memories advance once, from the canonical view
+            fr_args = (config["fr_level_weights"], config["fr_alpha"], config["fr_temperature"],
+                       config["fr_momentum"])
+            mask = batch["mask"]
+            fr_x, new_banks = fr_head.fr_loss(out["fr_feats"], y, out["logits"], mask, banks, *fr_args)
+            fr_a, _ = fr_head.fr_loss(aug["fr_feats"], y, aug["logits"], mask, banks, *fr_args)
+            fr = (fr_x + fr_a) / 2
+            loss = loss + config["fr_weight"] * fr
+        else:
+            fr = jnp.zeros_like(main)
+        hit = lambda logits: (logits.argmax(-1) == y).astype(jnp.float32)
+        sl = out["stream_logits"]
+        hand_acc = hit(sl[:, 1]) if sl.shape[1] > 1 else jnp.zeros_like(main)
+        metrics = jnp.stack([
+            loss, main, aux, kl, hit(out["logits"]), hit(aug["logits"]),
+            (out["logits"].argmax(-1) == aug["logits"].argmax(-1)).astype(jnp.float32),
+            out["sm_eta_mean"], out["sm_alpha_mean"], out["g4_eta_mean"], out["g4_alpha_mean"],
+            out["fast_scale_m4"], out["fast_scale_g4"], out["pair_scale"], hit(sl[:, 0]), hand_acc, kd, fr,
+        ], axis=-1)
+        return (metrics, new_banks) if use_fr else metrics
+
+    return per_sample
+
+
+def build_steps(model, config):
+    n_metrics = len(TRAIN_METRICS)
+
+    per_sample = make_loss(model, config)
+    use_fr = uses_fr(model, config)
+
+    @jax.jit
+    def train_step(state, key, batch):
+        k = config["accumulation_steps"]
+        if config.get("mix_prob", 0.0) > 0:       # static: with mixing off the key chain is untouched
+            key, mix_key = jax.random.split(key)
+            mixed_x, mixed_xa, y2, lam = mix_batch(mix_key, batch["x"], batch["xa"], batch["y"], batch["mask"],
+                                                   config["mix_prob"])
+        else:
+            mixed_x, mixed_xa, y2, lam = batch["x"], batch["xa"], batch["y"], jnp.ones_like(batch["mask"])
+        batch = dict(batch, x=mixed_x, xa=mixed_xa, y2=y2, lam=lam)
+        micros = jax.tree.map(lambda x: x.reshape(k, config["micro_batch"], *x.shape[1:]), batch)
+        denom = jnp.maximum(jnp.sum(batch["mask"]), 1)
+        key, step_key = jax.random.split(key)
+        drop_keys = jax.random.split(step_key, k)
+        zero = jax.tree.map(jnp.zeros_like, state.params)
+
+        def accumulate(carry, inputs):
+            gradient_sum, metric_sum, banks = carry
+            micro, drop = inputs
+
+            def loss_fn(params):
+                if use_fr:   # the class memories advance micro-batch by micro-batch, as in the original
+                    rows, new_banks = per_sample(params, drop, micro, banks)
+                else:
+                    rows, new_banks = per_sample(params, drop, micro), banks
+                totals = jnp.sum(rows * micro["mask"][:, None], axis=0)
+                return totals[0] / denom, (totals, new_banks)
+
+            (_, (totals, banks)), gradients = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+            return (jax.tree.map(lambda a, b: a + b, gradient_sum, gradients), metric_sum + totals, banks), None
+
+        (grads, metrics, banks), _ = jax.lax.scan(
+            accumulate, (zero, jnp.zeros(n_metrics, jnp.float32), state.fr_banks), (micros, drop_keys))
+        norm = optax.global_norm(grads)
+        state = state.apply_gradients(grads=grads)
+        if use_fr:
+            state = state.replace(fr_banks=banks)
+        ema = jax.tree.map(lambda e, p: config["ema_decay"] * e + (1 - config["ema_decay"]) * p,
+                           state.ema_params, state.params)
+        state = state.replace(ema_params=ema)
+        return state, key, jnp.r_[metrics, denom, norm]
+
+    @jax.jit
+    def eval_step(params, batch):
+        out = model.apply({"params": params}, batch["x"], training=False)
+        y, mask, logits = batch["y"], batch["mask"], out["logits"]
+        top5 = jax.lax.top_k(logits, 5)[1]
+        sl = out["stream_logits"]
+        hit = lambda lg: (lg.argmax(-1) == y).astype(jnp.float32)
+        columns = [
+            ce(logits, y, 0), hit(logits), jnp.any(top5 == y[:, None], axis=-1).astype(jnp.float32),
+            out["sm_eta_mean"], out["sm_alpha_mean"], hit(sl[:, 0]),
+            hit(sl[:, 1]) if sl.shape[1] > 1 else jnp.zeros_like(mask), jnp.ones_like(mask),
+        ]
+        return jnp.sum(jnp.stack(columns, -1) * mask[:, None], axis=0)
+
+    @jax.jit
+    def predict_step(params, batch):
+        return model.apply({"params": params}, batch["x"], training=False)["logits"].argmax(-1)
+
+    return train_step, eval_step, predict_step
+
+
+class DMGDState(NamedTuple):
+    momentum: object
+    projection: object
+
+
+def dmgd_l2(momentum=0.90, memory_lr=0.01, mix=0.10, cap=2.0, eps=1e-6):
+    """Optimizer as an associative memory (HOPE's deep momentum GD, diagonal L2 form, as in NestSAR-HOPE v4.1).
+
+    Per parameter, a diagonal predictor p maps the gradient to the momentum: pred = tanh(p) g. It is
+    written with a normalised L2 / delta rule, p <- clip(p - lr_m (pred - m) g / (g^2 + eps)), and the
+    gradient passed on is g + mix * pred. Training-only state; zero inference parameters.
+    """
+    def init_fn(params):
+        zeros = jax.tree.map(jnp.zeros_like, params)
+        return DMGDState(momentum=zeros, projection=zeros)
+
+    def update_fn(updates, state, params=None):
+        del params
+        m = jax.tree.map(lambda m_, g: momentum * m_ + (1 - momentum) * g, state.momentum, updates)
+        pred = jax.tree.map(lambda p, g: jnp.tanh(p) * g, state.projection, updates)
+        proj = jax.tree.map(lambda p, g, pr, t: jnp.clip(p - memory_lr * (pr - t) * g / (jnp.square(g) + eps),
+                                                         -cap, cap),
+                            state.projection, updates, pred, m)
+        out = jax.tree.map(lambda g, pr: g + mix * pr, updates, pred)
+        return out, DMGDState(momentum=m, projection=proj)
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+def tier_labels(params):
+    """Outer-CMS tier of every parameter: the period of its temporal level (1 outside the levels); a
+    CMS-chain MLP ``mlp_p<f>`` uses its own period f."""
+    flat = traverse_util.flatten_dict(dict(params))
+    labels = {}
+    for path in flat:
+        period = OUTER_CMS_PERIODS.get(path[0], 1)
+        for part in path:
+            if isinstance(part, str) and part.startswith("mlp_p") and part[5:].isdigit():
+                period = int(part[5:])
+        labels[path] = f"p{period}"
+    return traverse_util.unflatten_dict(labels)
+
+
+def make_optimizer(config, schedule, params):
+    """R5: clip + AdamW. HOPE: optional DMGD-L2 and outer CMS (tier p updated every p steps, mean grad)."""
+    def inner(period):
+        sched = schedule if period == 1 else (lambda count: schedule(count * period))
+        parts = []
+        if config["dmgd"]:
+            parts.append(dmgd_l2(config["dmgd_momentum"], config["dmgd_memory_lr"], config["dmgd_mix"],
+                                 config["dmgd_cap"]))
+        parts += [optax.clip_by_global_norm(config["grad_clip"]),
+                  optax.adamw(sched, weight_decay=config["weight_decay"])]
+        return optax.chain(*parts)
+
+    if not config["outer_cms"]:
+        return inner(1)
+    labels = tier_labels(params)
+    periods = sorted({int(x[1:]) for x in jax.tree.leaves(labels)})
+    transforms = {f"p{p}": inner(p) if p == 1 else
+                  optax.MultiSteps(inner(p), every_k_schedule=p, use_grad_mean=True) for p in periods}
+    return optax.multi_transform(transforms, labels)
+
+
+def create_state(config, steps_per_epoch):
+    total = config["epochs"] * steps_per_epoch
+    warm = max(1, int(total * config["warmup_fraction"]))
+    warm = min(warm, max(total - 1, 1))
+    schedule = optax.warmup_cosine_decay_schedule(
+        0, config["learning_rate"], warm, max(total, warm + 1), end_value=config["min_learning_rate"])
+    model = make_model(config)
+    key, init = jax.random.split(jax.random.PRNGKey(config["seed"]))
+    params = model.init({"params": init, "dropout": init},
+                        jnp.zeros((1, FRAMES, FEATURES), jnp.float32), training=False)["params"]
+    optimizer = make_optimizer(config, schedule, params)
+    count = sum(x.size for x in jax.tree.leaves(params))
+    expected = expected_params(config["variant"])
+    if count != expected:
+        raise RuntimeError(f"Model parameter mismatch for {config['variant']}: {count} != {expected}")
+    banks = None
+    if uses_fr(model, config):   # torch.randn(h, K) per branch; fixed key so a resumed run restores the same tree
+        banks = fr_head.init_banks(jax.random.PRNGKey(config["seed"] + 7919), model.fr_hidden, NUM_CLASSES,
+                                   fr_head.levels(model.fr_version))
+    state = State.create(apply_fn=model.apply, params=params, tx=optimizer, ema_params=params, fr_banks=banks)
+    return model, state, key, schedule, int(math.ceil(warm / steps_per_epoch))
+
+
+def save_checkpoint(path, state, key, metadata):
+    payload = {"state": serialization.to_state_dict(jax.device_get(state)), "key": np.asarray(key),
+               "metadata_json": json.dumps(metadata, allow_nan=False)}
+    atomic_bytes(path, serialization.msgpack_serialize(payload))
+
+
+def restore_checkpoint(path, template, expected_hash):
+    payload = serialization.msgpack_restore(Path(path).read_bytes())
+    meta = json.loads(payload["metadata_json"])
+    if meta["config_hash"] != expected_hash:
+        raise ValueError("Resume config/data mismatch. Keep the original config or choose a new OUT_DIR.")
+    state = serialization.from_state_dict(template, payload["state"])
+    return jax.device_put(state), jax.device_put(payload["key"]), meta
+
+
+def publish_best(out, metadata, params_count):
+    name = metadata["best_checkpoint"]
+    if Path(name).name != name or not name.startswith("best_epoch_"):
+        raise ValueError("Invalid best-checkpoint filename")
+    atomic_bytes(out / "best.msgpack", (out / name).read_bytes())
+    atomic_json(out / "best.json", dict(
+        model=metadata.get("model", MODEL_NAME), epoch=metadata["best_epoch"],
+        val_accuracy=metadata["best"], params=params_count,
+        preprocessing_version=PREPROCESSING_VERSION, pipeline_version=VERSION,
+        config_hash=metadata["config_hash"], model_identity=metadata.get("model_identity")))
+
+
+def write_result(out, protocol, metadata, digest, params_count, resumed=False):
+    variant = metadata["config"]["variant"]
+    result = {
+        "model": metadata.get("model", MODEL_NAME),
+        "variant": variant,
+        "protocol": protocol,
+        "best_val_accuracy": metadata["best"],
+        "best_accuracy": metadata["best"],
+        "best_epoch": metadata["best_epoch"],
+        "last_epoch": metadata["epoch"],
+        "epochs_run": metadata["epoch"],
+        "params": params_count,
+        "strict_mflops": strict_mflops(variant), "segments": FRAMES,
+        "backend": jax.default_backend(),
+        "devices": [str(d) for d in jax.local_devices()],
+        "config_hash": digest,
+        "checkpoint": str(out / "best.msgpack"),
+        "preprocessing_version": PREPROCESSING_VERSION,
+        "pipeline_version": VERSION,
+        "stopped_early": metadata["stopped_early"],
+        "resumed_completed": resumed,
+        "model_identity": metadata.get("model_identity"),
+    }
+    atomic_json(out / "result.json", result)
+    atomic_json(out.parent / f"result_{protocol}.json", result)
+    return result
+
+
+def per_class_report(out, protocol, dataset, val_ids, config, predict_step, report):
+    """Confusion-based report of the best EMA checkpoint (written once)."""
+    target = out / "per_class.json"
+    if target.exists() or not (out / "best.msgpack").exists():
+        return
+    payload = serialization.msgpack_restore((out / "best.msgpack").read_bytes())
+    params = jax.device_put(payload["ema_params"])
+    confusion = np.zeros((NUM_CLASSES, NUM_CLASSES), np.int64)
+    steps = math.ceil(len(val_ids) / config["eval_batch"])
+    report(phase="Per-class report", current=0, total=steps)
+    with closing(dataset.batches(val_ids, config["eval_batch"], config, protocol=protocol)) as batches:
+        for index in range(steps):
+            batch, _ = next(batches)
+            pred = np.asarray(predict_step(params, jax.device_put(batch)))
+            n = int(batch["mask"].sum())
+            np.add.at(confusion, (batch["y"][:n], pred[:n]), 1)
+            if index % config["progress_every"] == 0 or index + 1 == steps:
+                report(phase="Per-class report", current=index + 1, total=steps)
+    support = confusion.sum(1)
+    recall = np.diag(confusion) / np.maximum(support, 1)
+    names = [f"A{c + 1:03d}" for c in range(NUM_CLASSES)]
+    off = confusion.copy()
+    np.fill_diagonal(off, 0)
+    flat = np.argsort(off, axis=None)[::-1][:20]
+    pairs = [{"true": names[i // NUM_CLASSES], "pred": names[i % NUM_CLASSES],
+              "count": int(off.flat[i])} for i in flat if off.flat[i] > 0]
+    # The R4 weak-class references are NTU-120 recalls; NTU-60 has no A061+ classes (and other splits).
+    reference = R4_WEAK_CLASS_RECALL.get(protocol, {}) if spec.DATASET == "ntu120" else {}
+    atomic_json(target, {
+        "protocol": protocol,
+        "epoch": int(payload.get("epoch", 0)),
+        "top1": float(np.trace(confusion) / max(confusion.sum(), 1)),
+        "macro_recall": float(recall[support > 0].mean()) if (support > 0).any() else 0.0,
+        "recall": {names[c]: float(recall[c]) for c in range(NUM_CLASSES)},
+        "r4_weak_classes": {k: {"r4": v, "r5": float(recall[int(k[1:]) - 1]),
+                                "delta_pp": 100 * (float(recall[int(k[1:]) - 1]) - v)}
+                            for k, v in reference.items()},
+        "top_confusions": pairs,
+        "note": "Selected on the official validation split (best epoch); diagnostic, not an untouched test.",
+    })
+
+
+def run(config, protocol, cache, outdir, allow_cpu=False, accelerator="gpu"):
+    config = validate_config(config)
+    if protocol not in spec.PROTOCOLS:
+        raise ValueError(f"Expected one of {spec.PROTOCOLS} for {spec.DATASET}")
+    out = Path(outdir) / protocol
+    out.mkdir(parents=True, exist_ok=True)
+    if accelerator == "tpu":
+        # One process owns every TPU chip; the batch is split across them (data parallel).
+        if jax.default_backend() != "tpu" and not allow_cpu:
+            raise RuntimeError(f"Expected TPU; backend={jax.default_backend()}, devices={jax.local_devices()}")
+    elif not allow_cpu and (jax.default_backend() != "gpu" or len(jax.local_devices()) != 1):
+        raise RuntimeError(f"Expected one isolated GPU; backend={jax.default_backend()}, "
+                           f"devices={jax.local_devices()}")
+
+    variant = config["variant"]
+    params_count = expected_params(variant)
+    identity = implementation_identity(variant)
+    dataset = Dataset(cache)
+    if config.get("hand_filter", "none") != dataset.hand_filter:
+        raise ValueError(f"config hand_filter={config.get('hand_filter', 'none')!r} but the hand cache was built with "
+                         f"{dataset.hand_filter!r}")
+    if config.get("body_align", "none") != dataset.body_align:
+        raise ValueError(f"config body_align={config.get('body_align', 'none')!r} but the cache was built with "
+                         f"{dataset.body_align!r}")
+    train_ids = dataset.splits[f"{protocol}_train"]
+    val_ids = dataset.splits[f"{protocol}_val"]
+    if config["max_train_samples"]:
+        train_ids = train_ids[:config["max_train_samples"]]
+    if config["max_val_samples"]:
+        val_ids = val_ids[:config["max_val_samples"]]
+    if not train_ids or not val_ids:
+        raise ValueError("Empty train/validation split")
+
+    batch_size = config["micro_batch"] * config["accumulation_steps"]
+    steps = math.ceil(len(train_ids) / batch_size)
+    signature = {"config": config, "protocol": protocol, "cache": dataset.meta["signature"],
+                 "parameters": params_count, "pipeline_version": VERSION, "model": MODEL_NAME,
+                 "model_identity": identity}
+    digest = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
+    previous = read_json(out / "run_config.json")
+    # Compare in JSON form: the stored file turns tuples (e.g. fr_level_weights) into lists.
+    if previous is not None and previous != json.loads(json.dumps(signature)):
+        raise ValueError("OUT_DIR contains another model, implementation, or config/data. Choose a new OUT_DIR.")
+    atomic_json(out / "run_config.json", signature)
+
+    report = Reporter(out / "status.json")
+    report(phase="JAX startup", current=0, total=1, protocol=protocol, epoch=0, best=None,
+           best_epoch=0, completed_epoch=0, variant=variant)
+    model, state, key, schedule, warmup_epochs = create_state(config, steps)
+    metadata = {"config_hash": digest, "config": config, "epoch": 0, "best": -1.0, "best_epoch": 0,
+                "model": MODEL_NAME, "model_identity": identity, "bad_epochs": 0, "history": [],
+                "warmup_epochs": warmup_epochs, "best_checkpoint": None, "stopped_early": False}
+    last = out / "last.msgpack"
+    if last.exists():
+        state, key, metadata = restore_checkpoint(last, state, digest)
+        if metadata["best_epoch"]:
+            publish_best(out, metadata, params_count)
+        atomic_json(out / "history.json", metadata["history"])
+    report(best=metadata["best"] if metadata["best_epoch"] else None,
+           best_epoch=metadata["best_epoch"], completed_epoch=metadata["epoch"])
+    put_batch = jax.device_put
+    n_dev = jax.local_device_count()
+    if accelerator == "tpu" and n_dev > 1:
+        # Data parallel over all local chips: replicated state, batch split on its leading axis (GSPMD).
+        from jax.sharding import Mesh, NamedSharding, PartitionSpec
+        mesh = Mesh(np.asarray(jax.local_devices()), ("d",))
+        replicated, split = NamedSharding(mesh, PartitionSpec()), NamedSharding(mesh, PartitionSpec("d"))
+        for size in (batch_size, config["eval_batch"]):
+            if size % n_dev:
+                raise ValueError(f"Batch {size} is not divisible by {n_dev} devices")
+        state, key = jax.device_put(state, replicated), jax.device_put(key, replicated)
+        put_batch = lambda b: jax.device_put(b, split)
+
+    train_step, eval_step, predict_step = build_steps(model, config)
+    if metadata["epoch"] >= config["epochs"] or metadata["stopped_early"]:
+        per_class_report(out, protocol, dataset, val_ids, config, predict_step, report)
+        result = write_result(out, protocol, metadata, digest, params_count, resumed=True)
+        report(phase="Done", current=1, total=1, done=True, epoch=metadata["epoch"])
+        return result
+
+    compiled_train = compiled_eval = None
+    guard = max(warmup_epochs, config["early_stop_guard_epoch"])
+    n_train = len(TRAIN_METRICS)
+    for epoch in range(metadata["epoch"] + 1, config["epochs"] + 1):
+        epoch_t0 = time.perf_counter()
+        report(phase="Train", epoch=epoch, current=0, total=steps, val_acc=None,
+               best=metadata["best"] if metadata["best_epoch"] else None, best_epoch=metadata["best_epoch"])
+        train_sum = np.zeros(n_train + 1, np.float64)
+        timing = dict(prepare_service_s=0.0, data_wait_s=0.0, h2d_s=0.0, gpu_train_s=0.0,
+                      gpu_eval_s=0.0, compile_train_s=0.0, compile_eval_s=0.0)
+        grad_norm_sum = 0.0
+        with closing(dataset.batches(train_ids, batch_size, config, epoch, True, protocol)) as batches:
+            for index in range(steps):
+                t = time.perf_counter()
+                batch, prep_s = next(batches)
+                timing["data_wait_s"] += time.perf_counter() - t
+                timing["prepare_service_s"] += prep_s
+                t = time.perf_counter()
+                device_batch = jax.block_until_ready(put_batch(batch))
+                timing["h2d_s"] += time.perf_counter() - t
+                if compiled_train is None:
+                    report(phase="Compile train", current=0, total=steps)
+                    t = time.perf_counter()
+                    compiled_train = train_step.lower(state, key, device_batch).compile()
+                    timing["compile_train_s"] = time.perf_counter() - t
+                t = time.perf_counter()
+                state, key, metrics = jax.block_until_ready(compiled_train(state, key, device_batch))
+                timing["gpu_train_s"] += time.perf_counter() - t
+                values = np.asarray(metrics)
+                if not np.isfinite(values).all():
+                    raise FloatingPointError(f"Nonfinite training values at epoch {epoch}, batch {index + 1}")
+                train_sum += values[:n_train + 1]
+                grad_norm_sum += float(values[-1])
+                if index % config["progress_every"] == 0 or index + 1 == steps:
+                    d = max(train_sum[n_train], 1.0)
+                    report(phase="Train", current=index + 1, total=steps, loss=float(train_sum[0] / d),
+                           train_acc=float(train_sum[4] / d), lr=float(schedule(state.step)),
+                           wait_s=timing["data_wait_s"], gpu_s=timing["gpu_train_s"],
+                           **r4_worker.memory_snapshot())
+        if int(train_sum[n_train]) != len(train_ids):
+            raise RuntimeError("Training sample accounting mismatch")
+
+        eval_sum = np.zeros(len(EVAL_COLUMNS), np.float64)
+        val_steps = math.ceil(len(val_ids) / config["eval_batch"])
+        report(phase="Validate EMA", current=0, total=val_steps)
+        with closing(dataset.batches(val_ids, config["eval_batch"], config, protocol=protocol)) as batches:
+            for index in range(val_steps):
+                t = time.perf_counter()
+                batch, prep_s = next(batches)
+                timing["data_wait_s"] += time.perf_counter() - t
+                timing["prepare_service_s"] += prep_s
+                device_batch = jax.block_until_ready(put_batch(batch))
+                if compiled_eval is None:
+                    report(phase="Compile validation", current=0, total=val_steps)
+                    t = time.perf_counter()
+                    compiled_eval = eval_step.lower(state.ema_params, device_batch).compile()
+                    timing["compile_eval_s"] = time.perf_counter() - t
+                t = time.perf_counter()
+                vals = np.asarray(jax.block_until_ready(compiled_eval(state.ema_params, device_batch)))
+                timing["gpu_eval_s"] += time.perf_counter() - t
+                if not np.isfinite(vals).all():
+                    raise FloatingPointError("Nonfinite validation values")
+                eval_sum += vals
+                if index % config["progress_every"] == 0 or index + 1 == val_steps:
+                    report(phase="Validate EMA", current=index + 1, total=val_steps,
+                           val_acc=float(eval_sum[1] / max(eval_sum[-1], 1)))
+        if int(eval_sum[-1]) != len(val_ids):
+            raise RuntimeError("Validation mask/count mismatch")
+        n_val = eval_sum[-1]
+        val = float(eval_sum[1] / n_val)
+        best, bad, improved = r4_worker.stopping_update(
+            metadata["best"], metadata["bad_epochs"], val, epoch, guard, config["min_delta"])
+
+        d = train_sum[n_train]
+        row = {"epoch": epoch}
+        row.update({f"train_{name}": float(train_sum[i] / d) for i, name in enumerate(TRAIN_METRICS)})
+        row.update({
+            "train_loss": float(train_sum[0] / d), "train_acc": float(train_sum[4] / d),
+            "augmented_train_acc": float(train_sum[5] / d),
+            "val_loss": float(eval_sum[0] / n_val), "val_acc": val, "val_main_acc": val,
+            "val_top5": float(eval_sum[2] / n_val), "eta": float(eval_sum[3] / n_val),
+            "alpha": float(eval_sum[4] / n_val), "val_aux_m4_acc": float(eval_sum[5] / n_val),
+            "val_aux_hand_acc": float(eval_sum[6] / n_val),
+            "grad_norm_mean": grad_norm_sum / max(steps, 1),
+            "train_samples": len(train_ids), "val_samples": len(val_ids), "bad_epochs": bad,
+            "epoch_s": time.perf_counter() - epoch_t0, **timing, **r4_worker.memory_snapshot(),
+        })
+
+        previous_best = metadata["best_checkpoint"]
+        metadata.update(epoch=epoch, best=best, bad_epochs=bad, stopped_early=bad >= config["patience"])
+        report(phase="Save checkpoint", current=1, total=1)
+        if improved:
+            metadata.update(best_epoch=epoch, best_checkpoint=f"best_epoch_{epoch:04d}.msgpack")
+            best_payload = {
+                "model": MODEL_NAME, "model_identity": identity, "protocol": protocol, "epoch": epoch,
+                "val_accuracy": val, "ema_params": jax.device_get(state.ema_params), "config": config,
+                "preprocessing_version": PREPROCESSING_VERSION, "pipeline_version": VERSION,
+                "cache_signature": dataset.meta["signature"], "train_samples": len(train_ids),
+                "val_samples": len(val_ids), "params": params_count,
+            }
+            atomic_bytes(out / metadata["best_checkpoint"], serialization.to_bytes(best_payload))
+        row.update(best_val_accuracy=best, best_epoch=metadata["best_epoch"])
+        metadata["history"].append(row)
+        save_checkpoint(last, state, key, metadata)
+        if improved:
+            publish_best(out, metadata, params_count)
+            if previous_best and previous_best != metadata["best_checkpoint"]:
+                (out / previous_best).unlink(missing_ok=True)
+        atomic_json(out / "history.json", metadata["history"])
+        report(phase="Epoch complete", best=best, best_epoch=metadata["best_epoch"], completed_epoch=epoch,
+               val_acc=val, current=1, total=1, bad_epochs=bad, epoch_s=row["epoch_s"],
+               wait_s=timing["data_wait_s"], gpu_s=timing["gpu_train_s"])
+        if metadata["stopped_early"]:
+            break
+
+    per_class_report(out, protocol, dataset, val_ids, config, predict_step, report)
+    result = write_result(out, protocol, metadata, digest, params_count)
+    report(phase="Done", current=1, total=1, done=True, best=metadata["best"],
+           best_epoch=metadata["best_epoch"], epoch=metadata["epoch"], completed_epoch=metadata["epoch"])
+    return result
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", required=True)
+    p.add_argument("--protocol", required=True, choices=spec.PROTOCOLS)
+    p.add_argument("--cache", required=True, help="R5 hand-cache directory")
+    p.add_argument("--outdir", required=True)
+    p.add_argument("--allow-cpu", action="store_true")
+    p.add_argument("--accelerator", default="gpu", choices=("gpu", "tpu"))
+    a = p.parse_args()
+    print(MODEL_NAME, flush=True)
+    run(json.loads(Path(a.config).read_text()), a.protocol, a.cache, a.outdir, a.allow_cpu, a.accelerator)
+
+
+if __name__ == "__main__":
+    main()
