@@ -15,8 +15,9 @@
 </p>
 
 NestSAR recognises human actions from 3D skeletons at **40.9 MFLOPs per clip** (strict count, 2 × MACs) with
-**1.13 M inference parameters**. It uses no softmax attention, no Transformer, no GCN and no T×T operation. A
-variable-length clip is summarised into 16 motion-preserving temporal tokens, and the whole network runs on those 16.
+**1.13 M inference parameters**. It uses no softmax attention, no Transformer and no T×T operation; space is mixed
+by a two-layer graph encoder, time by recurrent memory. A variable-length clip is summarised into 16
+motion-preserving temporal tokens, and the whole network runs on those 16.
 
 <p align="center"><img src="assets/nestsar_architecture.png" width="900" alt="NestSAR architecture"></p>
 
@@ -24,7 +25,8 @@ variable-length clip is summarised into 16 motion-preserving temporal tokens, an
 
 - **One early-fused trunk.** Joint, bone, joint-motion and bone-motion features are fused per joint; there are no four
   separate stream models.
-- **Spatial encoder.** A bidirectional GRU sweeps over the joints, grouped into 14 body parts.
+- **Spatial graph encoder.** Two graph-aggregation layers over the 25 joints of each frame (normalised skeleton
+  adjacency plus a learned residual adjacency, zero-initialised), then pooling into 14 body parts.
 - **Hand branch.** Hand-relative tokens at 4× the temporal rate (tip, thumb, hand, wrist) go through a bidirectional
   GRU and are pooled back to 16 steps.
 - **Person interaction.** Explicit person-person geometry plus a layer-scaled cross-person message.
