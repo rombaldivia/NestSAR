@@ -15,6 +15,7 @@ import onnx
 import onnxruntime as ort
 from onnx import helper as H, numpy_helper as NH
 from onnxsim import simplify
+from trt82_compat import lower_masks, audit
 
 
 class Lowerer:
@@ -189,6 +190,7 @@ def prepare(source, output, registry):
         if not ok:
             raise ValueError("Simplification failed: " + name)
         model = Lowerer(model).run()
+        model = lower_masks(model)
         model, ok = simplify(model, check_n=0)
         if not ok:
             raise ValueError("Post-lowering simplification failed: " + name)
@@ -197,6 +199,7 @@ def prepare(source, output, registry):
         if remaining:
             raise ValueError("Unsupported TensorRT 8.2 operations: {}".format(remaining))
         onnx.checker.check_model(model, full_check=True)
+        audit(model)
         source_session = session(original.SerializeToString())
         target_session = session(model.SerializeToString())
         shape = original_manifest[name]["input_shape"]

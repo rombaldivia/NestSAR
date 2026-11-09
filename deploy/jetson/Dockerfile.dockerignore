@@ -8,3 +8,5 @@
 !deploy/jetson/cuda_runtime.py
 !deploy/jetson/trt_engine.py
 !deploy/jetson/runner.py
+!deploy/jetson/check_image.py
+!deploy/jetson/trt82_compat.py

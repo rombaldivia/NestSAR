@@ -46,15 +46,18 @@ if [[ "$target" == auto ]]; then
     fi
 fi
 if [[ "$target" == nano ]]; then
-    base=nvcr.io/nvidia/l4t-tensorrt:r8.2.1-runtime
+    base=nvcr.io/nvidia/l4t-tensorrt:r8.2.1-runtime@sha256:3ecac9f197c475abeb284211f6be4277ad59cf3e38ddfa3deda203cedffeeba1
+    runtime_python=3.8
 else
-    base=nvcr.io/nvidia/l4t-jetpack:r36.4.0
+    base=nvcr.io/nvidia/l4t-tensorrt:r10.3.0-runtime@sha256:2c5dd352de34433ca837f75f38822312ef520bd1c5582d13d20449752aecf04e
+    runtime_python=3.10
 fi
-image="${IMAGE_TAG:-nestsar-jetson:${target}-cuda-v1}"
+image="${IMAGE_TAG:-nestsar-jetson:${target}-cuda-v2}"
 results="${RESULTS_DIR:-$ROOT/resultados-jetson}"
 cache="${ENGINE_CACHE_DIR:-$ROOT/.jetson-engines}"
 data="${DATA_DIR:-$ROOT/data-jetson}"
 build=(docker build --platform linux/arm64 --build-arg "RUNTIME_BASE=$base"
+       --build-arg "RUNTIME_PYTHON=$runtime_python"
        -f "$ROOT/deploy/jetson/Dockerfile" -t "$image" "$ROOT")
 run=(docker run --rm --init --runtime nvidia --network none
      --user "$(id -u):$(id -g)" --security-opt no-new-privileges

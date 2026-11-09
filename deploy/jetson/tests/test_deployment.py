@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "deploy/jetson"))
 from prepare_models import Lowerer, session
 from runner import load_manifest, verify, worker
+from trt82_compat import lower_masks, audit
 
 
 @pytest.mark.parametrize("equation,shapes", [
@@ -67,7 +68,7 @@ def test_untrained_predictions_are_blocked_before_cuda(tmp_path):
 
 @pytest.mark.parametrize("release,image", [
     ("# R32 (release), REVISION: 7.6, GCID: 123", "l4t-tensorrt:r8.2.1-runtime"),
-    ("# R36 (release), REVISION: 4.3, GCID: 123", "l4t-jetpack:r36.4.0"),
+    ("# R36 (release), REVISION: 4.3, GCID: 123", "l4t-tensorrt:r10.3.0-runtime"),
 ])
 def test_detects_matching_cuda_base(tmp_path, release, image):
     import os
@@ -87,3 +88,44 @@ def test_unknown_jetpack_fails_instead_of_guessing(tmp_path):
     result = subprocess.run([str(ROOT / "jetson.sh"), "--dry-run"],
                             env=dict(os.environ, NESTSAR_L4T_RELEASE_FILE=str(path)), capture_output=True)
     assert result.returncode == 2
+
+
+@pytest.mark.parametrize("kind", ["Gather", "ScatterND", "ReduceSum"])
+def test_mask_lowering_removes_unsupported_trt82_types(kind):
+    if kind == "Gather":
+        graph = H.make_graph([H.make_node("Gather", ["x", "indices"], ["y"])], "bool-gather",
+            [H.make_tensor_value_info("x", onnx.TensorProto.BOOL, [3])],
+            [H.make_tensor_value_info("y", onnx.TensorProto.BOOL, [2])],
+            [onnx.numpy_helper.from_array(np.array([2, 0], np.int64), "indices")])
+        x = np.array([True, False, True])
+    elif kind == "ScatterND":
+        graph = H.make_graph([H.make_node("ScatterND", ["x", "indices", "updates"], ["y"])], "bool-scatter",
+            [H.make_tensor_value_info("x", onnx.TensorProto.BOOL, [3])],
+            [H.make_tensor_value_info("y", onnx.TensorProto.BOOL, [3])],
+            [onnx.numpy_helper.from_array(np.array([[0], [2]], np.int64), "indices"),
+             onnx.numpy_helper.from_array(np.array([False, True]), "updates")])
+        x = np.array([True, False, False])
+    else:
+        graph = H.make_graph([H.make_node("Cast", ["x"], ["integer_mask"], to=onnx.TensorProto.INT64),
+            H.make_node("ReduceSum", ["integer_mask"], ["y"], keepdims=0)], "mask-count",
+            [H.make_tensor_value_info("x", onnx.TensorProto.BOOL, [3])],
+            [H.make_tensor_value_info("y", onnx.TensorProto.INT64, [])])
+        x = np.array([True, False, True])
+    model = H.make_model(graph, opset_imports=[H.make_opsetid("", 13)], ir_version=7)
+    expected = session(model.SerializeToString()).run(None, {"x": x})[0]
+    with pytest.raises(ValueError, match="dtype audit"):
+        audit(model)
+    lowered = lower_masks(model)
+    audit(lowered)
+    actual = session(lowered.SerializeToString()).run(None, {"x": x})[0]
+    assert actual.dtype == expected.dtype
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_arbitrary_integer_reduction_is_not_rounded_to_float():
+    graph = H.make_graph([H.make_node("ReduceSum", ["x"], ["y"], keepdims=0)], "integer-count",
+        [H.make_tensor_value_info("x", onnx.TensorProto.INT64, [3])],
+        [H.make_tensor_value_info("y", onnx.TensorProto.INT64, [])])
+    model = H.make_model(graph, opset_imports=[H.make_opsetid("", 13)], ir_version=7)
+    with pytest.raises(ValueError, match="arbitrary integer"):
+        lower_masks(model)
