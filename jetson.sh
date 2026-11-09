@@ -103,6 +103,20 @@ for device_group in video render; do
 done
 if [[ "$rebuild" == 1 ]] || ! docker image inspect "$image" >/dev/null 2>&1; then
     echo "Construyendo para $target ($base). La primera vez requiere Internet."
-    "${build[@]}"
+    build_log="$results/build-${target}.log"
+    if "${build[@]}" 2>&1 | tee "$build_log"; then
+        :
+    else
+        status=$?
+        echo "Fallo la construccion. Log: $build_log" >&2
+        exit "$status"
+    fi
 fi
-exec "${run[@]}"
+run_log="$results/run-${target}-$(date -u +%Y%m%dT%H%M%SZ).log"
+if "${run[@]}" 2>&1 | tee "$run_log"; then
+    echo "Log: $run_log"
+else
+    status=$?
+    echo "Fallo la ejecucion CUDA. Log: $run_log" >&2
+    exit "$status"
+fi

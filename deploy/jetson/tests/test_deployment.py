@@ -129,3 +129,37 @@ def test_arbitrary_integer_reduction_is_not_rounded_to_float():
     model = H.make_model(graph, opset_imports=[H.make_opsetid("", 13)], ir_version=7)
     with pytest.raises(ValueError, match="arbitrary integer"):
         lower_masks(model)
+
+
+@pytest.mark.parametrize("build_exit,run_exit", [(0, 0), (0, 7), (9, 0)])
+def test_launcher_logs_and_preserves_failure_status(tmp_path, build_exit, run_exit):
+    import os
+    tools = tmp_path / "fake-bin"
+    tools.mkdir()
+    docker = tools / "docker"
+    docker.write_text('''#!/bin/bash
+case "$1" in
+ info) printf '{"nvidia":{}}\n'; exit 0;;
+ image) exit 1;;
+ build) echo 'simulated build log'; exit "$FAKE_BUILD_EXIT";;
+ run) echo 'simulated CUDA run log' >&2; exit "$FAKE_RUN_EXIT";;
+ *) exit 99;;
+esac
+''')
+    uname = tools / "uname"
+    uname.write_text("#!/bin/sh\nprintf 'aarch64\\n'\n")
+    docker.chmod(0o755)
+    uname.chmod(0o755)
+    results = tmp_path / "results with spaces"
+    env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"],
+               RESULTS_DIR=str(results), ENGINE_CACHE_DIR=str(tmp_path / "cache"),
+               DATA_DIR=str(tmp_path / "data"), FAKE_BUILD_EXIT=str(build_exit), FAKE_RUN_EXIT=str(run_exit))
+    result = subprocess.run([str(ROOT / "jetson.sh"), "--target", "nano", "benchmark", "--only", "nestsar"],
+                            env=env, text=True, capture_output=True)
+    assert result.returncode == (build_exit or run_exit)
+    assert "simulated build log" in (results / "build-nano.log").read_text()
+    logs = list(results.glob("run-nano-*.log"))
+    if build_exit:
+        assert not logs
+    else:
+        assert len(logs) == 1 and "simulated CUDA run log" in logs[0].read_text()

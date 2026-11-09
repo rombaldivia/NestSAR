@@ -9,7 +9,7 @@ f42daeee49f2517a954c5601f0f76bef9ed94b62, docs/operators.md.
 import math
 
 import onnx
-from onnx import helper as H, numpy_helper as NH
+from onnx import helper as H
 
 F = onnx.TensorProto.FLOAT
 H16 = onnx.TensorProto.FLOAT16

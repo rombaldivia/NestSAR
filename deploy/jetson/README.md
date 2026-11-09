@@ -16,7 +16,13 @@ no tiene acceso a Docker, ejecuta `sudo ./jetson.sh`.
 | Placa | Sistema requerido | Imagen NVIDIA | Ejecucion |
 | --- | --- | --- | --- |
 | Jetson Nano original 2 GB / 4 GB | JetPack 4.6.1–4.6.6, L4T R32.7.1–R32.7.6 | `l4t-tensorrt:r8.2.1-runtime` | TensorRT 8.2, CUDA 10.2 |
-| Jetson Orin Nano / Nano Super | JetPack 6.1/6.2.x, L4T R36.4.x | `l4t-jetpack:r36.4.0` | TensorRT 10.3, CUDA 12.6 |
+| Jetson Orin Nano / Nano Super | JetPack 6.1/6.2.x, L4T R36.4.x | `l4t-tensorrt:r10.3.0-runtime` | TensorRT 10.3, CUDA 12.6 |
+
+Las dos bases NVIDIA estan fijadas por digest SHA-256. La version de Python se
+conserva tal como viene en cada imagen: 3.8 para TensorRT 8.2 y 3.10 para 10.3.
+La imagen final no ejecuta APT ni pip, para no depender de repositorios internos
+que aparecen en el historial de las imagenes NVIDIA antiguas. NumPy 1.24.4 se
+instala previamente para la arquitectura y ABI exactas de cada runtime.
 
 El lanzador detecta `/etc/nv_tegra_release`. Rechaza otras versiones para evitar
 mezclar las bibliotecas CUDA del contenedor con un controlador incompatible.
@@ -68,6 +74,8 @@ validacion numerica, latencia mediana/p90, clips/s y tiempo de construccion/carg
 Las mediciones incluyen las transferencias de entrada/salida entre CPU y GPU y
 su sincronizacion; excluyen compilacion, calentamiento y preprocesamiento.
 No son una medicion de camara a accion ni una medicion de accuracy.
+Se conservan tambien `build-<placa>.log` y `run-<placa>-<fecha>.log`, incluyendo
+los errores. Si algo falla, basta con compartir esa carpeta para diagnosticarlo.
 
 Los motores se guardan en `.jetson-engines/`. La clave incluye modelo, GPU,
 compute capability, arquitectura, CUDA, controlador, TensorRT, precision y
@@ -85,8 +93,9 @@ un benchmark completado. Puedes empezar con:
 ```
 
 La construccion inicial requiere Internet y espacio para las imagenes NVIDIA y
-la etapa temporal de preparacion. La imagen de Orin incluye JetPack y es de varios
-GB. Una vez construida, la ejecucion tiene la red deshabilitada.
+la etapa temporal de preparacion. Se usan las imagenes de runtime de TensorRT,
+de aproximadamente 1.6–1.7 GB comprimidas por base, mas las capas de preparacion.
+Una vez construida, la ejecucion tiene la red deshabilitada.
 
 ## Tus pesos entrenados
 
@@ -139,13 +148,27 @@ Puedes cambiar las rutas con `RESULTS_DIR`, `ENGINE_CACHE_DIR`, `DATA_DIR` y
 
 ## Verificacion y limites
 
-Se comprobaron en x86 los diez grafos adaptados contra los originales: cuatro
-entradas por modelo, incluyendo ceros; se verificaron tambien las formas/ONNX
-opset 13. Las pruebas automaticas cubren el orden de ejes de las contracciones,
-la deteccion de JetPack y el rechazo de resultados numericamente incorrectos.
+Se construyeron las dos imagenes completas en maquinas ARM64 nativas mediante
+GitHub Actions. Pasaron las comprobaciones de ABI Python/NumPy, presencia de los
+bindings y bibliotecas TensorRT, hashes de los diez modelos y lectura de sus
+referencias con el NumPy del runtime. Los diez grafos se compararon contra los
+originales tanto en x86 como en ARM64: cuatro entradas por modelo, incluyendo
+ceros. [Ejecucion ARM64 verificada](https://github.com/rombaldivia/NestSAR/actions/runs/42551619016).
 
-La construccion de las imagenes y la importacion/ejecucion TensorRT en Nano/Orin
-requieren esas placas y no se han probado fisicamente en el entorno de desarrollo.
+Se revisan los tipos de datos admitidos por TensorRT 8.2 ademas del opset.
+Los Gather/ScatterND booleanos y las sumas de mascaras enteras pasan por FP32
+de forma exacta, restaurando su tipo ONNX al terminar. No se convierten sumas
+enteras arbitrarias que puedan perder precision. La referencia de restricciones
+es `onnx/onnx-tensorrt`, rama 8.2-GA, commit
+`f42daeee49f2517a954c5601f0f76bef9ed94b62`.
+
+Las pruebas automaticas cubren las contracciones, mascaras, deteccion de JetPack,
+rechazo de salidas incorrectas y las rutas API de TensorRT 8.2/10 con memoria CUDA
+simulada. Estas ultimas son pruebas de software, no mediciones de una GPU.
+
+La importacion y ejecucion real de TensorRT/CUDA en Nano/Orin no se han probado
+fisicamente: los runners ARM64 de CI carecen de una GPU Jetson. La construccion
+verificada reduce los riesgos de instalacion, pero no certifica el motor CUDA.
 El primer arranque es la comprobacion de aceptacion: construye el motor, compara
 CUDA con las referencias y solo entonces mide. Un modelo que TensorRT no pueda
 importar o verificar produce un error y un codigo de salida distinto de cero.
@@ -154,5 +177,5 @@ Fuentes NVIDIA para las imagenes y sus requisitos:
 
 - [JetPack 4.6.x y CUDA 10.2](https://developer.nvidia.com/jetpack-sdk-466)
 - [Imagen TensorRT 8.2.1 para Jetson](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/l4t-tensorrt)
-- [Imagen JetPack R36.4.0](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/l4t-jetpack)
+- [Imagen TensorRT 10.3.0 para Jetson](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/l4t-tensorrt)
 - [API TensorRT Python](https://docs.nvidia.com/deeplearning/tensorrt/10.x.x/inference-library/python-api-docs.html)
