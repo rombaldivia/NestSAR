@@ -1,0 +1,10 @@
+**
+!deploy/
+!deploy/jetson/
+!deploy/jetson/Dockerfile
+!deploy/jetson/requirements-prepare.txt
+!deploy/jetson/artifacts.json
+!deploy/jetson/prepare_models.py
+!deploy/jetson/cuda_runtime.py
+!deploy/jetson/trt_engine.py
+!deploy/jetson/runner.py

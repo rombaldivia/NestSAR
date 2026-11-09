@@ -31,6 +31,9 @@ datasets/
 runs/
 checkpoints/
 outputs/
+resultados-jetson/
+.jetson-engines/
+data-jetson/
 wandb/
 
 # Logs and local metadata
