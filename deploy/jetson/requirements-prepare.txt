@@ -1,0 +1,5 @@
+# Build-time only. No training frameworks are installed in the Jetson image.
+numpy==2.5.4
+onnx==1.23.2
+onnxruntime==1.31.1
+onnxsim==0.8.1

@@ -1,0 +1,62 @@
+name: Jetson Docker validation
+
+on:
+  push:
+    branches: [main]
+    paths: ['deploy/jetson/**', 'jetson.sh', '.github/workflows/jetson-docker.yml']
+  pull_request:
+    paths: ['deploy/jetson/**', 'jetson.sh', '.github/workflows/jetson-docker.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jetson-docker-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r deploy/jetson/requirements-prepare.txt pytest
+      - run: python -m pytest deploy/jetson/tests -q
+      - run: bash -n jetson.sh
+
+  arm64-image:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: nano
+            python: '3.8'
+            base: nvcr.io/nvidia/l4t-tensorrt:r8.2.1-runtime@sha256:3ecac9f197c475abeb284211f6be4277ad59cf3e38ddfa3deda203cedffeeba1
+          - target: orin
+            python: '3.10'
+            base: nvcr.io/nvidia/l4t-tensorrt:r10.3.0-runtime@sha256:2c5dd352de34433ca837f75f38822312ef520bd1c5582d13d20449752aecf04e
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build complete image on native ARM64
+        env:
+          BASE: ${{ matrix.base }}
+          PYTHON_VERSION: ${{ matrix.python }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          docker build --progress plain --platform linux/arm64 \
+            --build-arg "RUNTIME_BASE=$BASE" --build-arg "RUNTIME_PYTHON=$PYTHON_VERSION" \
+            -t "nestsar-$TARGET:test" -f deploy/jetson/Dockerfile .
+      - name: Verify image files and NumPy ABI without a GPU
+        env:
+          TARGET: ${{ matrix.target }}
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: |
+          docker run --rm --network none --entrypoint python3 "nestsar-$TARGET:test" \
+            /opt/jetson/check_image.py --python "$PYTHON_VERSION"
+          docker run --rm --network none "nestsar-$TARGET:test" list

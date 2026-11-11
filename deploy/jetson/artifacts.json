@@ -1,0 +1,36 @@
+{
+  "repository": "rombaldivia/NestSAR",
+  "commit": "1fa5cbc704d5dc069258c633c6afc8d687c1f6f3",
+  "models": {
+    "ctrgcn": {
+      "sha256": "bc649ca1a41a3d6461a8693b104ecffe127d8ddf8ce227d3a45af7ba7961dc87"
+    },
+    "hcnb": {
+      "sha256": "81e07cd79f8d6cf8a5155da1b947c4094de661cbbbb3fc6aca2e98578f61a158"
+    },
+    "nestsar": {
+      "sha256": "72cfe724c641254811cac5e1bf8163662eb8024e3c076eac5537d91a2e15bd7d"
+    },
+    "nestsar_notemp": {
+      "sha256": "d92bd866cd792d0cd79e8e6b44e1df8fa7016a036995f9ccb48ac9f820b48393"
+    },
+    "nestsar_tattn": {
+      "sha256": "7f5dd48bc59cbfbd2376afb315ecd077bbac9319faf731cf616ecab8b9ff9a80"
+    },
+    "nestsar_tconv": {
+      "sha256": "30ebfe9eea1ab16fb9c6a32e3b6619988bf61c5ef80d3132a83c198571e55e54"
+    },
+    "sgn40": {
+      "sha256": "f3c1e6bd532ec26edc6c13d0c546fe798fb15b825233ab37b8c33e6c7f56c3e2"
+    },
+    "sgn_full": {
+      "sha256": "b4447ab62cb15c667bb149c76291c7a879d03c0daacc5d8b6d07cc9f38ffd39b"
+    },
+    "tacnn": {
+      "sha256": "6ac8b65341100f4cea714b45fa4ddd3308b7a9b0f4330e6322b14ed664431d5b"
+    },
+    "tscnn": {
+      "sha256": "583a3612b7a27e8a31c3492ee977e40668a34f0577cc3584d9c309cc3b8ab1ff"
+    }
+  }
+}

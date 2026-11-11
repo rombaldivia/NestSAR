@@ -84,6 +84,12 @@ every protocol; it is not the reported model.
 
 ## Edge deployment
 
+For **CUDA on Jetson Nano 2/4 GB or Orin Nano Super**, run `./jetson.sh`.
+The launcher chooses the matching JetPack image, builds TensorRT engines on the
+device and checks GPU outputs before benchmarking. See
+[`deploy/jetson/README.md`](deploy/jetson/README.md) for supported JetPack versions,
+trained checkpoints and the distinction between latency and action prediction.
+
 Every model is exported to ONNX Runtime and to XLA (`jax.export`, weights baked in). Each is reported with its **best**
 runtime and thread setting, batch 1.
 
