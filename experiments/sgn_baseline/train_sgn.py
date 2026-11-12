@@ -146,7 +146,14 @@ def main(argv=None):
     crit = LabelSmoothing(classes, 0.1)
     best, best_ep, hist = -1.0, 0, []
     status = out / "status.json"
-    for ep in range(1, a.epochs + 1):
+    last, start = out / "last.pt", 1
+    if last.exists():                      # resume after an interruption: same weights, optimizer, schedule and RNGs
+        ck = torch.load(last, map_location=dev, weights_only=False)
+        model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"]); sched.load_state_dict(ck["sched"])
+        rng.bit_generator.state = ck["np_rng"]; gen.set_state(ck["gen"]); torch.set_rng_state(ck["torch_rng"])
+        best, best_ep, hist, start = ck["best"], ck["best_ep"], ck["hist"], ck["epoch"] + 1
+        print(f"resumed from {last} at epoch {start}", flush=True)
+    for ep in range(start, a.epochs + 1):
         model.train()
         perm = rng.permutation(tr)
         tl, tc, tn, t1 = 0.0, 0, 0, time.time()
@@ -175,6 +182,10 @@ def main(argv=None):
         hist.append({"epoch": ep, "train_loss": tl / tn, "train_acc": tc / tn, "val_acc_1crop": acc,
                      "seconds": time.time() - t1})
         (out / "history.json").write_text(json.dumps(hist))
+        torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
+                    "np_rng": rng.bit_generator.state, "gen": gen.get_state(), "torch_rng": torch.get_rng_state(),
+                    "best": best, "best_ep": best_ep, "hist": hist, "epoch": ep}, out / "last.tmp")
+        (out / "last.tmp").replace(last)
         status.write_text(json.dumps({"phase": "Eval", "epoch": ep, "epochs": a.epochs, "current": nb, "total": nb,
                                       "best": best, "best_epoch": best_ep, "last_val": acc}))
         print(f"E{ep:3d} loss {tl / tn:.3f} train {100 * tc / tn:.2f} val(1 crop) {100 * acc:.2f} best {100 * best:.2f} (E{best_ep}) "
