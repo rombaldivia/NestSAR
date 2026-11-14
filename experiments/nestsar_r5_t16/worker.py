@@ -537,7 +537,8 @@ def per_class_report(out, protocol, dataset, val_ids, config, predict_step, repo
     flat = np.argsort(off, axis=None)[::-1][:20]
     pairs = [{"true": names[i // NUM_CLASSES], "pred": names[i % NUM_CLASSES],
               "count": int(off.flat[i])} for i in flat if off.flat[i] > 0]
-    reference = R4_WEAK_CLASS_RECALL.get(protocol, {})
+    reference = {k: v for k, v in R4_WEAK_CLASS_RECALL.get(protocol, {}).items()
+                 if int(k[1:]) <= NUM_CLASSES}        # NTU-120 reference classes; on NTU-60 keep only A001..A060
     atomic_json(target, {
         "protocol": protocol,
         "epoch": int(payload.get("epoch", 0)),
