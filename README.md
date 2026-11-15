@@ -2,7 +2,7 @@
 
 <p align="center">
   <strong>Ultra-Low-Compute Skeleton-Based Action Recognition</strong><br>
-  JAX · NTU RGB+D 60 / 120 · NW-UCLA · 40.9 MFLOPs per clip · measured on a Raspberry Pi Zero 2 W
+  JAX · NTU RGB+D 60 / 120 · NW-UCLA · 40.8 MFLOPs per clip · measured on a Raspberry Pi Zero 2 W
 </p>
 
 <p align="center">
@@ -11,11 +11,11 @@
   <img alt="NTU120 XSub" src="https://img.shields.io/badge/NTU120%20XSub-78.54%25-success">
   <img alt="NTU120 XSet" src="https://img.shields.io/badge/NTU120%20XSet-80.35%25-success">
   <img alt="NW-UCLA" src="https://img.shields.io/badge/NW--UCLA-90.09%25-success">
-  <img alt="Cost" src="https://img.shields.io/badge/cost-40.9%20MFLOPs-orange">
+  <img alt="Cost" src="https://img.shields.io/badge/cost-40.8%20MFLOPs-orange">
 </p>
 
-NestSAR recognises human actions from 3D skeletons at **40.9 MFLOPs per clip** (strict count, 2 × MACs) with
-**1.13 M inference parameters**. It uses no softmax attention, no Transformer and no T×T operation; space is mixed
+NestSAR recognises human actions from 3D skeletons at **40.8 MFLOPs per clip** (strict count, 2 × MACs) with
+**1.10 M inference parameters**. It uses no softmax attention, no Transformer and no T×T operation; space is mixed
 by a two-layer graph encoder, time by recurrent memory. A variable-length clip is summarised into 16
 motion-preserving temporal tokens, and the whole network runs on those 16.
 
@@ -33,6 +33,37 @@ motion-preserving temporal tokens, and the whole network runs on those 16.
 - **Nested temporal memory.** A BiGRU over the 16 segments (M4), the same over 4 chunks (G4), and a surprise-gated,
   self-modifying fast memory at each level.
 - **Training only.** A masked-reconstruction head (mask ratio 0.5), absent from the inference graph.
+
+## Quick inference
+
+Trained weights for every run (main models, all seeds, ablations) are in the
+[`weights-v1` release](https://github.com/rombaldivia/NestSAR/releases/tag/weights-v1). `infer.py` downloads the
+checkpoint it needs (about 5 MB) into `~/.cache/nestsar` and runs on CPU:
+
+```bash
+git clone https://github.com/rombaldivia/NestSAR && cd NestSAR
+pip install "jax[cpu]" flax numpy
+python infer.py --input S001C001P001R001A001.skeleton                  # NTU RGB+D raw file, NTU-60 XSub model
+python infer.py --model ntu120-xset --input S018C001P008R001A061.skeleton
+python infer.py --model nwucla --input a01_s01_e00_v03.json            # NW-UCLA all_sqe clip
+python infer.py --input clip.npy                                       # [M, T, 25, 3] or [T, 25, 3], NTU joint order
+python infer.py --list                                                 # all released checkpoints and their top-1
+```
+
+| `--model` | Checkpoint | Val. top-1 | Mean of 3 seeds (paper) |
+|---|---|---|---|
+| `ntu60-xsub` (default) | `nestsar_ntu60_xsub_ep60_s23` | 85.70 | 85.55 ± 0.14 |
+| `ntu60-xview` | `nestsar_ntu60_xview_ep60_s23` | 91.98 | 91.89 ± 0.11 |
+| `ntu120-xsub` | `nestsar_ntu120_xsub_ep60_s7` | 78.62 | 78.54 ± 0.09 |
+| `ntu120-xset` | `nestsar_ntu120_xset_ep60_s7` | 80.45 | 80.35 ± 0.12 |
+| `nwucla` | `nestsar_nwucla_xview_ep80_s23` | 90.73 | 90.09 ± 0.94 |
+
+Each checkpoint is a flax msgpack of the EMA parameters; the `.json` next to it holds the full training config and
+result. The input goes through the same tokenisation as training (`experiments/nestsar_r5_t16/preprocessing.py`).
+The `.skeleton` reader keeps every body track in order of first appearance and the preprocessing keeps the two most
+active ones; the benchmark numbers use the PYSKL `ntu*_3danno.pkl` skeletons, whose body selection can differ on
+noisy multi-body clips. `pi_demo_ntu60_xsub.tar.gz` in the same release is the exported XLA CPU program evaluated on
+the Raspberry Pi (edge kit, branch `edge-kit`).
 
 ## Results
 
@@ -53,7 +84,7 @@ SGN-40 is **our** scaled SGN (width × 0.3125, 39.9 MFLOPs), built to answer *"w
 model?"*. SGN full is our reimplementation of SGN at its published width (359 MFLOPs per pass; its paper reports 89.0
 on NTU-60 X-Sub with 5-crop testing, our reimplementation gives 88.53).
 
-| Benchmark | NestSAR (40.9 MFLOPs) | SGN-40 (39.9 MFLOPs) | Δ at equal cost |
+| Benchmark | NestSAR (40.8 MFLOPs) | SGN-40 (39.9 MFLOPs) | Δ at equal cost |
 | --- | ---: | ---: | ---: |
 | NTU-60 X-Sub | **85.55** | 83.22 | **+2.3** |
 | NTU-60 X-View | **91.89** | 88.35 | **+3.5** |
@@ -68,7 +99,7 @@ On NW-UCLA, NestSAR (90.09) also beats SGN full at 9× the compute (88.94 ± 0.9
 
 | Variant | Temporal module | MFLOPs | Top-1 |
 | --- | --- | ---: | ---: |
-| **NestSAR** | nested M4/G4 memory + fast memory | 40.9 | **84.94** |
+| **NestSAR** | nested M4/G4 memory + fast memory | 40.8 | **84.94** |
 | FLATSTACK | stacked flat levels | 51.1 | 84.93 |
 | NOFAST | nested, no fast memory | 40.5 | 84.65 |
 | FLAT | single level | 37.2 | 84.55 |
@@ -91,7 +122,7 @@ runtime and thread setting, batch 1.
 | --- | ---: | ---: | ---: | ---: |
 | SGN-40 (ours, equal cost) | 39.9 | 15.96 | 0.91 | 83.22 |
 | Two-Stream CNN | 165.1 | 30.12 | 0.91 | 83.89 |
-| **NestSAR (edge schedule)** | **40.9** | **35.03** | **1.94** ¹ | **85.55** |
+| **NestSAR (edge schedule)** | **40.8** | **35.03** | **1.94** ¹ | **85.55** |
 | HCN-B | 387.9 | 65.80 | 3.35 | 87.67 |
 | SGN full | 359.3 | 66.60 | 3.28 | 87.43 |
 | Ta-CNN | 289.0 | 86.47 | 4.82 | 88.53 |
