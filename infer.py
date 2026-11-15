@@ -4,6 +4,7 @@
     python infer.py --model ntu120-xset --input clip.skeleton
     python infer.py --model nwucla --input a01_s01_e00_v03.json           # NW-UCLA all_sqe clip
     python infer.py --input clip.npy                                      # array [M, T, 25, 3] or [T, 25, 3]
+    python infer.py --input pi_eval_ntu60_xsub/x.npy --index 7            # tokenised clip [N, 16, 942] (+ y.npy)
     python infer.py --list                                                # every released checkpoint
 
 --model takes a short name (ntu60-xsub, ntu60-xview, ntu120-xsub, ntu120-xset, nwucla; best seed of the paper's
@@ -134,6 +135,9 @@ def main():
     ap.add_argument("--model", default="ntu60-xsub", help=f"one of {sorted(SHORT)} or a name from --list")
     ap.add_argument("--input", help=".skeleton (NTU), .json (NW-UCLA all_sqe) or .npy [M, T, 25, 3]")
     ap.add_argument("--top", type=int, default=5)
+    ap.add_argument("--index", type=int, default=0,
+                    help="clip to use when --input is an already tokenised array [N, 16, 942] (e.g. x.npy of the "
+                         "Pi evaluation package); a y.npy next to it gives the true label")
     ap.add_argument("--list", action="store_true", help="list every released checkpoint")
     a = ap.parse_args()
 
@@ -165,17 +169,28 @@ def main():
     model = NestSARR5T16(**model_kwargs(config))
     params = serialization.msgpack_restore(fetch(name + ".msgpack").read_bytes())["ema_params"]
 
-    raw = ordered_raw(read_input(a.input), "MTVC")
-    tokens = r5pp.features(raw, hand_filter=config["hand_filter"], body_align=config["body_align"])
+    truth, src = None, Path(a.input)
+    arr = np.load(src, mmap_mode="r") if src.suffix == ".npy" else None
+    if arr is not None and arr.shape[-2:] == (r5pp.FRAMES, r5pp.FEATURES):      # already tokenised
+        tokens = np.asarray(arr[a.index] if arr.ndim == 3 else arr, np.float32)
+        what = f"tokenised clip {a.index}" if arr.ndim == 3 else "tokenised clip"
+        if arr.ndim == 3 and (src.parent / "y.npy").exists():
+            truth = int(np.load(src.parent / "y.npy")[a.index])
+    else:
+        raw = ordered_raw(read_input(a.input), "MTVC")
+        tokens = r5pp.features(raw, hand_filter=config["hand_filter"], body_align=config["body_align"])
+        what = f"{raw.shape[0]} frames"
     logits = model.apply({"params": params}, jax.numpy.asarray(tokens[None]), training=False)["logits"][0]
     prob = np.asarray(jax.nn.softmax(logits))
     names = NWUCLA if dataset == "nwucla" else NTU120[:60] if dataset == "ntu60" else NTU120
     acc = meta["result"].get("best_accuracy")
     acc = 100 * acc if acc is not None and acc <= 1 else acc
-    print(f"{name}  (validation top-1 {acc:.2f}%)  input {Path(a.input).name}: {raw.shape[0]} frames")
+    print(f"{name}  (validation top-1 {acc:.2f}%)  input {src.name}: {what}")
     for k in np.argsort(-prob)[:a.top]:
         tag = f"{k:2d}" if dataset == "nwucla" else f"A{k + 1:03d}"
-        print(f"  {tag}  {prob[k] * 100:5.1f}%  {names[k]}")
+        print(f"  {tag}  {prob[k] * 100:5.1f}%  {names[k]}" + ("   <- true" if k == truth else ""))
+    if truth is not None:
+        print(f"  true class: {names[truth]}")
 
 
 if __name__ == "__main__":
