@@ -126,9 +126,15 @@ runtime and thread setting, batch 1.
 | HCN-B | 387.9 | 65.80 | 3.35 | 87.67 |
 | SGN full | 359.3 | 66.60 | 3.28 | 87.43 |
 | Ta-CNN | 289.0 | 86.47 | 4.82 | 88.53 |
-| CTR-GCN | 3878.4 | 1215.62 | 49 | — |
+| InfoGCN | 3340 ² | 882.4 | — | 89.8 |
+| CTR-GCN | 3878.4 | 1215.62 | 49 | 89.6 |
+| HD-GCN | 3440 ² | 1231.7 | — | 90.6 |
+| SkateFormer (released weights) | 3620 ² | 1377.7 | — | 92.6 |
 
 ¹ The x86 figure is the training schedule; on x86 the edge schedule makes no difference (1.40 vs 1.42 ms on one thread).
+² Cost as reported by the authors. InfoGCN, HD-GCN and SkateFormer are timed with `bench_big.py` on branch `edge-kit`
+(SkateFormer from its released `ntu60-xsub-joint` checkpoint, the other two from their official code); accuracies are
+the published joint-only results.
 
 - **NestSAR is on the latency-accuracy Pareto front, not the fastest model.** SGN-40 is 2.2× faster on the Pi, and
   NestSAR is +2.3 to +6.5 points more accurate.
@@ -177,7 +183,7 @@ subprocess.Popen("cd /kaggle/working/NestSAR && python -u -m experiments.nestsar
   benchmarks.
 - **NW-UCLA joints.** NW-UCLA (Kinect v1) has no hand tip or thumb joints. NestSAR masks them as missing; for SGN they
   are filled with the hand joint, which favours the baseline.
-- **Baseline numbers.** Two-Stream CNN, HCN-B, Ta-CNN and CTR-GCN accuracies are the published ones; their latencies
+- **Baseline numbers.** Two-Stream CNN, HCN-B, Ta-CNN, CTR-GCN, InfoGCN, HD-GCN and SkateFormer accuracies are the published ones; their latencies
   are measured here with ports of the public code (`experiments/edge/skelact_models.py`, Apache-2.0).
 - **History.** Earlier research lines and their ledgers (`NESTSAR_EXPERIMENT_STATUS_*.md`, `nestsar.py`) are kept for
   reference; the current model lives in `experiments/nestsar_r5_t16/`.
