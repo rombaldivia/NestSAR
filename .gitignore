@@ -1,3 +1,5 @@
 venv/
 resultados/
 __pycache__/
+resultados_trained/
+venv081/

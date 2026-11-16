@@ -21,3 +21,10 @@ Los resultados quedan en `resultados/` (JSON + `resumen.md`). Pásame esa carpet
     source venv/bin/activate
     python3 bench_onnx.py --models edge_models --only nestsar --threads 4 --power-window 60
 Repite con sgn40, tacnn, tscnn, sgn_full. Anota corriente (12 lecturas en 60 s) y voltaje; y también en reposo (sleep 60).
+
+## Latencia con pesos entrenados (NestSAR y todas sus variantes de la ablación)
+    cd ~/nestsar-edge && git pull          # o la carpeta donde clonaste la rama edge-kit
+    nohup ./bench_trained.sh > trained.log 2>&1 &
+    tail -f trained.log                    # ~50 min en la Pi Zero 2 W; sigue aunque cierres la sesión
+Al final imprime una tabla (también en `resultados_trained/resumen.txt`). Si se corta, vuelve a lanzarlo: continúa.
+Los programas de `edge_xla_trained/` salen de los checkpoints publicados (release `weights-v1`), con jax 0.8.1.

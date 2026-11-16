@@ -1,0 +1,420 @@
+{
+ "base120": {
+  "checkpoint": "nestsar_ntu120_xsub_ep60_s7",
+  "variant": "graph_mr",
+  "dataset": "ntu120",
+  "classes": 120,
+  "top1": 78.62,
+  "schedule": "split",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 8.344650268554688e-07,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "9722731",
+  "bytes": 4491868
+ },
+ "base120_stacked": {
+  "checkpoint": "nestsar_ntu120_xsub_ep60_s7",
+  "variant": "graph_mr",
+  "dataset": "ntu120",
+  "classes": 120,
+  "top1": 78.62,
+  "schedule": "stacked",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 0.0,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "9722731",
+  "bytes": 4489756
+ },
+ "base60": {
+  "checkpoint": "nestsar_ntu60_xsub_ep60_s23",
+  "variant": "graph_mr",
+  "dataset": "ntu60",
+  "classes": 60,
+  "top1": 85.7,
+  "schedule": "split",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 7.152557373046875e-07,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "9722731",
+  "bytes": 4449388
+ },
+ "flatstack": {
+  "checkpoint": "nestsar_ntu120_xsub_flat_stack_ep38_s7",
+  "variant": "graph_mr_flat_stack",
+  "dataset": "ntu120",
+  "classes": 120,
+  "top1": 77.28,
+  "schedule": "split",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 8.344650268554688e-07,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "9722731",
+  "bytes": 4340120
+ },
+ "flat": {
+  "checkpoint": "nestsar_ntu120_xsub_one_level_ep38_s7",
+  "variant": "graph_mr_one_level",
+  "dataset": "ntu120",
+  "classes": 120,
+  "top1": 77.44,
+  "schedule": "split",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 9.5367431640625e-07,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "90f127f",
+  "bytes": 2594336
+ },
+ "nofast": {
+  "checkpoint": "nestsar_ntu120_xsub_no_fast_ep38_s7",
+  "variant": "graph_mr_no_fast",
+  "dataset": "ntu120",
+  "classes": 120,
+  "top1": 77.44,
+  "schedule": "split",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 7.152557373046875e-07,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "9722731",
+  "bytes": 4436008
+ },
+ "shared": {
+  "checkpoint": "nestsar_ntu120_xsub_shared_ep38_s7",
+  "variant": "graph_mr_shared",
+  "dataset": "ntu120",
+  "classes": 120,
+  "top1": 77.46,
+  "schedule": "split",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 7.152557373046875e-07,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "90f127f",
+  "bytes": 2724912
+ },
+ "causal": {
+  "checkpoint": "nestsar_ntu120_xsub_causal_ep38_s7",
+  "variant": "graph_mr_causal",
+  "dataset": "ntu120",
+  "classes": 120,
+  "top1": 77.83,
+  "schedule": "split",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 0.0,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "90f127f",
+  "bytes": 4314724
+ },
+ "tattn": {
+  "checkpoint": "nestsar_ntu60_xsub_tattn_ep38_s7",
+  "variant": "graph_mr_tattn",
+  "dataset": "ntu60",
+  "classes": 60,
+  "top1": 84.03,
+  "schedule": "split",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 0.0,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "9722731",
+  "bytes": 4937888
+ },
+ "tconv": {
+  "checkpoint": "nestsar_ntu60_xsub_tconv_ep38_s7",
+  "variant": "graph_mr_tconv",
+  "dataset": "ntu60",
+  "classes": 60,
+  "top1": 83.44,
+  "schedule": "split",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 0.0,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "9722731",
+  "bytes": 1807140
+ },
+ "memonly": {
+  "checkpoint": "nestsar_ntu120_xsub_mem_only_ep38_s7",
+  "variant": "graph_mr_mem_only",
+  "dataset": "ntu120",
+  "classes": 120,
+  "top1": 74.82,
+  "schedule": "split",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 0.0,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "90f127f",
+  "bytes": 1011008
+ },
+ "notemp": {
+  "checkpoint": "nestsar_ntu60_xsub_notemp_ep38_s7",
+  "variant": "graph_mr_notemp",
+  "dataset": "ntu60",
+  "classes": 60,
+  "top1": 81.95,
+  "schedule": "split",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 0.0,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "9722731",
+  "bytes": 1281012
+ },
+ "tavg": {
+  "checkpoint": "nestsar_ntu120_xsub_no_temporal_ep38_s7",
+  "variant": "graph_mr_no_temporal",
+  "dataset": "ntu120",
+  "classes": 120,
+  "top1": 73.42,
+  "schedule": "split",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 0.0,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "90f127f",
+  "bytes": 955504
+ },
+ "nohand": {
+  "checkpoint": "nestsar_ntu120_xsub_no_hand_ep38_s7",
+  "variant": "graph_mr_no_hand",
+  "dataset": "ntu120",
+  "classes": 120,
+  "top1": 77.09,
+  "schedule": "split",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 9.5367431640625e-07,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "90f127f",
+  "bytes": 4418940
+ },
+ "nointer": {
+  "checkpoint": "nestsar_ntu120_xsub_no_inter_ep38_s7",
+  "variant": "graph_mr_no_inter",
+  "dataset": "ntu120",
+  "classes": 120,
+  "top1": 78.05,
+  "schedule": "split",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 9.98377799987793e-07,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "90f127f",
+  "bytes": 4416672
+ },
+ "st2": {
+  "checkpoint": "nestsar_ntu120_xsub_st2_ep38_s7",
+  "variant": "graph_mr_st2",
+  "dataset": "ntu120",
+  "classes": 120,
+  "top1": 77.97,
+  "schedule": "split",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 7.152557373046875e-07,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "9722731",
+  "bytes": 4539060
+ },
+ "base120_hybrid": {
+  "checkpoint": "nestsar_ntu120_xsub_ep60_s7",
+  "variant": "graph_mr",
+  "dataset": "ntu120",
+  "classes": 120,
+  "top1": 78.62,
+  "schedule": "hybrid",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 8.344650268554688e-07,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "9722731",
+  "bytes": 4491736
+ },
+ "tattn_stacked": {
+  "checkpoint": "nestsar_ntu60_xsub_tattn_ep38_s7",
+  "variant": "graph_mr_tattn",
+  "dataset": "ntu60",
+  "classes": 60,
+  "top1": 84.03,
+  "schedule": "stacked",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 0.0,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "9722731",
+  "bytes": 4937092
+ },
+ "tconv_stacked": {
+  "checkpoint": "nestsar_ntu60_xsub_tconv_ep38_s7",
+  "variant": "graph_mr_tconv",
+  "dataset": "ntu60",
+  "classes": 60,
+  "top1": 83.44,
+  "schedule": "stacked",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 0.0,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "9722731",
+  "bytes": 1806344
+ },
+ "notemp_stacked": {
+  "checkpoint": "nestsar_ntu60_xsub_notemp_ep38_s7",
+  "variant": "graph_mr_notemp",
+  "dataset": "ntu60",
+  "classes": 60,
+  "top1": 81.95,
+  "schedule": "stacked",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 0.0,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "9722731",
+  "bytes": 1280224
+ },
+ "memonly_stacked": {
+  "checkpoint": "nestsar_ntu120_xsub_mem_only_ep38_s7",
+  "variant": "graph_mr_mem_only",
+  "dataset": "ntu120",
+  "classes": 120,
+  "top1": 74.82,
+  "schedule": "stacked",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 0.0,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "90f127f",
+  "bytes": 1010176
+ },
+ "tavg_stacked": {
+  "checkpoint": "nestsar_ntu120_xsub_no_temporal_ep38_s7",
+  "variant": "graph_mr_no_temporal",
+  "dataset": "ntu120",
+  "classes": 120,
+  "top1": 73.42,
+  "schedule": "stacked",
+  "trained": true,
+  "input_shape": [
+   1,
+   16,
+   942
+  ],
+  "max_abs_diff_vs_training_schedule": 0.0,
+  "roundtrip_max_abs_diff": 0.0,
+  "jax_version": "0.8.1",
+  "code_commit": "90f127f",
+  "bytes": 954644
+ }
+}
